@@ -497,6 +497,84 @@ async fn fetch_deepgram_voices(
     Ok(voices)
 }
 
+/// The Google credential to list voices with, or `None` when Google is not configured here.
+///
+/// `get_api_key("google")` answers `""` (use Application Default Credentials) when nothing is
+/// configured, which `/ws` needs on Google Cloud. Taken as "configured", it sent every `/voices`
+/// call through ADC's metadata-server and gcloud-file retries on any other host, ending in
+/// "Failed to fetch access token". Google is listed when a credential is configured, or when ADC
+/// has something to find: `GOOGLE_APPLICATION_CREDENTIALS`, gcloud's ADC file, or a metadata
+/// server (checked once per process).
+async fn google_voice_credentials(state: &AppState) -> Option<String> {
+    let configured = state.config.get_api_key("google").unwrap_or_default();
+    if !configured.trim().is_empty() {
+        return Some(configured);
+    }
+    if adc_available(
+        std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+            .ok()
+            .as_deref(),
+        gcloud_adc_file().as_deref(),
+    ) || on_google_cloud().await
+    {
+        return Some(String::new());
+    }
+    tracing::debug!("Google credentials not configured, skipping");
+    None
+}
+
+/// Whether ADC has a credential file to read: the env var, or gcloud's ADC file on disk.
+fn adc_available(env_path: Option<&str>, gcloud_file: Option<&std::path::Path>) -> bool {
+    env_path.is_some_and(|p| !p.trim().is_empty()) || gcloud_file.is_some_and(|f| f.is_file())
+}
+
+/// gcloud's ADC file: `$CLOUDSDK_CONFIG/application_default_credentials.json`, else
+/// `~/.config/gcloud/application_default_credentials.json`.
+fn gcloud_adc_file() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("CLOUDSDK_CONFIG")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config/gcloud"))
+        })?;
+    Some(dir.join("application_default_credentials.json"))
+}
+
+/// Whether a Google metadata server answers (GCE, GKE, Cloud Run): asked once per process with a
+/// short timeout, so a host off Google Cloud pays one failed lookup, not one per `/voices` call.
+async fn on_google_cloud() -> bool {
+    static ON_GCP: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *ON_GCP
+        .get_or_init(|| async {
+            let host = std::env::var("GCE_METADATA_HOST")
+                .ok()
+                .filter(|h| !h.trim().is_empty())
+                .unwrap_or_else(|| "metadata.google.internal".to_string());
+            let Ok(client) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(500))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+            else {
+                return false;
+            };
+            let found = client
+                .get(format!(
+                    "http://{host}/computeMetadata/v1/project/project-id"
+                ))
+                .header("Metadata-Flavor", "Google")
+                .send()
+                .await
+                .is_ok_and(|r| {
+                    r.status().is_success()
+                        && r.headers()
+                            .get("metadata-flavor")
+                            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"google"))
+                });
+            tracing::debug!(found, "Google metadata server check (once per process)");
+            found
+        })
+        .await
+}
+
 // Helper function to fetch voices from Google TTS API
 async fn fetch_google_voices(
     credentials: &str,
@@ -681,9 +759,8 @@ pub async fn list_voices(State(state): State<Arc<AppState>>) -> axum::response::
         tracing::debug!("Deepgram API key not configured, skipping");
     }
 
-    // Fetch Google TTS voices - skip if not configured
-    // Note: Google returns empty string for ADC which is valid
-    if let Ok(credentials) = state.config.get_api_key("google") {
+    // Fetch Google TTS voices - only when a credential (or ADC with something to find) exists.
+    if let Some(credentials) = google_voice_credentials(&state).await {
         match fetch_google_voices(&credentials).await {
             Ok(voices) => {
                 voices_response.insert("google".to_string(), voices);
@@ -693,8 +770,6 @@ pub async fn list_voices(State(state): State<Arc<AppState>>) -> axum::response::
                 failed.push(("google", e.to_string()));
             }
         }
-    } else {
-        tracing::debug!("Google credentials not configured, skipping");
     }
 
     // Fetch Azure TTS voices - skip if not configured
@@ -988,9 +1063,9 @@ pub(crate) async fn fetch_provider_catalog_with_key(
                 None => Vec::new(),
             }
         }
-        "google" | "google-tts" => match state.config.get_api_key("google") {
-            Ok(creds) => fetch_google_voices(&creds).await.unwrap_or_default(),
-            Err(_) => Vec::new(),
+        "google" | "google-tts" => match google_voice_credentials(state).await {
+            Some(creds) => fetch_google_voices(&creds).await.unwrap_or_default(),
+            None => Vec::new(),
         },
         "azure" | "microsoft-azure" | "microsoft_azure" => {
             match state.config.get_api_key("microsoft-azure") {
@@ -2614,6 +2689,20 @@ mod tests {
             voices_answer(HashMap::new(), Vec::new()).status(),
             StatusCode::OK
         );
+    }
+
+    #[test]
+    fn adc_counts_as_configured_only_with_something_to_find() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("application_default_credentials.json");
+        assert!(!adc_available(None, None));
+        assert!(
+            !adc_available(Some("  "), Some(&file)),
+            "a missing gcloud file is nothing"
+        );
+        assert!(adc_available(Some("/run/secrets/sa.json"), None));
+        std::fs::write(&file, "{}").unwrap();
+        assert!(adc_available(None, Some(&file)));
     }
 
     #[test]

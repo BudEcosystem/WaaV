@@ -4,7 +4,7 @@ BudSTT - Speech-to-Text pipeline
 
 from typing import Any, AsyncIterator, Callable, Optional, Union
 
-from ..types import STTConfig, STTResult, FeatureFlags, AudioFeatures, DAGConfig
+from ..types import STTConfig, STTResult, FeatureFlags, AudioFeatures, DAGConfig, ReadySTT
 from ..ws.session import (
     WebSocketSession,
     SessionMetrics,
@@ -188,12 +188,21 @@ class STTSession:
         """Get the stream ID."""
         return self._session.stream_id
 
+    @property
+    def stt(self) -> Optional[ReadySTT]:
+        """What speech-to-text this session got (``ready.stt``: ``transcription_mode``,
+        ``interim_results``, latency, notices, ...); ``None`` when the gateway does not report it."""
+        return self._session.stt
+
     def on(self, event: str, handler: Callable[..., Any]) -> None:
         """
         Register an event handler.
 
         Args:
-            event: Event name (transcript, error, close)
+            event: Event name (transcript, error, close, stt_warning, vad_event, ...).
+                Non-transcript events are the session's: ``stt_warning`` and
+                ``vad_event`` handlers get the raw frame dict (parse with
+                ``SttWarning.from_wire`` / ``VadEvent.from_wire``).
             handler: Event handler function
         """
         if event == "transcript":

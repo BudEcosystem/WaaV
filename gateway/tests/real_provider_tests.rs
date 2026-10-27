@@ -25,14 +25,15 @@ use std::time::Duration;
 // Test Helper Functions
 // =============================================================================
 
+/// The variable's value; an empty one counts as unset (CI passes a missing secret as "").
 fn get_env_or_skip(key: &str) -> Option<String> {
-    env::var(key).ok()
+    env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
 fn require_env(key: &str) -> String {
-    env::var(key).unwrap_or_else(|_| {
+    get_env_or_skip(key).unwrap_or_else(|| {
         panic!(
-            "Environment variable {} is required for this test. Set it and run with --ignored",
+            "Environment variable {} is required (and non-empty) for this test. Set it and run with --ignored",
             key
         )
     })
@@ -91,12 +92,7 @@ async fn test_deepgram_stt_real() {
                 );
             } else {
                 // 401 = bad API key, which is an expected failure mode
-                assert!(
-                    status.as_u16() == 401 || status.is_client_error(),
-                    "Unexpected server error from Deepgram: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by Deepgram: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -139,12 +135,7 @@ async fn test_deepgram_tts_real() {
                 assert!(audio_bytes.len() > 1000, "TTS audio too short");
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                assert!(
-                    status.as_u16() == 401 || status.is_client_error(),
-                    "Unexpected server error from Deepgram TTS: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by Deepgram TTS: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -197,7 +188,7 @@ async fn test_elevenlabs_stt_real() {
 
             // Accept success or expected client errors
             assert!(
-                status.is_success() || status.as_u16() == 401 || status.as_u16() == 404,
+                status.is_success(),
                 "Unexpected error from ElevenLabs STT: {} - {}",
                 status,
                 body
@@ -224,7 +215,7 @@ async fn test_elevenlabs_tts_real() {
 
     let payload = serde_json::json!({
         "text": "Hello, this is a test of the ElevenLabs text to speech API.",
-        "model_id": "eleven_monolingual_v1"
+        "model_id": "eleven_flash_v2_5"
     });
 
     let response = client
@@ -253,12 +244,7 @@ async fn test_elevenlabs_tts_real() {
                 assert!(audio_bytes.len() > 1000, "TTS audio too short");
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                assert!(
-                    status.as_u16() == 401 || status.is_client_error(),
-                    "Unexpected server error from ElevenLabs TTS: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by ElevenLabs TTS: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -296,12 +282,7 @@ async fn test_elevenlabs_voices_real() {
                 assert!(voices.is_some(), "No voices array in response");
                 println!("ElevenLabs has {} voices available", voices.unwrap().len());
             } else {
-                assert!(
-                    status.as_u16() == 401,
-                    "Unexpected error from ElevenLabs voices: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by ElevenLabs voices: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -358,12 +339,7 @@ async fn test_openai_stt_real() {
                     "OpenAI response missing text field"
                 );
             } else {
-                assert!(
-                    status.as_u16() == 401 || status.is_client_error(),
-                    "Unexpected server error from OpenAI STT: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by OpenAI STT: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -408,12 +384,7 @@ async fn test_openai_tts_real() {
                 assert!(audio_bytes.len() > 1000, "TTS audio too short");
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                assert!(
-                    status.as_u16() == 401 || status.is_client_error(),
-                    "Unexpected server error from OpenAI TTS: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by OpenAI TTS: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -471,12 +442,7 @@ async fn test_cartesia_tts_real() {
                 assert!(audio_bytes.len() > 1000, "TTS audio too short");
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                assert!(
-                    status.as_u16() == 401 || status.as_u16() == 403 || status.is_client_error(),
-                    "Unexpected server error from Cartesia TTS: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by Cartesia TTS: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -515,12 +481,7 @@ async fn test_cartesia_voices_real() {
                     println!("Cartesia has {} voices available", voices.len());
                 }
             } else {
-                assert!(
-                    status.as_u16() == 401 || status.as_u16() == 403,
-                    "Unexpected error from Cartesia voices: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by Cartesia voices: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -572,12 +533,7 @@ async fn test_azure_stt_real() {
                     "Azure response missing RecognitionStatus"
                 );
             } else {
-                assert!(
-                    status.as_u16() == 401 || status.is_client_error(),
-                    "Unexpected server error from Azure STT: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by Azure STT: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -630,12 +586,7 @@ async fn test_azure_tts_real() {
                 assert!(audio_bytes.len() > 1000, "TTS audio too short");
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                assert!(
-                    status.as_u16() == 401 || status.is_client_error(),
-                    "Unexpected server error from Azure TTS: {} - {}",
-                    status,
-                    body
-                );
+                panic!("Refused by Azure TTS: {} - {}", status, body);
             }
         }
         Err(e) => {
@@ -704,8 +655,13 @@ async fn test_gateway_with_real_deepgram() {
     let _api_key = require_env("DEEPGRAM_API_KEY");
 
     // This test requires the gateway to be running with Deepgram configured
-    let gateway_url =
-        env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3001".to_string());
+    let gateway_url = match get_env_or_skip("GATEWAY_URL") {
+        Some(url) => url,
+        None => {
+            println!("skipping: set GATEWAY_URL to a running gateway");
+            return;
+        }
+    };
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -715,17 +671,14 @@ async fn test_gateway_with_real_deepgram() {
     // Check if gateway is running
     let health_check = client.get(format!("{}/", gateway_url)).send().await;
 
-    if health_check.is_err() {
-        println!("Gateway not running at {}. Start it with:", gateway_url);
-        println!("  DEEPGRAM_API_KEY=xxx cargo run");
-        return;
+    if let Err(e) = health_check {
+        panic!("Gateway not reachable at {gateway_url}: {e}");
     }
 
     // Test speak endpoint with Deepgram TTS
     let payload = serde_json::json!({
         "text": "Hello from the gateway integration test.",
-        "provider": "deepgram",
-        "voice_id": "aura-asteria-en"
+        "tts_config": {"provider": "deepgram", "voice_id": "aura-asteria-en"}
     });
 
     let response = client
@@ -745,11 +698,11 @@ async fn test_gateway_with_real_deepgram() {
                 assert!(!audio_bytes.is_empty(), "No audio returned");
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                println!("Gateway error: {}", body);
+                panic!("Gateway refused: {} - {}", status, body);
             }
         }
         Err(e) => {
-            println!("Failed to connect to gateway: {}", e);
+            panic!("Failed to connect to gateway: {}", e);
         }
     }
 }
@@ -759,8 +712,13 @@ async fn test_gateway_with_real_deepgram() {
 async fn test_gateway_voices_with_real_elevenlabs() {
     let _api_key = require_env("ELEVENLABS_API_KEY");
 
-    let gateway_url =
-        env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3001".to_string());
+    let gateway_url = match get_env_or_skip("GATEWAY_URL") {
+        Some(url) => url,
+        None => {
+            println!("skipping: set GATEWAY_URL to a running gateway");
+            return;
+        }
+    };
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -770,10 +728,8 @@ async fn test_gateway_voices_with_real_elevenlabs() {
     // Check if gateway is running
     let health_check = client.get(format!("{}/", gateway_url)).send().await;
 
-    if health_check.is_err() {
-        println!("Gateway not running at {}. Start it with:", gateway_url);
-        println!("  ELEVENLABS_API_KEY=xxx cargo run");
-        return;
+    if let Err(e) = health_check {
+        panic!("Gateway not reachable at {gateway_url}: {e}");
     }
 
     // Test voices endpoint
@@ -793,11 +749,11 @@ async fn test_gateway_voices_with_real_elevenlabs() {
                 let json: serde_json::Value = serde_json::from_str(&body).unwrap();
                 println!("Voices response: {:?}", json);
             } else {
-                println!("Gateway error: {}", body);
+                panic!("Gateway refused: {} - {}", status, body);
             }
         }
         Err(e) => {
-            println!("Failed to connect to gateway: {}", e);
+            panic!("Failed to connect to gateway: {}", e);
         }
     }
 }

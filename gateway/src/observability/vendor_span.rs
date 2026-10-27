@@ -630,13 +630,10 @@ fn scrub(secrets: &[String], text: &str) -> String {
 
 /// The vendor's id for a request, from the response headers vendors use for one.
 pub fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    ["dg-request-id", "request-id", "x-request-id"]
-        .iter()
-        .find_map(|name| headers.get(*name))
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty() && v.len() <= 200)
-        .map(str::to_string)
+    waav_segmented_stt::vendor::request_id(
+        headers,
+        &["dg-request-id", "request-id", "x-request-id"],
+    )
 }
 
 #[cfg(test)]

@@ -70,6 +70,37 @@ function schemaProps(yaml: string, schemaName: string): { props: string[]; requi
   return { props, required };
 }
 
+/**
+ * Extract the property keys of the config envelope: the `type: config` branch of the
+ * `IncomingMessage` oneOf, which is not a top-level component schema. The branch is the one
+ * carrying `conversation_config`; its keys are that key's siblings at the same indent.
+ * (Port of the Python guard's `extract_config_envelope_properties`.)
+ */
+function configEnvelopeProps(yaml: string): string[] {
+  const lines = yaml.split('\n');
+  const indentOf = (l: string) => l.length - l.trimStart().length;
+  const start = lines.findIndex((l) => indentOf(l) === 4 && l.trim() === 'IncomingMessage:');
+  if (start === -1) throw new Error('IncomingMessage schema missing from openapi.yaml');
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i]!.trim() && indentOf(lines[i]!) <= 4) {
+      end = i;
+      break;
+    }
+  }
+  const block = lines.slice(start, end);
+  const anchor = block.findIndex((l) => l.trim() === 'conversation_config:');
+  if (anchor === -1) throw new Error('IncomingMessage has no config branch with conversation_config');
+  const depth = indentOf(block[anchor]!);
+  const props = new Set<string>();
+  const take = (l: string) => {
+    if (indentOf(l) === depth && l.trimEnd().endsWith(':')) props.add(l.trim().slice(0, -1));
+  };
+  for (let j = anchor; j >= 0 && (indentOf(block[j]!) >= depth || !block[j]!.trim()); j--) take(block[j]!);
+  for (let j = anchor + 1; j < block.length && (indentOf(block[j]!) >= depth || !block[j]!.trim()); j++) take(block[j]!);
+  return [...props];
+}
+
 // SDK config field sets (camelCase). These are the typed surfaces the mirror
 // exposes; the drift guard asserts every openapi property maps into one of them
 // (possibly via a documented exception).
@@ -82,6 +113,10 @@ const STT_SDK = new Set([
   'encoding', 'model', 'apiKey', 'extras',
   // D8 uplink transport codec (linear16|opus):
   'audioInCodec',
+  // Segmented STT: requested kind of speech-to-text (auto|streaming|segmented):
+  'transcriptionMode',
+  // WaaV's own uplink denoiser:
+  'noiseSuppression',
   // features{} canonical surface (flattened onto STTConfig):
   'interimResults', 'diarize', 'wordTimestamps', 'smartFormat', 'profanityFilter',
   'fillerWords', 'vadEvents', 'endpointingMs', 'utteranceEndMsFeature', 'keyterms',
@@ -117,6 +152,7 @@ const CONVERSATION_SDK = new Set([
   'latencyFillerPhrases', 'reasoningEffort', 'reasoningModel', 'reasoningBaseUrl',
   'reasoningApiKey', 'reasoningProviderKind', 'reasoningRoute', 'reasoningBudgetMs',
   'degradationMessage', 'maxLlmCallsPerTurn', 'maxReasoningTokens',
+  'credentialRef', 'reasoningCredentialRef', 'llmTimeoutMs',
 ]);
 
 const TURN_SDK = new Set(['enabled', 'threshold', 'eager']);
@@ -128,10 +164,13 @@ const LIVEKIT_SDK = new Set([
 
 const DAG_SDK = new Set(['template', 'definition', 'enableMetrics', 'timeoutMs']);
 
+// Spec 025 voice agent (VoiceAgentConfig, wire `agent`).
+const AGENT_SDK = new Set(['id', 'version', 'textOnly', 'variables']);
+
 // Top-level config envelope (IncomingMessage::Config branch).
 const ENVELOPE_SDK = new Set([
   'streamId', 'audio', 'sttConfig', 'ttsConfig', 'livekit', 'dag', 'conversation',
-  'turnDetection', 'interaction',
+  'turnDetection', 'alias', 'agent', 'interaction',
 ]);
 
 /**
@@ -149,6 +188,7 @@ const EXCEPTIONS: Record<string, Record<string, string>> = {
   TurnDetectionWsConfig: {},
   LiveKitWebSocketConfig: {},
   DAGWebSocketConfig: {},
+  AgentWebSocketConfig: {},
   ConfigEnvelope: {
     type: 'discriminator constant, set by the serializer',
     audio_disabled: 'DEPRECATED alias for audio:false; the SDK uses the canonical `audio` field',
@@ -165,6 +205,7 @@ describe('config drift guard: SDK config ⊇ gateway openapi config schemas', ()
     ['TurnDetectionWsConfig', TURN_SDK],
     ['LiveKitWebSocketConfig', LIVEKIT_SDK],
     ['DAGWebSocketConfig', DAG_SDK],
+    ['AgentWebSocketConfig', AGENT_SDK],
   ];
 
   for (const [schema, sdk] of cases) {
@@ -187,10 +228,8 @@ describe('config drift guard: SDK config ⊇ gateway openapi config schemas', ()
     // The Config branch is an inline oneOf member, not a named schema; assert
     // against the known top-level keys from the spec digest (verified present in
     // the regenerated openapi IncomingMessage oneOf).
-    const envelopeProps = [
-      'stream_id', 'audio', 'audio_disabled', 'stt_config', 'tts_config',
-      'livekit', 'dag_config', 'conversation_config', 'interaction', 'type',
-    ];
+    // Read from the spec, never listed here: a hand-written list cannot notice a new field.
+    const envelopeProps = configEnvelopeProps(yaml);
     const exc = EXCEPTIONS.ConfigEnvelope!;
     // Map wire key → SDK field name.
     const wireToSdk: Record<string, string> = {
@@ -214,14 +253,26 @@ describe('config drift guard: SDK config ⊇ gateway openapi config schemas', ()
 describe('config drift guard: the extractor itself is honest', () => {
   const yaml = readFileSync(OPENAPI, 'utf8');
 
+  // `provider` and `base_url` stopped being required when /ws legs began addressing Bud
+  // deployments (FRD-023 RT6): a deployment decides the vendor, and under the Bud control plane the
+  // conversation loop's LLM is a Bud deployment (the gateway refuses a `base_url`).
   it('parses the documented STT required set', () => {
-    const { required } = schemaProps(yaml, 'STTWebSocketConfig');
-    expect(required.sort()).toEqual(['channels', 'language', 'provider', 'punctuation', 'sample_rate']);
+    const { props, required } = schemaProps(yaml, 'STTWebSocketConfig');
+    expect(required.sort()).toEqual(['channels', 'language', 'punctuation', 'sample_rate']);
+    expect(props).toContain('provider');
   });
 
-  it('parses the documented Conversation required set (base_url + model)', () => {
-    const { required } = schemaProps(yaml, 'ConversationWebSocketConfig');
-    expect(required.sort()).toEqual(['base_url', 'model']);
+  it('parses the documented Conversation required set (model; base_url optional)', () => {
+    const { props, required } = schemaProps(yaml, 'ConversationWebSocketConfig');
+    expect(required.sort()).toEqual(['model']);
+    expect(props).toContain('base_url');
+  });
+
+  it('reads the config envelope from the spec, including the newest keys', () => {
+    const props = configEnvelopeProps(yaml);
+    for (const key of ['type', 'stt_config', 'tts_config', 'conversation_config', 'dag_config', 'alias', 'agent']) {
+      expect(props).toContain(key);
+    }
   });
 
   it('finds a representative reasoning property on the Conversation schema', () => {

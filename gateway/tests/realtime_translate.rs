@@ -50,16 +50,16 @@ const USER: &str = "5b0c7e1d-0000-4000-8000-00000000bc01";
 const API_KEY_ID: &str = "5b0c7e1d-0000-4000-8000-00000000cd01";
 const MODEL_ID: &str = "5b0c7e1d-0000-4000-8000-00000000de01";
 
-/// bud-auth's fixture ciphertext; the plaintext is `VENDOR_KEY`.
-const TEST_CREDENTIAL: &str = include_str!("../../bud-auth/tests/fixtures/test_cred_encrypted.hex");
+/// The test credential (run-time key, see `support/credential_keys.rs`); the plaintext is `VENDOR_KEY`.
+#[path = "support/credential_keys.rs"]
+mod credential_keys;
+
+static TEST_CREDENTIAL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| credential_keys::credential_key().ciphertext.clone());
 const VENDOR_KEY: &str = "dg_vendor_key_abc123";
 
 fn test_pem() -> String {
-    std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../bud-auth/tests/fixtures/test_cred_private.pem"
-    ))
-    .expect("bud-auth's fixture key (git-ignored *.pem) must be present locally")
+    credential_keys::credential_key().pem.clone()
 }
 
 /// Encrypt a credential exactly as budapp does (RSA-OAEP-SHA-256 blocks, hex).

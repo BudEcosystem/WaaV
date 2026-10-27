@@ -1,0 +1,2360 @@
+{
+  "provider_id": "bhashini",
+  "provider": {
+    "aliases": [
+      "bhashini-stt",
+      "bhashini_stt",
+      "ulca",
+      "ai4bharat",
+      "ai4bharat-stt",
+      "meity",
+      "meity-stt"
+    ],
+    "default_model": null,
+    "model_string": "wire_model",
+    "key_normalisation": {
+      "strip_provider_prefix": false
+    },
+    "registered_in_gateway": true,
+    "prerequisites": [
+      {
+        "kind": "configuration_call",
+        "detail": "The service id and the compute address come from the vendor's pipeline configuration call."
+      }
+    ],
+    "notes": "Registered in the plugin registry as bhashini with seven aliases (gateway/src/plugin/builtin/mod.rs:1758-1761); the standard factory matches only the exact string bhashini (gateway/src/core/stt/standard.rs:414-416). This is the Government of India service at bhashini.gov.in; the company at bhashini.ai is unrelated. The vendor exposes service ids, each bound to one model and reached through a pipeline id. The gateway's model field only selects a pipeline: 'ai4bharat' or 'a4b' selects the AI4Bharat pipeline and anything else the MeitY pipeline (gateway/src/core/stt/bhashini/config.rs:561-564). The service id then comes from the vendor's configuration call at run time (client.rs:296-301), so a customer cannot name one today and an empty model cannot be resolved to a row in advance; default_model is therefore null and such sessions use the provider default row. The existing client buffers the audio and uploads it once, when it is disconnected (client.rs:506-552). That happens at hang-up, or earlier when the caller's application sends the end-of-audio message, which makes the gateway disconnect and reconnect the speech-to-text client (gateway/src/handlers/ws/audio_handler.rs:301-314, gateway/src/core/voice_manager/manager.rs:1648-1672). So a conversation gets no transcript while it is in progress, and audio beyond 10 MB is rejected (client.rs:51). A push-to-talk application that sends the end-of-audio message after each utterance is therefore the one use that can get a transcript today, provided the vendor's reply parses (see the next sentences). Even the transcript at hang-up is doubtful: a call longer than about 30 s is uploaded as one clip beyond the length the vendor documents without its voice-activity pre-processor, and a response in the vendor's documented shape (audio set to null) would fail to parse and be retried twice more (messages.rs:354-359, client.rs:356-400). That is inferred from reading and was not run. The vendor also documents a Socket.IO live interface that takes a service id; the gateway has no client for it and the audit recommends against building one now. Eight of the twelve service ids begin with 'bhashini/' and four with the alias 'ai4bharat/', so the rows are keyed by the full wire string and no provider prefix is stripped. The only live contact with the vendor during the research was unauthenticated: the compute endpoint answered HTTP 403 'Not authenticated' and the Socket.IO endpoint answered with a handshake, which confirms that both exist. Nothing was transcribed, which is why every row says it was verified from documentation."
+  },
+  "rows": [
+    {
+      "id": "bhashini:ai4bharat-conformer-hi-gpu--t4",
+      "match": {
+        "provider": "bhashini",
+        "model": "ai4bharat/conformer-hi-gpu--t4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "hi"
+              ],
+              "note": "The languages the vendor's model list gives for this service."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359",
+          "gateway/src/core/stt/bhashini/config.rs:225-227"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: Hindi (model by AI4Bharat). It is the gateway's built-in fallback service id for Hindi (gateway/src/core/stt/bhashini/config.rs:225-227), used only when the vendor's configuration call returns no service id. The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:ai4bharat-conformer-multilingual-indo_aryan-gpu--t4",
+      "match": {
+        "provider": "bhashini",
+        "model": "ai4bharat/conformer-multilingual-indo_aryan-gpu--t4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "hi",
+                "bn",
+                "mr",
+                "ur",
+                "or",
+                "pa",
+                "gu",
+                "sa"
+              ],
+              "note": "The languages the vendor's model list gives for this service."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359",
+          "gateway/src/core/stt/bhashini/config.rs:198-211",
+          "gateway/src/core/stt/bhashini/config.rs:229"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: Hindi, Bengali, Marathi, Urdu, Odia, Punjabi, Gujarati and Sanskrit (model by AI4Bharat). The gateway's built-in fallback table (gateway/src/core/stt/bhashini/config.rs:198-211, 229) also sends Nepali, Sindhi, Konkani, Dogri, Kashmiri, Maithili and Bhojpuri here, which the vendor does not list for this service. The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:ai4bharat-conformer-multilingual-dravidian-gpu--t4",
+      "match": {
+        "provider": "bhashini",
+        "model": "ai4bharat/conformer-multilingual-dravidian-gpu--t4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "kn",
+                "ml",
+                "ta",
+                "te"
+              ],
+              "note": "The languages the vendor's model list gives for this service."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: Kannada, Malayalam, Tamil and Telugu (model by AI4Bharat). The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:ai4bharat-whisper-medium-en--gpu--t4",
+      "match": {
+        "provider": "bhashini",
+        "model": "ai4bharat/whisper-medium-en--gpu--t4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "en"
+              ],
+              "note": "The languages the vendor's model list gives for this service."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: English (a Whisper model served by AI4Bharat). Because it is a Whisper model, the gateway's list of phrases that Whisper invents on non-speech audio should be applied to this service id only. The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:bhashini-ai4bharat-conformer-multilingual-asr",
+      "match": {
+        "provider": "bhashini",
+        "model": "bhashini/ai4bharat/conformer-multilingual-asr"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "as",
+                "bn",
+                "brx",
+                "doi",
+                "gu",
+                "hi",
+                "kn",
+                "ks",
+                "gom",
+                "kok",
+                "mai",
+                "ml",
+                "mni",
+                "mr",
+                "ne",
+                "or",
+                "pa",
+                "sa",
+                "sat",
+                "sd",
+                "ta",
+                "te",
+                "ur"
+              ],
+              "note": "The languages the vendor's model list gives for this service. The vendor lists Goan Konkani; which code its sourceLanguage takes for it is not confirmed, so both gom and kok are admitted."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "hotword_list",
+                "note": "Hindi only, one service. A post-processor in the compute request; any other language must raise a configuration warning."
+              }
+            ],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: Assamese, Bengali, Bodo, Dogri, Gujarati, Hindi, Kannada, Kashmiri, Goan Konkani, Maithili, Malayalam, Manipuri, Marathi, Nepali, Odia, Punjabi, Sanskrit, Santali, Sindhi, Tamil, Telugu and Urdu, 22 in all (model by AI4Bharat). It is the only service with the hotword_list post-processor, which biases recognition towards listed words and applies to Hindi only; that is recorded as keyterms and must raise a configuration warning for any other language. The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:bhashini-iitm-asr-dravidian--gpu--t4",
+      "match": {
+        "provider": "bhashini",
+        "model": "bhashini/iitm/asr-dravidian--gpu--t4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "te",
+                "kn",
+                "ml",
+                "ta"
+              ],
+              "note": "The languages the vendor's model list gives for this service."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: Telugu, Kannada, Malayalam and Tamil (model by IIT Madras). The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:bhashini-iitm-asr-indoaryan--gpu--t4",
+      "match": {
+        "provider": "bhashini",
+        "model": "bhashini/iitm/asr-indoaryan--gpu--t4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "gu",
+                "or",
+                "hi",
+                "mr",
+                "pa",
+                "bn"
+              ],
+              "note": "The languages the vendor's model list gives for this service."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: Gujarati, Odia, Hindi, Marathi, Punjabi and Bengali (model by IIT Madras). The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:bhashini-iitm-asr-misc--gpu--t4",
+      "match": {
+        "provider": "bhashini",
+        "model": "bhashini/iitm/asr-misc--gpu--t4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "bho",
+                "ur"
+              ],
+              "note": "The languages the vendor's model list gives for this service."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359",
+          "gateway/src/core/stt/bhashini/config.rs:212-217",
+          "gateway/src/core/stt/bhashini/config.rs:240"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: Bhojpuri and Urdu only (model by IIT Madras). The gateway's built-in fallback table (gateway/src/core/stt/bhashini/config.rs:212-217, 240) sends Assamese, Bodo, Manipuri, Santali and Sanskrit here, which the vendor does not list for this service. The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:bhashini-iisc-asr-mai-t4",
+      "match": {
+        "provider": "bhashini",
+        "model": "bhashini/iisc/asr-mai-t4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "mai"
+              ],
+              "note": "The languages the vendor's model list gives for this service."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359",
+          "gateway/src/core/stt/bhashini/config.rs:208",
+          "gateway/src/core/stt/bhashini/config.rs:237-238"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: Maithili (model by IISc). The gateway's fallback table cannot reach this service: it classifies Maithili as Indo-Aryan first (gateway/src/core/stt/bhashini/config.rs:208, 237-238). The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:bhashini-iisc-asr-bho-t4",
+      "match": {
+        "provider": "bhashini",
+        "model": "bhashini/iisc/asr-bho-t4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "bho"
+              ],
+              "note": "The languages the vendor's model list gives for this service."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359",
+          "gateway/src/core/stt/bhashini/config.rs:209",
+          "gateway/src/core/stt/bhashini/config.rs:235-236"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: Bhojpuri (model by IISc). The gateway's fallback table cannot reach this service: it classifies Bhojpuri as Indo-Aryan first (gateway/src/core/stt/bhashini/config.rs:209, 235-236). The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:bhashini-bodhan-asr-transcribe-flex",
+      "match": {
+        "provider": "bhashini",
+        "model": "bhashini/bodhan/asr-transcribe-flex"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: English plus 26 Indian languages (model by Bodhan.AI). The gateway does not know this service id. How it differs from asr-transcribe-core is not documented. The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:bhashini-bodhan-asr-transcribe-core",
+      "match": {
+        "provider": "bhashini",
+        "model": "bhashini/bodhan/asr-transcribe-core"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking. The gateway also cannot yet send a service id named by the session: its model field only selects a pipeline, and the service id is taken from the vendor's configuration call. Until that is built, enabling this transport for this row would transcribe with whatever service the pipeline returns, not with the one the row names.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Languages the vendor lists for this service: English plus 24 Indian languages (model by Bodhan.AI). The gateway does not know this service id. The id is the exact service id from the vendor's model list; the compute request carries it as serviceId. The source language is required as an ISO 639 code such as hi, and this call does no automatic detection. The gateway cannot select a service id today: its model field only chooses a pipeline, and the service id comes back from the vendor's configuration call (gateway/src/core/stt/bhashini/config.rs:561-564, client.rs:296-301). A 25 s gateway segment with its padding stays under the documented 30 s line, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that is the auditor's estimate. The vendor returns no confidence, timestamps or detected language, so dropping bad transcripts depends on the gateway never uploading silence."
+      }
+    },
+    {
+      "id": "bhashini:any",
+      "match": {
+        "provider": "bhashini",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The existing Bhashini client buffers the whole call in memory and uploads it once, when the client is disconnected (at hang-up, or earlier if the caller's application sends an explicit end-of-audio message), so it produces no transcript while the caller is speaking.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the compute call and no credentials were available to measure it."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audioFormat",
+                "value": "wav",
+                "in": "json"
+              },
+              {
+                "name": "samplingRate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [],
+            "wire": "bhashini_pipeline_json"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/bhashini/client.rs:317-463, 506-552; gateway/src/core/stt/bhashini/messages.rs:305-333, 354-359",
+            "notes": "There is no per-utterance upload. Request code that can be reused does exist: PipelineComputeRequest::new_asr builds the JSON body and send_audio_to_compute posts it, but today it runs only once, at disconnect, on the whole buffered call. The exchange has two steps. A pipeline configuration call returns the upload address, the name and value of the authorisation header, and the service id; then one synchronous JSON request carries the audio as base64 text in inputData.audio[0].audioContent. It is not multipart, and a full 25 s segment is about 1.05 MiB of JSON. The language travels as config.language.sourceLanguage and the format as audioFormat and samplingRate, which must match the audio. Before reuse: build one pooled HTTP client instead of one per request (client.rs:412-421); replace the three attempts of 60 s each (client.rs:54-63); accept null for output and audio in the response, because the vendor's documented sample has audio set to null and the present structs reject that (messages.rs:354-359); send post-processors in the compute request, where the vendor reads them; and stop reporting a fixed confidence of 0.95 (client.rs:377). The adapter must not send the vendor's voice-activity pre-processor, because the gateway has already cut the audio."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's Socket.IO speech recognition interface (wss://dhruva-api.bhashini.gov.in), and the vendor does not say which service ids it serves. The audit recommends not building one now: according to the open-source reference server it cuts the audio with its own voice-activity detector and posts each piece to the same file endpoint, answering at most once per second of audio.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "sourceLanguage",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "bhashini_socketio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Listed so that the map records that the vendor does offer a live interface; routing must follow what the gateway can do, which is nothing on this transport. The gateway has no Socket.IO dependency. Facts from the vendor's page and its own Java client: audio is 8 kHz 16-bit mono PCM; the client sends a start event carrying the service id, waits for ready, then sends data events; the server sends response events at a configured interval (responseFrequencyInSecs). The values recorded for interim results, endpointing owner and turn signal come from the open-source reference server, and it is not confirmed that the production server behaves the same way."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/bhashini/client.rs:506-552 (send_audio only buffers; the one upload runs in disconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Bhashini transcribes uploaded audio, and this gateway's Bhashini client sends the audio once, when the client ends the turn or the call ends, so it gives no transcript while a conversation is in progress. It cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, choose a provider that streams, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no prices. Its public keys are for proof of concept only, and paid plans are arranged with the Bhashini team. There is no Bhashini speech-to-text price in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/available-models-for-usage.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/request-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-compute-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-config-call/response-payload.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/pipeline-search-call.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/overall-understanding-of-the-api-calls.md",
+          "https://dibd-bhashini.gitbook.io/bhashini-apis/websocket-asr-api.md",
+          "https://raw.githubusercontent.com/AI4Bharat/Dhruva-Platform/master/server/seq_streamer.py",
+          "https://raw.githubusercontent.com/bhashini-dibd/bhashini-websockets/main/Java/web-socket-client/src/main/java/client/web_socket_client/ULCASocketClient.java"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/bhashini/client.rs:296-301",
+          "gateway/src/core/stt/bhashini/client.rs:317-463",
+          "gateway/src/core/stt/bhashini/client.rs:506-552",
+          "gateway/src/core/stt/bhashini/config.rs:561-564",
+          "gateway/src/core/stt/bhashini/messages.rs:305-333",
+          "gateway/src/core/stt/bhashini/messages.rs:354-359"
+        ],
+        "unverified": [
+          "everything in this row when applied to a model id the map has not seen",
+          "transports[0].limits.max_upload_bytes and the hard maximum audio duration (not published; 30 s is the documented length beyond which the vendor requires its voice-activity pre-processor)",
+          "transports[0].limits.min_audio_ms and rates (no limits are published; the vendor's error page is empty)",
+          "transports[0].latency (no vendor figure and no credentials to measure)",
+          "transports[0] response shape (the documented sample has audio set to null; whether production responses match is not confirmed)",
+          "transports[0] sample rate handling (the vendor states a minimum of 8000 Hz and that declared values must match the audio; server-side resampling is not in the official documentation)",
+          "transports[1] as a whole (whether the vendor socket serves this service id, and whether production matches the open-source reference server)",
+          "billing (unit, prices and minimum billed duration are not published)",
+          "which pipeline id returns this service id for a given language (decided by the vendor's configuration call at run time)",
+          "transports[0].dialect.language_format (the vendor takes ISO 639 codes, two letters where one exists and three otherwise, such as hi and brx; no value of the schema names that mix, so the field is left out)",
+          "transports[1].stream_audio (8 kHz 16-bit mono PCM is the documented socket format; whether other rates are accepted is not stated)"
+        ],
+        "notes": "Provider default. It is used for an empty model, for the pipeline selectors 'ai4bharat' and 'a4b' that existing configurations put in the model field, and for any service id the map has not seen. In all of those cases the service id is chosen by the vendor's configuration call at run time, per pipeline and language, so the map cannot name it in advance. Every known Bhashini speech recognition service is reached through the same synchronous compute call, so the row chooses file upload, the slower but safer guess. The pipeline id for 'ai4bharat' that the gateway holds (643930aa521a4b1ba0f4c41d) is absent from the vendor's current documentation and may no longer resolve. The id ai4bharat/conformer-en-gpu--t4 appears in one of the vendor's documentation samples but not in its list of available models, so it has no row and falls here."
+      }
+    }
+  ]
+}

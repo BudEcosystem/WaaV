@@ -1,0 +1,1576 @@
+{
+  "provider_id": "iflytek",
+  "provider": {
+    "aliases": [
+      "iflytek-stt",
+      "iflytek_stt",
+      "ifly",
+      "xfyun",
+      "xunfei",
+      "讯飞",
+      "科大讯飞"
+    ],
+    "default_model": "iat",
+    "model_string": "gateway_alias",
+    "registered_in_gateway": true,
+    "notes": "Registered at gateway/src/plugin/builtin/mod.rs:1763-1766; dispatched at gateway/src/core/stt/standard.rs:436-437 (which also accepts 'ifly'). MODEL KEY: iFlytek has no model parameter. Rows are keyed by the vendor's business.domain value, which matches how the gateway picks the socket today: a model string containing 'realtime', 'stream' or 'ist' selects the real-time socket and anything else, including an empty string, selects the short-form socket with domain 'iat' (gateway/src/core/stt/iflytek/config.rs:422-436). default_model is therefore 'iat' although the vendor has no model field. Three glob rows, '*realtime*', '*stream*' and '*ist*', mirror that substring routing so that a string the gateway sends to the real-time socket is not described as the short-form product; they are marked assumed and should be deleted when model routing becomes an exact lookup. The client targets the international (Singapore) hosts only. NO FILE UPLOAD: segmentation by file upload is neither needed nor possible. Every product that can serve a call is a WebSocket stream, and the only file API is an asynchronous job with a stated floor of about 20 seconds. STREAMING CLIENT (adapter native, known_broken; read from code and vendor documentation, never run against the vendor; paths under gateway/src/core/stt/iflytek/ unless stated): (1) A short-form session holds one utterance: the vendor's final result sets session_ended (client.rs:253-257), the next tick returns Completed (client.rs:191-195) and the supervisor exits without redialling (gateway/src/core/websocket/reconnectable_stream.rs:374-376). Every later send_audio fails (client.rs:841-844) while is_ready stays true (client.rs:827-829). The repository test states this is by design (gateway/tests/mock_endpoint_e2e.rs:578-580). (2) Results are slices the client is expected to join and, for 'rpl' slices, replace; the client emits each slice alone (messages.rs:481-486, client.rs:489-508), so a final carries only the last fragment, and an empty last slice emits no final at all. (3) Confidence is the average of a field the vendor documents as reserved, or an invented 0.95 (messages.rs:489-500). (4) On the short-form socket the end of an utterance is the vendor's silence timeout vad_eos, 2000 ms by default (config.rs:439), so end of speech to final is at least two seconds. (5) On the real-time socket the client always sends domain 'iat' (config.rs:436) and vad_eos, where the vendor documents the domains ist_open, ist, ist_hy, ist_huanyu and sp_ist_vais, the parameter 'punc', 16 kHz audio only and no vad_eos; and it marks a result final only when data.status is 2, which on that socket follows the client's own end marker, so probably no final arrives before hang-up (inferred). (6) An unknown language falls back to Mandarin (config.rs:416), and Cantonese is sent as language 'zh_hk' with accent 'cantonese' (config.rs:126, :174), which is not a vendor value: the vendor selects Cantonese with language 'zh_cn' plus accent 'cantonese' on both sockets. (7) vad_eos is copied from the customer's endpointing_ms without a bound (config.rs:469-471; validate() at config.rs:496-525 never checks it), although the vendor's maximum is 10000 ms. (8) Once the first frame has gone, the loop sends a frame every 40 ms even when it has no audio (client.rs:198), so zero-length frames flow during silence, the vendor's 10 second idle timer never fires, and silence is never withheld. (9) After the first utterance the session is not closed or redialled: each audio frame the caller sends produces one error message to the client (gateway/src/handlers/ws/audio_handler.rs:130-133; LiveKit path gateway/src/handlers/ws/config_handler.rs:2947-2954). PER-UTTERANCE SOCKET (adapter planned_commit, which no release builds): open a short-form session when the gateway's detector reports speech (pre-roll first), stream in real time, send the end marker {\"data\":{\"status\":2}} when the detector reports end of speech, then open the next session; rotate before 60 seconds. Set vad_eos to its maximum of 10000 ms so the vendor's silence timeout does not end the session first. The vendor asks for 1280 bytes every 40 ms and warns that a shorter interval may cause incorrect recognition. Results must be assembled by slice number with replacements applied. This adapter shares its speech start and stop events with the segmented engine. STATE TODAY: the streaming client is the native transport, enabled from Release 0, groundwork and honest refusal, and reported as known broken in ready.stt rather than refused (integration decisions, section 15); each native transport carries its defect. No release builds a file or commit transport for iFlytek (decisions section 12: its only file interface is a slow asynchronous job). Speed Transcription task types, which today's client silently streams as domain 'iat', are refused from Release 3, default on. config/pricing.rs has no iFlytek entries, so rows carry no pricing_key."
+  },
+  "rows": [
+    {
+      "id": "iflytek:iat",
+      "match": {
+        "provider": "iflytek",
+        "model": "iat"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open one short-form session per utterance and send the vendor end marker when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "max_session_ms": 60000,
+            "idle_timeout_ms": 10000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor's default ('50 channels are supported by default'); whether it counts per application or per account is not stated."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 5,
+                "plan": "free_trial",
+                "scope": "unknown",
+                "note": "'During free trial you can only send a maximum of five concurrent requests.'"
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_iat_ws"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Proposed by the audit as utterance-scoped streaming; details are in the provider notes. Audio is raw 16 kHz PCM16 as Base64 in JSON frames (no WAV header), paced at 1280 bytes every 40 ms."
+          },
+          "segment_profile": {
+            "trailing_silence_ms": 0,
+            "max_segment_ms": 55000,
+            "max_in_flight": 1,
+            "request_timeout_ms": 5000,
+            "rationale": "The audit's profile for per-utterance sessions. No silence is appended because under real-time pacing it delays the final by its own length; the end marker is sent at end of speech instead. 55 seconds because the vendor closes a session at 60. One in flight because sessions are sequential. 5000 ms from end marker to final is a proposal; no latency is published."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 60000,
+            "idle_timeout_ms": 10000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor's default ('50 channels are supported by default'); whether it counts per application or per account is not stated."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 5,
+                "plan": "free_trial",
+                "scope": "unknown",
+                "note": "'During free trial you can only send a maximum of five concurrent requests.'"
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_iat_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken for a call: the short-form session ends at the vendor's first final result and is never reopened, so only the first utterance is transcribed, and results are emitted as unassembled fragments. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/client.rs:191-195,253-257,489-508; gateway/src/core/stt/iflytek/messages.rs:481-500; gateway/src/core/websocket/reconnectable_stream.rs:374-376",
+            "notes": "The defect list with line references is in the provider notes."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Short Form ASR is billed per service call (one session is one call), not per second. With one session per utterance, every utterance is a call."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/API.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436",
+          "gateway/src/core/stt/iflytek/client.rs:190-195",
+          "gateway/src/core/stt/iflytek/client.rs:252-257"
+        ],
+        "unverified": [
+          "limits.rates[].scope (the vendor says 50 channels by default and 5 on the free trial, without saying whether that is per application or per account)",
+          "whether languages other than Chinese and English work on this socket URL (the page says minority languages use a different URL but lists only one)",
+          "how much faster than real time audio may be sent, and whether ending an utterance without trailing silence clips the last word",
+          "transports[0].segment_profile.request_timeout_ms (a proposal, not measured), and all latency"
+        ],
+        "notes": "Row key: the vendor's business.domain value; iFlytek has no model parameter. The general domain of Short Form ASR on wss://iat-api-sg.xf-yun.com/v2/iat (60 seconds per session); it is what an empty model selects. The large-model engine uses the same socket and domain and is chosen by language code (mq_cbm, cn_cbm, en_cbm and others), which the gateway's language parser cannot express today."
+      }
+    },
+    {
+      "id": "iflytek:medical",
+      "match": {
+        "provider": "iflytek",
+        "model": "medical"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open one short-form session per utterance and send the vendor end marker when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "max_session_ms": 60000,
+            "idle_timeout_ms": 10000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor's default ('50 channels are supported by default'); whether it counts per application or per account is not stated."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 5,
+                "plan": "free_trial",
+                "scope": "unknown",
+                "note": "'During free trial you can only send a maximum of five concurrent requests.'"
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_iat_ws"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Proposed by the audit as utterance-scoped streaming; details are in the provider notes. Audio is raw 16 kHz PCM16 as Base64 in JSON frames (no WAV header), paced at 1280 bytes every 40 ms. The vendor says the medical domain cannot be used without authorisation in its console. The audit adds that an unauthorised request is ignored silently; the fact-check confirmed only the first statement."
+          },
+          "segment_profile": {
+            "trailing_silence_ms": 0,
+            "max_segment_ms": 55000,
+            "max_in_flight": 1,
+            "request_timeout_ms": 5000,
+            "rationale": "The audit's profile for per-utterance sessions. No silence is appended because under real-time pacing it delays the final by its own length; the end marker is sent at end of speech instead. 55 seconds because the vendor closes a session at 60. One in flight because sessions are sequential. 5000 ms from end marker to final is a proposal; no latency is published."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 60000,
+            "idle_timeout_ms": 10000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor's default ('50 channels are supported by default'); whether it counts per application or per account is not stated."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 5,
+                "plan": "free_trial",
+                "scope": "unknown",
+                "note": "'During free trial you can only send a maximum of five concurrent requests.'"
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_iat_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken for a call: the short-form session ends at the vendor's first final result and is never reopened, so only the first utterance is transcribed, and results are emitted as unassembled fragments. The client also cannot select this domain: it always sends domain 'iat'. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/client.rs:191-195,253-257,489-508; gateway/src/core/stt/iflytek/messages.rs:481-500; gateway/src/core/websocket/reconnectable_stream.rs:374-376",
+            "notes": "The defect list with line references is in the provider notes. The domain is set to its default 'iat' and nothing changes it (config.rs:436; default at config.rs:288-291)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Short Form ASR is billed per service call (one session is one call), not per second. With one session per utterance, every utterance is a call."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/API.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436",
+          "gateway/src/core/stt/iflytek/client.rs:190-195",
+          "gateway/src/core/stt/iflytek/client.rs:252-257"
+        ],
+        "unverified": [
+          "limits.rates[].scope (the vendor says 50 channels by default and 5 on the free trial, without saying whether that is per application or per account)",
+          "whether languages other than Chinese and English work on this socket URL (the page says minority languages use a different URL but lists only one)",
+          "how much faster than real time audio may be sent, and whether ending an utterance without trailing silence clips the last word",
+          "transports[0].segment_profile.request_timeout_ms (a proposal, not measured), and all latency",
+          "what the vendor does with domain 'medical' on an account that is not authorised for it"
+        ],
+        "notes": "Row key: the vendor's business.domain value; iFlytek has no model parameter. The medical domain of Short Form ASR, on the same socket as 'iat'. It needs console authorisation. Today a model string 'medical' selects the short-form socket but is sent with domain 'iat'."
+      }
+    },
+    {
+      "id": "iflytek:ist_open",
+      "match": {
+        "provider": "iflytek",
+        "model": "ist_open"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_ist_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the documented protocol of the real-time socket: the client always sends domain 'iat' instead of this row's value, sends punctuation as 'ptt' instead of 'punc', sends 'vad_eos' although the socket has no such parameter, and reports a final result only when the whole session is complete. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-440; gateway/src/core/stt/iflytek/client.rs:489-508; gateway/src/core/stt/iflytek/messages.rs:481-500",
+            "notes": "The defect list with line references is in the provider notes. Whether the server rejects or ignores the undocumented parameters is unverified."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time ASR is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/rtasr/rtasr/API.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "transports[0].endpointing_owner and transports[0].vendor_turn_signal (the page documents no end-of-utterance signal other than slices marked pgs 'apd'; whether a final arrives before the client's end marker is unverified)",
+          "transports[0].limits.rates (concurrent_sessions) and all billing fields (Real-time ASR is not on the pricing page)",
+          "which languages are really offered (the product page says only English and Chinese; the API page lists ten language rows)",
+          "latency"
+        ],
+        "notes": "Row key: the vendor's business.domain value; iFlytek has no model parameter. A Real-time ASR domain on wss://ist-api-sg.xf-yun.com/v2/ist (up to 5 hours, 16 kHz PCM only), documented for Mandarin, English, French, Thai and Vietnamese. No per-utterance transport is proposed for this socket, so until the streaming client is repaired the domain has no usable live path."
+      }
+    },
+    {
+      "id": "iflytek:ist",
+      "match": {
+        "provider": "iflytek",
+        "model": "ist"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_ist_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the documented protocol of the real-time socket: the client always sends domain 'iat' instead of this row's value, sends punctuation as 'ptt' instead of 'punc', sends 'vad_eos' although the socket has no such parameter, and reports a final result only when the whole session is complete. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-440; gateway/src/core/stt/iflytek/client.rs:489-508; gateway/src/core/stt/iflytek/messages.rs:481-500",
+            "notes": "The defect list with line references is in the provider notes. Whether the server rejects or ignores the undocumented parameters is unverified."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time ASR is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/rtasr/rtasr/API.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "transports[0].endpointing_owner and transports[0].vendor_turn_signal (the page documents no end-of-utterance signal other than slices marked pgs 'apd'; whether a final arrives before the client's end marker is unverified)",
+          "transports[0].limits.rates (concurrent_sessions) and all billing fields (Real-time ASR is not on the pricing page)",
+          "which languages are really offered (the product page says only English and Chinese; the API page lists ten language rows)",
+          "latency"
+        ],
+        "notes": "Row key: the vendor's business.domain value; iFlytek has no model parameter. A Real-time ASR domain on wss://ist-api-sg.xf-yun.com/v2/ist (up to 5 hours, 16 kHz PCM only), documented for Korean, and Cantonese (language zh_cn with accent cantonese). No per-utterance transport is proposed for this socket, so until the streaming client is repaired the domain has no usable live path."
+      }
+    },
+    {
+      "id": "iflytek:ist_hy",
+      "match": {
+        "provider": "iflytek",
+        "model": "ist_hy"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_ist_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the documented protocol of the real-time socket: the client always sends domain 'iat' instead of this row's value, sends punctuation as 'ptt' instead of 'punc', sends 'vad_eos' although the socket has no such parameter, and reports a final result only when the whole session is complete. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-440; gateway/src/core/stt/iflytek/client.rs:489-508; gateway/src/core/stt/iflytek/messages.rs:481-500",
+            "notes": "The defect list with line references is in the provider notes. Whether the server rejects or ignores the undocumented parameters is unverified."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time ASR is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/rtasr/rtasr/API.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "transports[0].endpointing_owner and transports[0].vendor_turn_signal (the page documents no end-of-utterance signal other than slices marked pgs 'apd'; whether a final arrives before the client's end marker is unverified)",
+          "transports[0].limits.rates (concurrent_sessions) and all billing fields (Real-time ASR is not on the pricing page)",
+          "which languages are really offered (the product page says only English and Chinese; the API page lists ten language rows)",
+          "latency"
+        ],
+        "notes": "Row key: the vendor's business.domain value; iFlytek has no model parameter. A Real-time ASR domain on wss://ist-api-sg.xf-yun.com/v2/ist (up to 5 hours, 16 kHz PCM only), documented for Indonesian and mixed Chinese-English. No per-utterance transport is proposed for this socket, so until the streaming client is repaired the domain has no usable live path."
+      }
+    },
+    {
+      "id": "iflytek:ist_huanyu",
+      "match": {
+        "provider": "iflytek",
+        "model": "ist_huanyu"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_ist_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the documented protocol of the real-time socket: the client always sends domain 'iat' instead of this row's value, sends punctuation as 'ptt' instead of 'punc', sends 'vad_eos' although the socket has no such parameter, and reports a final result only when the whole session is complete. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-440; gateway/src/core/stt/iflytek/client.rs:489-508; gateway/src/core/stt/iflytek/messages.rs:481-500",
+            "notes": "The defect list with line references is in the provider notes. Whether the server rejects or ignores the undocumented parameters is unverified."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time ASR is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/rtasr/rtasr/API.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "transports[0].endpointing_owner and transports[0].vendor_turn_signal (the page documents no end-of-utterance signal other than slices marked pgs 'apd'; whether a final arrives before the client's end marker is unverified)",
+          "transports[0].limits.rates (concurrent_sessions) and all billing fields (Real-time ASR is not on the pricing page)",
+          "which languages are really offered (the product page says only English and Chinese; the API page lists ten language rows)",
+          "latency"
+        ],
+        "notes": "Row key: the vendor's business.domain value; iFlytek has no model parameter. A Real-time ASR domain on wss://ist-api-sg.xf-yun.com/v2/ist (up to 5 hours, 16 kHz PCM only), documented for Arabic. No per-utterance transport is proposed for this socket, so until the streaming client is repaired the domain has no usable live path."
+      }
+    },
+    {
+      "id": "iflytek:sp_ist_vais",
+      "match": {
+        "provider": "iflytek",
+        "model": "sp_ist_vais"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_ist_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the documented protocol of the real-time socket: the client always sends domain 'iat' instead of this row's value, sends punctuation as 'ptt' instead of 'punc', sends 'vad_eos' although the socket has no such parameter, and reports a final result only when the whole session is complete. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-440; gateway/src/core/stt/iflytek/client.rs:489-508; gateway/src/core/stt/iflytek/messages.rs:481-500",
+            "notes": "The defect list with line references is in the provider notes. Whether the server rejects or ignores the undocumented parameters is unverified."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time ASR is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/rtasr/rtasr/API.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "transports[0].endpointing_owner and transports[0].vendor_turn_signal (the page documents no end-of-utterance signal other than slices marked pgs 'apd'; whether a final arrives before the client's end marker is unverified)",
+          "transports[0].limits.rates (concurrent_sessions) and all billing fields (Real-time ASR is not on the pricing page)",
+          "which languages are really offered (the product page says only English and Chinese; the API page lists ten language rows)",
+          "latency"
+        ],
+        "notes": "Row key: the vendor's business.domain value; iFlytek has no model parameter. A Real-time ASR domain on wss://ist-api-sg.xf-yun.com/v2/ist (up to 5 hours, 16 kHz PCM only), documented for Vietnamese (alternative domain). No per-utterance transport is proposed for this socket, so until the streaming client is repaired the domain has no usable live path."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_cn_10m_ed",
+      "match": {
+        "provider": "iflytek",
+        "model": "iflyrec_voice_cn_10m_ed"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: the vendor's task_type value; iFlytek has no model parameter. A Speed Transcription task_type, not a domain. Today the gateway accepts this string and silently routes it to the short-form streaming socket (gateway/src/core/stt/iflytek/config.rs:422-429); it should be refused for calls."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_ja_jp_24h",
+      "match": {
+        "provider": "iflytek",
+        "model": "iflyrec_voice_ja_jp_24h"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: the vendor's task_type value; iFlytek has no model parameter. A Speed Transcription task_type, not a domain. Today the gateway accepts this string and silently routes it to the short-form streaming socket (gateway/src/core/stt/iflytek/config.rs:422-429); it should be refused for calls."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_ko_kr_24h",
+      "match": {
+        "provider": "iflytek",
+        "model": "iflyrec_voice_ko_kr_24h"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: the vendor's task_type value; iFlytek has no model parameter. A Speed Transcription task_type, not a domain. Today the gateway accepts this string and silently routes it to the short-form streaming socket (gateway/src/core/stt/iflytek/config.rs:422-429); it should be refused for calls."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_de_de_24h",
+      "match": {
+        "provider": "iflytek",
+        "model": "iflyrec_voice_de_de_24h"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: the vendor's task_type value; iFlytek has no model parameter. A Speed Transcription task_type, not a domain. Today the gateway accepts this string and silently routes it to the short-form streaming socket (gateway/src/core/stt/iflytek/config.rs:422-429); it should be refused for calls."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_fr_fr_24h",
+      "match": {
+        "provider": "iflytek",
+        "model": "iflyrec_voice_fr_fr_24h"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: the vendor's task_type value; iFlytek has no model parameter. A Speed Transcription task_type, not a domain. Today the gateway accepts this string and silently routes it to the short-form streaming socket (gateway/src/core/stt/iflytek/config.rs:422-429); it should be refused for calls."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_es_es_24h",
+      "match": {
+        "provider": "iflytek",
+        "model": "iflyrec_voice_es_es_24h"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: the vendor's task_type value; iFlytek has no model parameter. A Speed Transcription task_type, not a domain. Today the gateway accepts this string and silently routes it to the short-form streaming socket (gateway/src/core/stt/iflytek/config.rs:422-429); it should be refused for calls."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_yueyu_24h",
+      "match": {
+        "provider": "iflytek",
+        "model": "iflyrec_voice_yueyu_24h"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: the vendor's task_type value; iFlytek has no model parameter. A Speed Transcription task_type, not a domain. Today the gateway accepts this string and silently routes it to the short-form streaming socket (gateway/src/core/stt/iflytek/config.rs:422-429); it should be refused for calls."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_vi_vn_vais_24h",
+      "match": {
+        "provider": "iflytek",
+        "model": "iflyrec_voice_vi_vn_vais_24h"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: the vendor's task_type value; iFlytek has no model parameter. A Speed Transcription task_type, not a domain. Today the gateway accepts this string and silently routes it to the short-form streaming socket (gateway/src/core/stt/iflytek/config.rs:422-429); it should be refused for calls."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_th_th_sp_24h",
+      "match": {
+        "provider": "iflytek",
+        "model": "iflyrec_voice_th_th_sp_24h"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html",
+          "https://global.xfyun.cn/doc/platform/pricing.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: the vendor's task_type value; iFlytek has no model parameter. A Speed Transcription task_type, not a domain. Today the gateway accepts this string and silently routes it to the short-form streaming socket (gateway/src/core/stt/iflytek/config.rs:422-429); it should be refused for calls."
+      }
+    },
+    {
+      "id": "iflytek:iflyrec_voice_-any",
+      "match": {
+        "provider": "iflytek",
+        "model_glob": "iflyrec_voice_*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "iat",
+        "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-436 (a model string without realtime, stream or ist selects the short-form socket, and the domain is always the default iat)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This is a task type of the Speed Transcription file API, an asynchronous job (upload, create task, poll). The vendor states that even a very short file takes about 20 seconds and asks for files of at least 5 minutes. It has no streaming interface."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call. Speed Transcription is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/asr/voicedictation/ost.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "that every id with this prefix is a Speed Transcription task type (true of the nine documented ones)"
+        ],
+        "notes": "Family row, added so that a Speed Transcription task type the map has not listed is refused instead of being routed to the short-form socket by the provider default. Drop it if the map should hold exact rows only."
+      }
+    },
+    {
+      "id": "iflytek:any-realtime-any",
+      "match": {
+        "provider": "iflytek",
+        "model_glob": "*realtime*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_ist_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the documented protocol of the real-time socket: the client always sends domain 'iat' where the vendor documents ist_open, ist, ist_hy, ist_huanyu and sp_ist_vais, sends punctuation as 'ptt' instead of 'punc', sends 'vad_eos' although the socket has no such parameter, and reports a final result only when the whole session is complete. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-440; gateway/src/core/stt/iflytek/client.rs:489-508; gateway/src/core/stt/iflytek/messages.rs:481-500",
+            "notes": "The defect list with line references is in the provider notes. The model string only selects the socket (gateway/src/core/stt/iflytek/config.rs:422-429); it cannot name a vendor domain, which the vendor ties to the language. Whether the server rejects or ignores the undocumented parameters is unverified."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time ASR is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/rtasr/rtasr/API.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "every field: this row mirrors the gateway's own routing of the model string, not a vendor statement",
+          "transports[0].endpointing_owner and transports[0].vendor_turn_signal (the page documents no end-of-utterance signal other than slices marked pgs 'apd'; whether a final arrives before the client's end marker is unverified)",
+          "transports[0].limits.rates (concurrent_sessions) and all billing fields (Real-time ASR is not on the pricing page)"
+        ],
+        "notes": "Gateway routing row, not a vendor identifier. iFlytek has no model parameter; the gateway picks the socket from the model string, and any string that contains 'realtime' selects the Real-time ASR socket wss://ist-api-sg.xf-yun.com/v2/ist (gateway/src/core/stt/iflytek/config.rs:422; the gateway's own test uses the string 'realtime', config.rs:827-834). Without this row such a string would fall to the provider default, which describes the short-form socket (60-second sessions, billed per call), a different product. Delete this row when model routing becomes an exact lookup."
+      }
+    },
+    {
+      "id": "iflytek:any-stream-any",
+      "match": {
+        "provider": "iflytek",
+        "model_glob": "*stream*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_ist_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the documented protocol of the real-time socket: the client always sends domain 'iat' where the vendor documents ist_open, ist, ist_hy, ist_huanyu and sp_ist_vais, sends punctuation as 'ptt' instead of 'punc', sends 'vad_eos' although the socket has no such parameter, and reports a final result only when the whole session is complete. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-440; gateway/src/core/stt/iflytek/client.rs:489-508; gateway/src/core/stt/iflytek/messages.rs:481-500",
+            "notes": "The defect list with line references is in the provider notes. The model string only selects the socket (gateway/src/core/stt/iflytek/config.rs:422-429); it cannot name a vendor domain, which the vendor ties to the language. Whether the server rejects or ignores the undocumented parameters is unverified."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time ASR is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/rtasr/rtasr/API.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "every field: this row mirrors the gateway's own routing of the model string, not a vendor statement",
+          "transports[0].endpointing_owner and transports[0].vendor_turn_signal (the page documents no end-of-utterance signal other than slices marked pgs 'apd'; whether a final arrives before the client's end marker is unverified)",
+          "transports[0].limits.rates (concurrent_sessions) and all billing fields (Real-time ASR is not on the pricing page)"
+        ],
+        "notes": "Gateway routing row, not a vendor identifier. iFlytek has no model parameter; the gateway picks the socket from the model string, and any string that contains 'stream' selects the Real-time ASR socket wss://ist-api-sg.xf-yun.com/v2/ist (gateway/src/core/stt/iflytek/config.rs:423). Without this row such a string would fall to the provider default, which describes the short-form socket (60-second sessions, billed per call), a different product. Delete this row when model routing becomes an exact lookup."
+      }
+    },
+    {
+      "id": "iflytek:any-ist-any",
+      "match": {
+        "provider": "iflytek",
+        "model_glob": "*ist*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_ist_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the documented protocol of the real-time socket: the client always sends domain 'iat' where the vendor documents ist_open, ist, ist_hy, ist_huanyu and sp_ist_vais, sends punctuation as 'ptt' instead of 'punc', sends 'vad_eos' although the socket has no such parameter, and reports a final result only when the whole session is complete. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/config.rs:422-440; gateway/src/core/stt/iflytek/client.rs:489-508; gateway/src/core/stt/iflytek/messages.rs:481-500",
+            "notes": "The defect list with line references is in the provider notes. The model string only selects the socket (gateway/src/core/stt/iflytek/config.rs:422-429); it cannot name a vendor domain, which the vendor ties to the language. Whether the server rejects or ignores the undocumented parameters is unverified."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time ASR is not on the international pricing page."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://global.xfyun.cn/doc/rtasr/rtasr/API.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436"
+        ],
+        "unverified": [
+          "every field: this row mirrors the gateway's own routing of the model string, not a vendor statement",
+          "transports[0].endpointing_owner and transports[0].vendor_turn_signal (the page documents no end-of-utterance signal other than slices marked pgs 'apd'; whether a final arrives before the client's end marker is unverified)",
+          "transports[0].limits.rates (concurrent_sessions) and all billing fields (Real-time ASR is not on the pricing page)"
+        ],
+        "notes": "Family and gateway routing row. Every Real-time ASR domain the vendor documents contains 'ist' (ist_open, ist, ist_hy, ist_huanyu, sp_ist_vais), and the gateway sends any model string that contains 'ist' to the Real-time ASR socket wss://ist-api-sg.xf-yun.com/v2/ist (gateway/src/core/stt/iflytek/config.rs:424). The five documented domains have exact rows, which take precedence; this row covers a real-time domain the map has not listed and any other string the gateway routes this way today, including unrelated strings that merely contain those three letters. Without this row such a string would fall to the provider default, which describes the short-form socket (60-second sessions, billed per call), a different product. Delete this row when model routing becomes an exact lookup."
+      }
+    },
+    {
+      "id": "iflytek:any",
+      "match": {
+        "provider": "iflytek",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open one short-form session per utterance and send the vendor end marker when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "max_session_ms": 60000,
+            "idle_timeout_ms": 10000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor's default ('50 channels are supported by default'); whether it counts per application or per account is not stated."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 5,
+                "plan": "free_trial",
+                "scope": "unknown",
+                "note": "'During free trial you can only send a maximum of five concurrent requests.'"
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_iat_ws"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Proposed by the audit as utterance-scoped streaming; details are in the provider notes. Audio is raw 16 kHz PCM16 as Base64 in JSON frames (no WAV header), paced at 1280 bytes every 40 ms."
+          },
+          "segment_profile": {
+            "trailing_silence_ms": 0,
+            "max_segment_ms": 55000,
+            "max_in_flight": 1,
+            "request_timeout_ms": 5000,
+            "rationale": "The audit's profile for per-utterance sessions. No silence is appended because under real-time pacing it delays the final by its own length; the end marker is sent at end of speech instead. 55 seconds because the vendor closes a session at 60. One in flight because sessions are sequential. 5000 ms from end marker to final is a proposal; no latency is published."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for its streaming products."
+          },
+          "limits": {
+            "max_session_ms": 60000,
+            "idle_timeout_ms": 10000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor's default ('50 channels are supported by default'); whether it counts per application or per account is not stated."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 5,
+                "plan": "free_trial",
+                "scope": "unknown",
+                "note": "'During free trial you can only send a maximum of five concurrent requests.'"
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "iflytek_iat_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken for a call: the short-form session ends at the vendor's first final result and is never reopened, so only the first utterance is transcribed, and results are emitted as unassembled fragments. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/iflytek/client.rs:191-195,253-257,489-508; gateway/src/core/stt/iflytek/messages.rs:481-500; gateway/src/core/websocket/reconnectable_stream.rs:374-376",
+            "notes": "The defect list with line references is in the provider notes."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Unknown model string: the short-form socket would bill per service call."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [],
+        "code_refs": [
+          "gateway/src/core/stt/iflytek/config.rs:422-436",
+          "gateway/src/core/stt/iflytek/client.rs:190-195",
+          "gateway/src/core/stt/iflytek/client.rs:252-257"
+        ],
+        "unverified": [
+          "every field: this row is a guess for a model string the map has never seen",
+          "that the short-form socket is the right product for an unknown model string (it is where today's gateway sends one; strings that contain 'realtime', 'stream' or 'ist' go to the real-time socket and have their own routing rows)"
+        ],
+        "notes": "iFlytek has no file API that can serve a call, so the default is the short-form socket, which is where the gateway sends any model string that does not contain 'realtime', 'stream' or 'ist'. A string that contains one of those goes to the real-time socket today (gateway/src/core/stt/iflytek/config.rs:422-429) and is covered by the three routing rows '*realtime*', '*stream*' and '*ist*', so it never reaches this row; model routing should become an exact lookup. The mainland-platform selectors 'slm', 'autodialect' and 'autominor' have no exact row and land here: the fact-check could not re-read the mainland pages and the gateway has no client for the mainland hosts or message layout."
+      }
+    }
+  ]
+}

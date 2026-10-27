@@ -1,0 +1,1014 @@
+{
+  "provider_id": "microsoft-azure",
+  "provider": {
+    "aliases": [
+      "azure",
+      "microsoft_azure"
+    ],
+    "default_model": "default",
+    "model_string": "gateway_alias",
+    "registered_in_gateway": true,
+    "native_model_handling": "ignored",
+    "notes": "The plugin registry's canonical id is microsoft-azure with alias azure (gateway/src/plugin/builtin/mod.rs:92-98, :1677-1680); the live speech-to-text name tables accept only those two spellings (gateway/src/plugin/dispatch.rs:257 and :280; gateway/src/core/stt/mod.rs:400). microsoft_azure is accepted only by a vendor-name helper on the REST audio routes (gateway/src/handlers/openai_audio.rs:1503-1505); a live session using that spelling would be refused today as an unknown provider (gateway/src/plugin/registry.rs:310-320; inferred from reading, not run), so it is listed as an alias for the resolver to normalise, not because it works today. The standardized factory matches only the spelling 'azure' (gateway/src/core/stt/standard.rs:412), so a session naming microsoft-azure falls to the flat factory (:476) and loses region, api_base and every standardized feature; the resolver must normalise the provider id before lookup. The reach of that split is narrower than it looks: a Bud voice-agent leg copies the deployment's vendor string into the session (gateway/src/handlers/ws/bud_legs.rs:223), and Bud publishes Azure Speech under the vendor name azure (comment at gateway/src/core/tts/self_hosted.rs:108-109), so Bud legs reach the standardized factory and only sessions that name microsoft-azure take the flat one. Azure Speech real-time recognition has no model id on the wire, so the model string is a name the gateway defines, and today's client never reads it (gateway/src/core/stt/azure/config.rs:552, :670), so the capability lookup must run before the client is built. Sessions are expected to reach this provider with model ids other than 'default' (inferred from two things read in the repository): the gateway's own documentation tells customers to put a Custom Speech endpoint id in the model field (gateway/docs/azure-stt.md:76, :183-191), and a Bud deployment's stored model string is copied into the session (gateway/src/handlers/ws/bud_legs.rs:223-226; a comment at gateway/src/core/tts/self_hosted.rs:108 says Bud publishes Azure Speech models under names of the form azure/speech/..., the exact speech-to-text strings were not confirmed). Every such id resolves to the provider default row, so that row decides the path of those sessions. 'llm-speech' is a proposed gateway sentinel for the LLM Speech product, which has no vendor model string. Not listed as transports: batch transcription and Whisper inside Azure Speech (asynchronous jobs that can take up to 30 minutes to start) and the 60-second short-audio REST call (Microsoft positions it as a last resort). Azure OpenAI audio models (whisper, gpt-transcribe, the gpt-4o transcribe family, gpt-live-transcribe, gpt-realtime-whisper) belong to the separate provider id azure_openai (rows/azure_openai.json), not to this file."
+  },
+  "rows": [
+    {
+      "id": "microsoft-azure:default",
+      "match": {
+        "provider": "microsoft-azure",
+        "model": "default"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1800,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat AZURE_TTFS_P99 (1.80 s): end of speech to final transcript, measured with a voice-activity stop time of 200 ms. Pipecat does not state the model, and the standardization research did not check which transport Pipecat's Azure service uses; the fact-check attributes the figure to Azure streaming speech-to-text. Read on 2026-10-03; no measurement date is published.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "s0",
+                "scope": "resource",
+                "note": "Default concurrent recognition limit of a standard (S0) Speech resource."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 1,
+                "plan": "f0",
+                "scope": "resource",
+                "note": "Free (F0) Speech resource."
+              }
+            ],
+            "assumed_plan": "s0"
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "quality_signals_require": [
+            "format=detailed"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "dgi.Groups[].Items",
+                "note": "Phrase list sent in the speech.context message (gateway/src/core/stt/azure/config.rs:524-537)."
+              }
+            ],
+            "wire": "azure_speech_usp"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "A BabbleTimeout status from Azure ends speech-to-text for the rest of the session as a fatal error (gateway/src/core/stt/azure/messages.rs:82-84, client.rs:217-221), and turn.end is only logged, so audio sent after Azure closes a turn may be ignored (client.rs:590-592; inferred from reading, not run).",
+            "code_ref": "gateway/src/core/stt/azure/client.rs:190-205 (each audio chunk is framed and sent at once), :553-580 (interim and final mapping); gateway/src/core/stt/azure/messages.rs:298-316 (a final sets is_final and is_speech_final); gateway/src/core/stt/azure/config.rs:552 and :670 (the model is never read); gateway/tests/mock_endpoint_e2e.rs:734 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo mock server. Microsoft documents the Speech SDK, not the raw socket frames, so the client's framing is an inferred contract. The client ignores the model id. Known risks: a BabbleTimeout status ends the stream as fatal (messages.rs:82-84, client.rs:562-570); turn.end is only logged (client.rs:590-592); the sample rate header copies the session rate with no WAV header (client.rs:458-463) although Microsoft documents only 16 kHz and 8 kHz. The 100 concurrent requests limit is the S0 tier default per Speech resource (1 on the free tier)."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_fast_transcription",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Azure Fast Transcription exists yet. Listed as a fallback for sessions that ask for segmented mode: Fast Transcription without an enhancedMode block runs the same family of transcription models as the real-time socket.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "except",
+              "values": [
+                "canadaeast",
+                "centralus",
+                "eastasia",
+                "norwayeast",
+                "qatarcentral",
+                "southafricanorth",
+                "switzerlandnorth",
+                "switzerlandwest",
+                "uaenorth",
+                "ukwest",
+                "westcentralus"
+              ],
+              "note": "Fast Transcription is offered in 22 of the 33 Speech regions; these are the 11 without it. Microsoft's Speech regions table (read 2026-10-03); the fact-check recounted it."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for Fast Transcription on short audio; it must be measured on 2 to 25 second clips before a deadline is set."
+          },
+          "limits": {
+            "max_upload_bytes": 250000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 600,
+                "plan": "s0",
+                "scope": "resource",
+                "note": "Shared with batch transcription on the same Speech resource; not offered on the free (F0) tier; adjustable by support request."
+              }
+            ],
+            "assumed_plan": "s0"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "ogg",
+              "opus",
+              "flac",
+              "aac",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "locales",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "phraseList.phrases"
+              }
+            ],
+            "wire": "azure_fast_transcription"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Azure Speech file builder exists); gateway/src/core/providers/azure/region.rs:183, :232, :587, :631 (only WebSocket and text-to-speech URL helpers exist)",
+            "notes": "Needs a request builder for POST {endpoint}/speechtotext/transcriptions:transcribe?api-version=2025-10-15 (multipart parts 'audio' and 'definition', header Ocp-Apim-Subscription-Key), a response parser for combinedPhrases and phrases, a REST base URL helper for the Speech endpoint, and a check that the deployment's region offers the API."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Fast Transcription meter: 0.36 USD per audio hour in eastus on the Azure retail price list (read 2026-10-03), billed per second. pricing.rs has no Fast Transcription key: its azure:batch key (gateway/src/config/pricing.rs:206) carries the same figure but is labelled batch transcription, and the evidence did not establish the batch price. A key for Fast Transcription must be added before this transport is metered."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "pricing_key": "azure:default",
+        "notes": "Real-time recognition meter: 1.00 USD per audio hour in eastus on the Azure retail price list (read 2026-10-03), priced per audio hour and billed per second. The pricing key is the real-time meter's."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-to-text",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-services-quotas-and-limits",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/fast-transcription-create",
+          "https://learn.microsoft.com/en-us/rest/api/speechtotext/transcriptions/transcribe",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/regions?tabs=stt",
+          "https://azure.microsoft.com/en-us/pricing/details/cognitive-services/speech-services/",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://prices.azure.com/api/retail/prices"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/azure/client.rs:190-205",
+          "gateway/src/core/stt/azure/client.rs:553-580",
+          "gateway/src/core/stt/azure/client.rs:217-221",
+          "gateway/src/core/stt/azure/client.rs:458-463",
+          "gateway/src/core/stt/azure/client.rs:590-592",
+          "gateway/src/core/stt/azure/messages.rs:82-84",
+          "gateway/src/core/stt/azure/messages.rs:298-316",
+          "gateway/src/core/stt/azure/config.rs:524-537",
+          "gateway/src/core/stt/azure/config.rs:552",
+          "gateway/src/core/stt/azure/config.rs:670",
+          "gateway/tests/mock_endpoint_e2e.rs:734",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/providers/azure/region.rs:183",
+          "gateway/src/core/providers/azure/region.rs:232",
+          "gateway/src/core/providers/azure/region.rs:587",
+          "gateway/src/core/providers/azure/region.rs:631",
+          "gateway/src/config/pricing.rs:206"
+        ],
+        "unverified": [
+          "transports[0].latency (the model and transport behind Pipecat's Azure figure are not stated)",
+          "transports[0].limits.max_session_ms (not established by the evidence)",
+          "transports[0]: whether the socket honours sample rates other than 16 kHz and 8 kHz, and whether audio sent after turn.end is recognized",
+          "billing.bills_silence of the row, which describes the socket (the gateway forwards every frame to the socket; whether silence is billed was not confirmed)",
+          "latency of the file transport (Microsoft publishes none for short audio; only 'synchronously and faster than real-time')",
+          "limits.max_upload_bytes and limits.max_audio_ms of the file transport (Microsoft pages disagree: 500 MB and 5 hours, 250 MB and 2 hours, 300 MB and 2 hours; the lowest pair is recorded)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "limits.rates (concurrent_requests) of the file transport (no concurrency limit is documented)",
+          "billing.min_billed_ms of both meters (none documented; the pricing page says per second billing)",
+          "transports[0].limits.rates (the free-tier figure of 1 is from the audit's reading of the quotas page; the fact-check confirmed only the default of 100)"
+        ],
+        "notes": "The model id 'default' is a gateway sentinel, not a string the vendor accepts: Azure Speech real-time recognition picks the base model from the language query parameter and a Custom Speech model from the cid query parameter. An empty model resolves to this row. The file transport is reachable only when a session asks for segmented transcription; it sends Fast Transcription without an enhancedMode block, which runs the same family of models as the real-time socket."
+      }
+    },
+    {
+      "id": "microsoft-azure:mai-transcribe-2",
+      "match": {
+        "provider": "microsoft-azure",
+        "model": "MAI-Transcribe-2"
+      },
+      "lifecycle": {
+        "status": "preview"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_fast_transcription",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Azure Fast Transcription exists yet. This model has no streaming interface; until the adapter ships, today's streaming client ignores the model id and serves the base real-time model instead, which the resolver reports with the warning stt_model_substituted.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "centralindia",
+                "eastus",
+                "northeurope",
+                "southeastasia",
+                "westus",
+                "westus2"
+              ],
+              "note": "MAI-Transcribe regions. Microsoft's Speech regions table (read 2026-10-03); the fact-check recounted it."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for Fast Transcription on short audio; it must be measured on 2 to 25 second clips before a deadline is set."
+          },
+          "limits": {
+            "max_upload_bytes": 250000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 600,
+                "plan": "s0",
+                "scope": "resource",
+                "note": "Shared with batch transcription on the same Speech resource; not offered on the free (F0) tier; adjustable by support request."
+              }
+            ],
+            "assumed_plan": "s0"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "flac"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "locales",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "phraseList.phrases"
+              }
+            ],
+            "wire": "azure_fast_transcription"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Azure Speech file builder exists); gateway/src/core/providers/azure/region.rs:183, :232, :587, :631 (only WebSocket and text-to-speech URL helpers exist)",
+            "notes": "Needs a request builder for POST {endpoint}/speechtotext/transcriptions:transcribe?api-version=2025-10-15 (multipart parts 'audio' and 'definition', header Ocp-Apim-Subscription-Key), a response parser for combinedPhrases and phrases, a REST base URL helper for the Speech endpoint, and a check that the deployment's region offers the API."
+          },
+          "file_request_mode": "sync"
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "default",
+        "code_ref": "gateway/src/core/stt/azure/config.rs:552 and :670 (the model string is stored and never read; no module under gateway/src/core/stt/azure reads it)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "No pricing key exists in pricing.rs for this model and its price on Azure is unverified. Microsoft's announcement gives 0.10 USD per hour of audio as a limited-time price until the end of the year, and a retail meter named 'Fast Transcription Promo' at 0.10 USD per hour took effect on 2026-09-01; that this meter is the model's is an inference, not a documented fact. Only uploaded speech segments would be billed."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/fast-transcription-create",
+          "https://learn.microsoft.com/en-us/rest/api/speechtotext/transcriptions/transcribe",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-services-quotas-and-limits",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/regions?tabs=stt",
+          "https://microsoft.ai/news/mai-transcribe-2-is-the-fastest-most-accurate-and-cheapest-speech-recognition-model-in-the-world/",
+          "https://prices.azure.com/api/retail/prices"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/providers/azure/region.rs:183",
+          "gateway/src/core/providers/azure/region.rs:232",
+          "gateway/src/core/providers/azure/region.rs:587",
+          "gateway/src/core/providers/azure/region.rs:631",
+          "gateway/src/core/stt/azure/config.rs:552",
+          "gateway/src/core/stt/azure/config.rs:670"
+        ],
+        "unverified": [
+          "latency of the file transport (Microsoft publishes none for short audio; only 'synchronously and faster than real-time')",
+          "limits.max_upload_bytes and limits.max_audio_ms of the file transport (Microsoft pages disagree: 500 MB and 5 hours, 250 MB and 2 hours, 300 MB and 2 hours; the lowest pair is recorded)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "limits.rates (concurrent_requests) of the file transport (no concurrency limit is documented)",
+          "billing.min_billed_ms (none documented; the pricing page says per second billing)",
+          "transports[0].quality_signals (whether phrases[].confidence is meaningful for this model is unknown; it is always 0 for LLM Speech, so no confidence signal is recorded)",
+          "transports[0].limits.rates (requests) (600 per minute is the Fast Transcription quota per Speech resource, shared with batch transcription; that this model counts against it is inferred)",
+          "billing.unit (the price and meter for this model on Azure were not confirmed)"
+        ],
+        "notes": "Exact wire string, sent as definition.enhancedMode.model with enhancedMode.enabled=true on the synchronous Fast Transcription call. Microsoft labels it public preview. Accepts WAV, MP3 or FLAC only. definition.locales takes one ISO-style code here, and Microsoft warns against setting it unless the language is certain; a free-text prompt is not supported."
+      }
+    },
+    {
+      "id": "microsoft-azure:mai-transcribe-1.5",
+      "match": {
+        "provider": "microsoft-azure",
+        "model": "MAI-Transcribe-1.5"
+      },
+      "lifecycle": {
+        "status": "preview"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_fast_transcription",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Azure Fast Transcription exists yet. This model has no streaming interface; until the adapter ships, today's streaming client ignores the model id and serves the base real-time model instead, which the resolver reports with the warning stt_model_substituted.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "centralindia",
+                "eastus",
+                "northeurope",
+                "southeastasia",
+                "westus",
+                "westus2"
+              ],
+              "note": "MAI-Transcribe regions. Microsoft's Speech regions table (read 2026-10-03); the fact-check recounted it."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for Fast Transcription on short audio; it must be measured on 2 to 25 second clips before a deadline is set."
+          },
+          "limits": {
+            "max_upload_bytes": 250000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 600,
+                "plan": "s0",
+                "scope": "resource",
+                "note": "Shared with batch transcription on the same Speech resource; not offered on the free (F0) tier; adjustable by support request."
+              }
+            ],
+            "assumed_plan": "s0"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "flac"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "locales",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "phraseList.phrases"
+              }
+            ],
+            "wire": "azure_fast_transcription"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Azure Speech file builder exists); gateway/src/core/providers/azure/region.rs:183, :232, :587, :631 (only WebSocket and text-to-speech URL helpers exist)",
+            "notes": "Needs a request builder for POST {endpoint}/speechtotext/transcriptions:transcribe?api-version=2025-10-15 (multipart parts 'audio' and 'definition', header Ocp-Apim-Subscription-Key), a response parser for combinedPhrases and phrases, a REST base URL helper for the Speech endpoint, and a check that the deployment's region offers the API."
+          },
+          "file_request_mode": "sync"
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "default",
+        "code_ref": "gateway/src/core/stt/azure/config.rs:552 and :670 (the model string is stored and never read; no module under gateway/src/core/stt/azure reads it)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "No pricing key exists in pricing.rs for this model and its price on Azure is unverified. Only uploaded speech segments would be billed."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/fast-transcription-create",
+          "https://learn.microsoft.com/en-us/rest/api/speechtotext/transcriptions/transcribe",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-services-quotas-and-limits",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/regions?tabs=stt",
+          "https://microsoft.ai/news/mai-transcribe-2-is-the-fastest-most-accurate-and-cheapest-speech-recognition-model-in-the-world/"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/providers/azure/region.rs:183",
+          "gateway/src/core/providers/azure/region.rs:232",
+          "gateway/src/core/providers/azure/region.rs:587",
+          "gateway/src/core/providers/azure/region.rs:631",
+          "gateway/src/core/stt/azure/config.rs:552",
+          "gateway/src/core/stt/azure/config.rs:670"
+        ],
+        "unverified": [
+          "latency of the file transport (Microsoft publishes none for short audio; only 'synchronously and faster than real-time')",
+          "limits.max_upload_bytes and limits.max_audio_ms of the file transport (Microsoft pages disagree: 500 MB and 5 hours, 250 MB and 2 hours, 300 MB and 2 hours; the lowest pair is recorded)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "limits.rates (concurrent_requests) of the file transport (no concurrency limit is documented)",
+          "billing.min_billed_ms (none documented; the pricing page says per second billing)",
+          "transports[0].quality_signals (whether phrases[].confidence is meaningful for this model is unknown; it is always 0 for LLM Speech, so no confidence signal is recorded)",
+          "transports[0].limits.rates (requests) (600 per minute is the Fast Transcription quota per Speech resource, shared with batch transcription; that this model counts against it is inferred)",
+          "billing.unit (the price and meter for this model on Azure were not confirmed)",
+          "lifecycle.status (the MAI page carries a public preview label; the audit records this model only as 'listed as supported')"
+        ],
+        "notes": "Exact wire string, sent as definition.enhancedMode.model with enhancedMode.enabled=true on the synchronous Fast Transcription call. It supports fewer languages than MAI-Transcribe-2 and is the documented replacement for the retired MAI-Transcribe-1. Accepts WAV, MP3 or FLAC only. definition.locales takes one ISO-style code here, and Microsoft warns against setting it unless the language is certain; a free-text prompt is not supported."
+      }
+    },
+    {
+      "id": "microsoft-azure:mai-transcribe-1",
+      "match": {
+        "provider": "microsoft-azure",
+        "model": "MAI-Transcribe-1"
+      },
+      "lifecycle": {
+        "status": "retired",
+        "deprecated_on": "2026-08-20",
+        "shutdown_on": "2026-09-15",
+        "replacement": [
+          "MAI-Transcribe-1.5"
+        ]
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "default",
+        "code_ref": "gateway/src/core/stt/azure/config.rs:552 and :670 (the model string is stored and never read; no module under gateway/src/core/stt/azure reads it)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_model_retired",
+          "text": "Microsoft deprecated MAI-Transcribe-1 on 2026-08-20 and retired it on 2026-09-15. Use MAI-Transcribe-1.5 or MAI-Transcribe-2."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/model-retirement-schedule"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/azure/config.rs:552",
+          "gateway/src/core/stt/azure/config.rs:670"
+        ],
+        "notes": "Kept as a row so that a deployment still naming this model gets a setup error with the retirement date and the replacement, instead of falling to the provider default. Refusal moved from Release 0 to Release 3 on 2026-10-04: a session on this model starts today (today's client serves a different model), and integration decision 12 warns such sessions in Releases 0 to 2 and refuses them from Release 3."
+      }
+    },
+    {
+      "id": "microsoft-azure:mai-transcribe-2-streaming",
+      "match": {
+        "provider": "microsoft-azure",
+        "model": "MAI-Transcribe-2-Streaming"
+      },
+      "lifecycle": {
+        "status": "preview"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the MAI realtime socket. That socket has no server-side speech detection, so the client must send input_audio_buffer.commit at each pause, which needs the gateway's own voice-activity detector.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No end-of-speech-to-final figure is published. Microsoft's announcement says only that first hypotheses arrive in just over 100 ms."
+          },
+          "limits": {
+            "max_session_ms": 3600000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000,
+              24000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "azure_mai_realtime"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Endpoint wss://{resource}.services.ai.azure.com/mai/v1/realtime?intent=transcription, events modelled on the OpenAI Realtime protocol, base64 PCM16 at 16000 or 24000 Hz. turn_detection accepts only null."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "The existing streaming client dials only the /speech/recognition/conversation/cognitiveservices/v1 path and never sends a model. This model is served on /speech/universal/v2 through Speech SDK 1.52.0, whose raw frames are not publicly specified.",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "azure_speech_usp"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/azure/config.rs:25 (the only recognition path the client knows)",
+            "notes": "Whether the existing client can be extended to the universal/v2 path is unknown; Microsoft documents the SDK only. On this path results carry no detected language, confidence scores or word timestamps."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "default",
+        "code_ref": "gateway/src/core/stt/azure/config.rs:552 and :670 (the model string is stored and never read; no module under gateway/src/core/stt/azure reads it)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "No price for this preview model was established by the evidence."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe-2-streaming",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe-2-streaming-realtime",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe-2-streaming-speech-sdk",
+          "https://microsoft.ai/news/our-first-streaming-transcription-model/"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/azure/config.rs:25",
+          "gateway/src/core/stt/azure/config.rs:552",
+          "gateway/src/core/stt/azure/config.rs:670"
+        ],
+        "unverified": [
+          "transports[0].interim_results (Microsoft says transcripts arrive while the speaker talks; that text arrives before the commit on the realtime socket was not separately confirmed)",
+          "transports[0].limits.rates (concurrent_sessions)",
+          "transports[1].endpointing_owner and transports[1].vendor_turn_signal (assumed to match the existing Speech SDK path; not stated for universal/v2)",
+          "transports[1].limits",
+          "dialect.language_param on both transports (the language field for this model was not established; recorded as null)",
+          "billing.unit, billing.min_billed_ms, billing.bills_silence"
+        ],
+        "notes": "Exact wire string: speech_config.model on the universal/v2 path, or the transcription model on the MAI realtime socket. It streams and has no file interface, so segmentation does not apply; it needs a new streaming client. Until one exists a session naming it keeps today's behaviour, served by the base real-time model with the warning stt_model_substituted (decisions section 15 and conversion rules section 10)."
+      }
+    },
+    {
+      "id": "microsoft-azure:llm-speech",
+      "match": {
+        "provider": "microsoft-azure",
+        "model": "llm-speech"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_fast_transcription",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Azure Fast Transcription exists yet. LLM Speech has no streaming interface; until the adapter ships, today's streaming client ignores the model id and serves the base real-time model instead, which the resolver reports with the warning stt_model_substituted.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "centralindia",
+                "eastus",
+                "northeurope",
+                "southeastasia",
+                "westus",
+                "westus2"
+              ],
+              "note": "LLM Speech regions. Microsoft's Speech regions table (read 2026-10-03); the fact-check recounted it."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for Fast Transcription on short audio; it must be measured on 2 to 25 second clips before a deadline is set."
+          },
+          "limits": {
+            "max_upload_bytes": 250000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 600,
+                "plan": null,
+                "scope": "resource",
+                "note": "LLM Speech quota per Speech resource; Microsoft says it is not adjustable. Whether it is counted together with the Fast Transcription quota of the same resource is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "locales",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "enhancedMode.prompt",
+                "max_chars": 4096,
+                "note": "An array of strings. The REST reference says 20,000 characters and the SDK pages 4,096; the lower is recorded."
+              },
+              {
+                "kind": "keyterms",
+                "wire_name": "phraseList.phrases"
+              }
+            ],
+            "wire": "azure_fast_transcription"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Azure Speech file builder exists); gateway/src/core/providers/azure/region.rs:183, :232, :587, :631 (only WebSocket and text-to-speech URL helpers exist)",
+            "notes": "Needs a request builder for POST {endpoint}/speechtotext/transcriptions:transcribe?api-version=2025-10-15 (multipart parts 'audio' and 'definition', header Ocp-Apim-Subscription-Key), a response parser for combinedPhrases and phrases, a REST base URL helper for the Speech endpoint, and a check that the deployment's region offers the API."
+          },
+          "file_request_mode": "sync"
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "default",
+        "code_ref": "gateway/src/core/stt/azure/config.rs:552 and :670 (the model string is stored and never read; no module under gateway/src/core/stt/azure reads it)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "No pricing key exists in pricing.rs for LLM Speech and its meter was not identified. Only uploaded speech segments would be billed."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/llm-speech",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/fast-transcription-create",
+          "https://learn.microsoft.com/en-us/rest/api/speechtotext/transcriptions/transcribe",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-services-quotas-and-limits",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/regions?tabs=stt"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/providers/azure/region.rs:183",
+          "gateway/src/core/providers/azure/region.rs:232",
+          "gateway/src/core/providers/azure/region.rs:587",
+          "gateway/src/core/providers/azure/region.rs:631",
+          "gateway/src/core/stt/azure/config.rs:552",
+          "gateway/src/core/stt/azure/config.rs:670"
+        ],
+        "unverified": [
+          "latency of the file transport (Microsoft publishes none for short audio; only 'synchronously and faster than real-time')",
+          "limits.max_upload_bytes and limits.max_audio_ms of the file transport (Microsoft pages disagree: 500 MB and 5 hours, 250 MB and 2 hours, 300 MB and 2 hours; the lowest pair is recorded)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "limits.rates (concurrent_requests) of the file transport (no concurrency limit is documented)",
+          "billing.min_billed_ms (none documented; the pricing page says per second billing)",
+          "match.model (llm-speech is a proposed gateway sentinel; no gateway code uses it yet and the capability-map workstream must confirm the name)",
+          "lifecycle.status (documented without a preview banner; no explicit general-availability statement was recorded)",
+          "transports[0].upload.accepted (WAV is accepted by every Fast Transcription variant; the full list for LLM Speech was not recorded)",
+          "billing.unit (the meter for LLM Speech was not identified)"
+        ],
+        "notes": "LLM Speech has no vendor model string: it is selected by definition.enhancedMode.enabled=true with no model on the Fast Transcription call. Its confidence field is always 0, so confidence must never be used as a filter."
+      }
+    },
+    {
+      "id": "microsoft-azure:any",
+      "match": {
+        "provider": "microsoft-azure",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "s0",
+                "scope": "resource",
+                "note": "Default concurrent recognition limit of a standard (S0) Speech resource."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 1,
+                "plan": "f0",
+                "scope": "resource",
+                "note": "Free (F0) Speech resource."
+              }
+            ],
+            "assumed_plan": "s0"
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "quality_signals_require": [
+            "format=detailed"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "dgi.Groups[].Items",
+                "note": "Phrase list sent in the speech.context message (gateway/src/core/stt/azure/config.rs:524-537)."
+              }
+            ],
+            "wire": "azure_speech_usp"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "A BabbleTimeout status from Azure ends speech-to-text for the rest of the session as a fatal error (gateway/src/core/stt/azure/messages.rs:82-84, client.rs:217-221), and turn.end is only logged, so audio sent after Azure closes a turn may be ignored (client.rs:590-592; inferred from reading, not run).",
+            "code_ref": "gateway/src/core/stt/azure/client.rs:190-205 (each audio chunk is framed and sent at once), :553-580 (interim and final mapping); gateway/src/core/stt/azure/messages.rs:298-316 (a final sets is_final and is_speech_final); gateway/src/core/stt/azure/config.rs:552 and :670 (the model is never read); gateway/tests/mock_endpoint_e2e.rs:734 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo mock server. The client ignores the model id, so on this row the base real-time model for the locale serves the call whatever id was named. This reproduces today's behaviour for unknown ids."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_fast_transcription",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Azure Fast Transcription exists yet. On this row the transport is reachable only when a session asks for segmented transcription, because the streaming client stays first (sessions with a Custom Speech endpoint id or a Bud model string land here and must keep streaming). An id this row does not know must not be sent as definition.enhancedMode.model, because Azure would reject an id that is not a Fast Transcription model (inferred, not probed); the request for an unknown id is Fast Transcription with no enhancedMode block, which runs the same family of models as the real-time socket.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "except",
+              "values": [
+                "canadaeast",
+                "centralus",
+                "eastasia",
+                "norwayeast",
+                "qatarcentral",
+                "southafricanorth",
+                "switzerlandnorth",
+                "switzerlandwest",
+                "uaenorth",
+                "ukwest",
+                "westcentralus"
+              ],
+              "note": "Fast Transcription is offered in 22 of the 33 Speech regions; these are the 11 without it. Microsoft's Speech regions table (read 2026-10-03); the fact-check recounted it."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for Fast Transcription on short audio; it must be measured on 2 to 25 second clips before a deadline is set."
+          },
+          "limits": {
+            "max_upload_bytes": 250000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 600,
+                "plan": "s0",
+                "scope": "resource",
+                "note": "Shared with batch transcription on the same Speech resource; not offered on the free (F0) tier; adjustable by support request."
+              }
+            ],
+            "assumed_plan": "s0"
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "locales",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "azure_fast_transcription"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Azure Speech file builder exists); gateway/src/core/providers/azure/region.rs:183, :232, :587, :631 (only WebSocket and text-to-speech URL helpers exist)",
+            "notes": "Needs a request builder for POST {endpoint}/speechtotext/transcriptions:transcribe?api-version=2025-10-15 (multipart parts 'audio' and 'definition', header Ocp-Apim-Subscription-Key), a response parser for combinedPhrases and phrases, a REST base URL helper for the Speech endpoint, and a check that the deployment's region offers the API."
+          },
+          "file_request_mode": "sync"
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/fast-transcription-create",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe",
+          "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/speech-to-text"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/azure/client.rs:190-205",
+          "gateway/src/core/stt/azure/client.rs:553-580",
+          "gateway/src/core/stt/azure/client.rs:217-221",
+          "gateway/src/core/stt/azure/client.rs:458-463",
+          "gateway/src/core/stt/azure/client.rs:590-592",
+          "gateway/src/core/stt/azure/messages.rs:82-84",
+          "gateway/src/core/stt/azure/messages.rs:298-316",
+          "gateway/src/core/stt/azure/config.rs:524-537",
+          "gateway/src/core/stt/azure/config.rs:552",
+          "gateway/src/core/stt/azure/config.rs:670",
+          "gateway/tests/mock_endpoint_e2e.rs:734",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/providers/azure/region.rs:183",
+          "gateway/src/core/providers/azure/region.rs:232",
+          "gateway/src/core/providers/azure/region.rs:587",
+          "gateway/src/core/providers/azure/region.rs:631",
+          "gateway/docs/azure-stt.md:76",
+          "gateway/src/handlers/ws/bud_legs.rs:223-226"
+        ],
+        "unverified": [
+          "every field: this row describes a model id the map does not know",
+          "which model strings Bud publishes for Azure Speech speech-to-text deployments (they decide how many live sessions resolve to this row)",
+          "what Azure returns when definition.enhancedMode.model carries an id that is not a Fast Transcription model"
+        ],
+        "notes": "Default for an Azure Speech model id the map does not know. The streaming client is listed first (conversion rules section 9: a working native client stays the default), which is exactly what happens today: the model id is ignored and the base real-time model serves the call; the provider's native_model_handling makes the resolver warn with stt_model_substituted. The Fast Transcription transport behind it is reachable only when a session asks for segmented transcription, and then must send no enhancedMode block for an id this row does not know (see its disabled_reason). Known sources of ids that land here are a Custom Speech endpoint id placed in the model field as the gateway's documentation instructs (gateway/docs/azure-stt.md:76, :183-191) and Bud deployments, whose stored model string is copied into the session (gateway/src/handlers/ws/bud_legs.rs:223-226). Exact rows for the ids Bud publishes would let those sessions be classified."
+      }
+    }
+  ]
+}

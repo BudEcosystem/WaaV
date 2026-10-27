@@ -1,0 +1,572 @@
+{
+  "provider_id": "groq",
+  "provider": {
+    "aliases": [],
+    "default_model": "whisper-large-v3-turbo",
+    "model_string": "wire_model",
+    "key_normalisation": {
+      "strip_provider_prefix": true,
+      "placeholder_as_unset": true
+    },
+    "registered_in_gateway": true,
+    "production_base": "https://api.groq.com/openai",
+    "base_url_convention": "origin",
+    "notes": "Registered as `groq` (gateway/src/plugin/builtin/mod.rs:1705); live sessions build it through create_stt_standard (gateway/src/core/stt/standard.rs:429). Groq has no streaming speech-to-text interface: both models are served by one synchronous multipart endpoint that is wire-compatible with OpenAI's. The existing client buffers audio and uploads only at hang-up, when the buffer reaches 20 MB, or when the client ends its audio by hand (an audio_end message on /ws, or a buffer commit on the /v1/realtime cascade), because the default flush strategy is OnDisconnect and no configuration path sets another (gateway/src/core/stt/groq/config.rs:521; client.rs:873-902), so a normal live call produces no transcript while it is in progress. Either act makes the voice manager disconnect and reconnect the client (gateway/src/handlers/ws/audio_handler.rs:301-322, also called from gateway/src/handlers/openai_realtime/cascade.rs:1353-1354; gateway/src/core/voice_manager/manager.rs:1648-1672), and the disconnect uploads the buffer (client.rs:1085-1108). A push-to-talk client that ends each utterance itself is therefore the one kind of session that gets usable text from this provider during a call today. The same disconnect clears the result callback (client.rs:1114-1115) and nothing registers it again, so a second such act in the same session probably delivers nothing (inferred from reading, not run). An empty model resolves to whisper-large-v3-turbo (config.rs:47, :540-543). The client reads underscores as hyphens before it matches its short aliases (gateway/src/core/stt/groq/config.rs:126), so large_v3 also selects whisper-large-v3; the rows list only the hyphen spellings as model_aliases. There is no model allow-list: unknown ids are sent verbatim, and plugin metadata still advertises the retired distil-whisper-large-v3-en (mod.rs:146)."
+  },
+  "rows": [
+    {
+      "id": "groq:whisper-large-v3-turbo",
+      "match": {
+        "provider": "groq",
+        "model": "whisper-large-v3-turbo",
+        "model_aliases": [
+          "whisper-v3-turbo",
+          "turbo",
+          "large-v3-turbo"
+        ]
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "groq_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the Groq client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1540,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "measured_on": "2026-02-09",
+                "conditions": "Pipecat constant GROQ_TTFS_P99 = 1.54 s: end of speech to final transcript for its voice-activity-segmented Groq service, including a 200 ms detector stop delay. The Pipecat benchmark harness builds that service with whisper-large-v3-turbo (https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/src/stt_benchmark/services.py, reported by the real-time levers research). The constant has not changed since 2026-02-09. No median is published; Groq itself publishes only a speed factor (216 times real time).",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "max_audio_ms": null,
+            "min_audio_ms": 10,
+            "context_window_ms": 30000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 400,
+                "plan": "developer",
+                "scope": "organisation"
+              },
+              {
+                "metric": "audio_seconds",
+                "per": "hour",
+                "value": 400000,
+                "plan": "developer",
+                "scope": "organisation"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 20,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "requests",
+                "per": "day",
+                "value": 2000,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "audio_seconds",
+                "per": "hour",
+                "value": 7200,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "audio_seconds",
+                "per": "day",
+                "value": 28800,
+                "plan": "free",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "developer"
+          },
+          "upload": {
+            "accepted": [
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "segment_no_speech_prob",
+            "segment_avg_logprob",
+            "segment_compression_ratio"
+          ],
+          "quality_signals_require": [
+            "response_format=verbose_json",
+            "timestamp_granularities[]=segment"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_tokens": 224
+              }
+            ],
+            "response_formats": [
+              "verbose_json",
+              "json",
+              "text"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions",
+            "limit_headers": {
+              "reset_requests": "x-ratelimit-reset-requests",
+              "retry_after": "retry-after"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/groq/client.rs:659 (send_request, takes &mut self); gateway/src/core/stt/groq/config.rs:630-664 (build_form_text_fields)",
+            "notes": "No adapter exists. The request code lives inside the buffering client: send_request takes &mut self and writes rate-limit state and the last request id, so two uploads cannot be in flight; it is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) behind a 120 s request timeout, a 30 s connect timeout and a three-attempt loop (client.rs:57, :60, :66). The loop retries network errors and timeouts; a typed 429 or 5xx reply is probably returned on the first attempt, because the retry test looks for the status digits or a lower-case 'rate limit' in a message that holds neither unless the vendor's error body failed to parse (client.rs:640-653, :806-825; inferred from reading, not run). The worst stall on the audio path is therefore three 120 s timeouts plus back-off, and a rate-limit reply probably fails the upload at once instead of waiting. The WAV is written at the session sample rate and channel count (client.rs:520-522), not 16 kHz mono. Groq speaks the OpenAI multipart request, so the shared OpenAI-compatible transcriber serves it with base URL https://api.groq.com/openai/v1 (config.rs:35). The client keeps only the text and a derived confidence (client.rs:591-596); no_speech_prob and compression_ratio are parsed and dropped, and an empty transcript still fires the result callback. Ask for the `segment` timestamp granularity: `word` alone returns only word, start and end, without the quality fields. The prompt is limited to 224 tokens (config.rs:50). Take the language hint from the provider-mapped value: on the /ws path the configured language is mapped to ISO 639-1, with `auto` omitted, before the client is built (gateway/src/handlers/ws/config.rs:475-504; gateway/src/core/lang/mappers/mod.rs:239-242), while the DAG node passes its own default en-US unmapped (gateway/src/dag/nodes/provider.rs:334-343)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 120 s per request, 30 s to connect and up to three attempts on network errors and timeouts (gateway/src/core/stt/groq/client.rs:57, :60, :66); the vendor audit recommends 5 s in total with one retry at most, roughly three times the third-party P99 of 1.54 s. It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV: Groq downsamples to 16 kHz mono and says WAV gives lower latency), pre-roll, trailing silence, the 25 s maximum segment and two uploads in flight keep the defaults. Segments are still uploaded at each pause: the 10 s minimum billed per request costs about $0.0001 (turbo) or $0.0003 (large-v3), too little to justify holding a segment back. The binding constraint is the per-organisation request limit, so a deployment on the free plan (20 requests per minute) may choose upload_policy per_turn."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/groq/config.rs:521 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Groq serves this model only through its file transcription endpoint and has no streaming interface. On this gateway it is not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 10000,
+        "bills_silence": false,
+        "pricing_key": "groq:whisper-large-v3-turbo",
+        "notes": "Only uploaded segments are billed, so a 3 s segment is billed as 10 s. pricing_key exists at gateway/src/config/pricing.rs:110."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://console.groq.com/docs/speech-to-text",
+          "https://console.groq.com/docs/models",
+          "https://console.groq.com/docs/model/whisper-large-v3-turbo",
+          "https://console.groq.com/docs/api-reference",
+          "https://console.groq.com/docs/rate-limits",
+          "https://console.groq.com/docs/errors",
+          "https://console.groq.com/docs/batch",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/groq/config.rs:47",
+          "gateway/src/core/stt/groq/config.rs:125-133",
+          "gateway/src/core/stt/groq/config.rs:521"
+        ],
+        "unverified": [
+          "transports[0].limits.max_audio_ms (only a file size limit is documented)",
+          "transports[0].limits.rates (concurrent_requests) (none documented)",
+          "transports[0].limits.rates (plan developer) (Developer plan values, confirmed on the models page only; the free-plan entries come from the rate limits page)",
+          "whether the audio-seconds limits count billed seconds (10 s minimum) or actual seconds",
+          "top-level verbose_json fields `language` and `duration` (not shown in Groq's example, so detected_languages is not listed as a quality signal)",
+          "transports[0].latency (third-party P99 only; no median)",
+          "translation support (the speech-to-text page says this model does not support the translation endpoint; the API reference lists both models)",
+          "the text of Groq's 429 reply, which decides whether the existing client retries a rate-limit error"
+        ],
+        "notes": "The gateway's default Groq model (gateway/src/core/stt/groq/config.rs:47). File endpoint only: Groq has no stream parameter and no realtime or WebSocket audio endpoint. An asynchronous Batch API also accepts transcriptions, but it answers in 24 hours to 7 days, so it is not listed as a transport. max_upload_bytes is the 25 MB attachment limit, which is also the free-plan file limit; the Developer plan allows 100 MB files, and anything above the attachment limit goes through the `url` parameter. Groq's x-ratelimit request headers always describe the per-day request window, not the per-minute one, and its token headers describe tokens per minute, which do not limit audio; the limiter may read retry-after directly but must not take the request headers as the per-minute budget."
+      }
+    },
+    {
+      "id": "groq:whisper-large-v3",
+      "match": {
+        "provider": "groq",
+        "model": "whisper-large-v3",
+        "model_aliases": [
+          "whisper-v3",
+          "large-v3"
+        ]
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "groq_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the Groq client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No figure for this model. Pipecat's P99 of 1.54 s was recorded with whisper-large-v3-turbo. Groq publishes only a speed factor (189 times real time)."
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "max_audio_ms": null,
+            "min_audio_ms": 10,
+            "context_window_ms": 30000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": "developer",
+                "scope": "organisation"
+              },
+              {
+                "metric": "audio_seconds",
+                "per": "hour",
+                "value": 200000,
+                "plan": "developer",
+                "scope": "organisation"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 20,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "requests",
+                "per": "day",
+                "value": 2000,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "audio_seconds",
+                "per": "hour",
+                "value": 7200,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "audio_seconds",
+                "per": "day",
+                "value": 28800,
+                "plan": "free",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "developer"
+          },
+          "upload": {
+            "accepted": [
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "segment_no_speech_prob",
+            "segment_avg_logprob",
+            "segment_compression_ratio"
+          ],
+          "quality_signals_require": [
+            "response_format=verbose_json",
+            "timestamp_granularities[]=segment"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_tokens": 224
+              }
+            ],
+            "response_formats": [
+              "verbose_json",
+              "json",
+              "text"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions",
+            "limit_headers": {
+              "reset_requests": "x-ratelimit-reset-requests",
+              "retry_after": "retry-after"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/groq/client.rs:659 (send_request, takes &mut self); gateway/src/core/stt/groq/config.rs:630-664 (build_form_text_fields)",
+            "notes": "No adapter exists. The request code lives inside the buffering client: send_request takes &mut self and writes rate-limit state and the last request id, so two uploads cannot be in flight; it is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) behind a 120 s request timeout, a 30 s connect timeout and a three-attempt loop (client.rs:57, :60, :66). The loop retries network errors and timeouts; a typed 429 or 5xx reply is probably returned on the first attempt, because the retry test looks for the status digits or a lower-case 'rate limit' in a message that holds neither unless the vendor's error body failed to parse (client.rs:640-653, :806-825; inferred from reading, not run). The worst stall on the audio path is therefore three 120 s timeouts plus back-off, and a rate-limit reply probably fails the upload at once instead of waiting. The WAV is written at the session sample rate and channel count (client.rs:520-522), not 16 kHz mono. Groq speaks the OpenAI multipart request, so the shared OpenAI-compatible transcriber serves it with base URL https://api.groq.com/openai/v1 (config.rs:35). The client keeps only the text and a derived confidence (client.rs:591-596); no_speech_prob and compression_ratio are parsed and dropped, and an empty transcript still fires the result callback. Ask for the `segment` timestamp granularity: `word` alone returns only word, start and end, without the quality fields. The prompt is limited to 224 tokens (config.rs:50). Take the language hint from the provider-mapped value: on the /ws path the configured language is mapped to ISO 639-1, with `auto` omitted, before the client is built (gateway/src/handlers/ws/config.rs:475-504; gateway/src/core/lang/mappers/mod.rs:239-242), while the DAG node passes its own default en-US unmapped (gateway/src/dag/nodes/provider.rs:334-343)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 120 s per request, 30 s to connect and up to three attempts on network errors and timeouts (gateway/src/core/stt/groq/client.rs:57, :60, :66); the vendor audit recommends 5 s in total with one retry at most, roughly three times the third-party P99 of 1.54 s. It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV: Groq downsamples to 16 kHz mono and says WAV gives lower latency), pre-roll, trailing silence, the 25 s maximum segment and two uploads in flight keep the defaults. Segments are still uploaded at each pause: the 10 s minimum billed per request costs about $0.0001 (turbo) or $0.0003 (large-v3), too little to justify holding a segment back. The binding constraint is the per-organisation request limit, so a deployment on the free plan (20 requests per minute) may choose upload_policy per_turn."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/groq/config.rs:521 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Groq serves this model only through its file transcription endpoint and has no streaming interface. On this gateway it is not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 10000,
+        "bills_silence": false,
+        "pricing_key": "groq:whisper-large-v3",
+        "notes": "Only uploaded segments are billed, so a 3 s segment is billed as 10 s. pricing_key exists at gateway/src/config/pricing.rs:106."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://console.groq.com/docs/speech-to-text",
+          "https://console.groq.com/docs/models",
+          "https://console.groq.com/docs/model/whisper-large-v3",
+          "https://console.groq.com/docs/api-reference",
+          "https://console.groq.com/docs/rate-limits",
+          "https://console.groq.com/docs/errors",
+          "https://console.groq.com/docs/batch"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/groq/config.rs:125-133",
+          "gateway/src/core/stt/groq/config.rs:521"
+        ],
+        "unverified": [
+          "transports[0].limits.max_audio_ms (only a file size limit is documented)",
+          "transports[0].limits.rates (concurrent_requests) (none documented)",
+          "transports[0].limits.rates (plan developer) (Developer plan values, confirmed on the models page only; the free-plan entries come from the rate limits page)",
+          "whether the audio-seconds limits count billed seconds (10 s minimum) or actual seconds",
+          "top-level verbose_json fields `language` and `duration` (not shown in Groq's example, so detected_languages is not listed as a quality signal)",
+          "transports[0].latency (no figure for this model)",
+          "transports[0].limits.context_window_ms (the audit read the 30-second statement on both model pages; the fact-check re-read only the turbo page)",
+          "the text of Groq's 429 reply, which decides whether the existing client retries a rate-limit error"
+        ],
+        "notes": "File endpoint only, like every Groq speech-to-text model. This is the Groq model that supports the English translation endpoint. max_upload_bytes is the 25 MB attachment limit, which is also the free-plan file limit; the Developer plan allows 100 MB files, and anything above the attachment limit goes through the `url` parameter. Groq's x-ratelimit request headers always describe the per-day request window, not the per-minute one, and its token headers describe tokens per minute, which do not limit audio; the limiter may read retry-after directly but must not take the request headers as the per-minute budget."
+      }
+    },
+    {
+      "id": "groq:distil-whisper-large-v3-en",
+      "match": {
+        "provider": "groq",
+        "model": "distil-whisper-large-v3-en"
+      },
+      "lifecycle": {
+        "status": "retired",
+        "shutdown_on": "2025-08-23",
+        "replacement": [
+          "whisper-large-v3-turbo"
+        ]
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/groq/config.rs:545-548 (an unknown id is sent verbatim; the upload happens at hang-up or a client commit because of :521)",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_model_retired",
+          "text": "Groq shut this model down on 2025-08-23 in favour of whisper-large-v3-turbo, so it can no longer be used. Choose whisper-large-v3-turbo instead."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://console.groq.com/docs/deprecations"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/groq/config.rs:521",
+          "gateway/src/core/stt/groq/config.rs:545-548",
+          "gateway/src/plugin/builtin/mod.rs:146"
+        ],
+        "unverified": [
+          "the exact error Groq returns for this id",
+          "lifecycle.deprecated_on (the announcement date is not in the evidence)",
+          "billing.unit, billing.min_billed_ms and billing.bills_silence (not applicable: the model is retired)"
+        ],
+        "notes": "Retired model kept in the map so that a session naming it gets a clear refusal instead of the provider default. Why the row has no transport (the version 1 reason, kept for the record): Groq shut this model down on 2025-08-23 in favour of whisper-large-v3-turbo, so no transport can reach it. It was a file-only model. The gateway still advertises it in plugin metadata (gateway/src/plugin/builtin/mod.rs:146) and would send the id verbatim, failing at the first upload; a session that names it should be refused at setup with a pointer to whisper-large-v3-turbo."
+      }
+    },
+    {
+      "id": "groq:any",
+      "match": {
+        "provider": "groq",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "groq_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the Groq client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "min_audio_ms": 10,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_tokens": 224
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions",
+            "limit_headers": {
+              "reset_requests": "x-ratelimit-reset-requests",
+              "retry_after": "retry-after"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/groq/client.rs:659 (send_request, takes &mut self); gateway/src/core/stt/groq/config.rs:630-664 (build_form_text_fields)",
+            "notes": "No adapter exists. The request code lives inside the buffering client: send_request takes &mut self and writes rate-limit state and the last request id, so two uploads cannot be in flight; it is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) behind a 120 s request timeout, a 30 s connect timeout and a three-attempt loop (client.rs:57, :60, :66). The loop retries network errors and timeouts; a typed 429 or 5xx reply is probably returned on the first attempt, because the retry test looks for the status digits or a lower-case 'rate limit' in a message that holds neither unless the vendor's error body failed to parse (client.rs:640-653, :806-825; inferred from reading, not run). The worst stall on the audio path is therefore three 120 s timeouts plus back-off, and a rate-limit reply probably fails the upload at once instead of waiting. The WAV is written at the session sample rate and channel count (client.rs:520-522), not 16 kHz mono. Groq speaks the OpenAI multipart request, so the shared OpenAI-compatible transcriber serves it with base URL https://api.groq.com/openai/v1 (config.rs:35). For an unknown id the adapter asks for the plain json format and reads no quality fields, because verbose_json segment fields are only established for the Whisper models. Take the language hint from the provider-mapped value: on the /ws path the configured language is mapped to ISO 639-1, with `auto` omitted, before the client is built (gateway/src/handlers/ws/config.rs:475-504; gateway/src/core/lang/mappers/mod.rs:239-242), while the DAG node passes its own default en-US unmapped (gateway/src/dag/nodes/provider.rs:334-343)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 120 s per request, 30 s to connect and up to three attempts on network errors and timeouts (gateway/src/core/stt/groq/client.rs:57, :60, :66); the vendor audit recommends 5 s in total with one retry at most, roughly three times the third-party P99 of 1.54 s. It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV: Groq downsamples to 16 kHz mono and says WAV gives lower latency), pre-roll, trailing silence, the 25 s maximum segment and two uploads in flight keep the defaults. Segments are still uploaded at each pause: the 10 s minimum billed per request costs about $0.0001 (turbo) or $0.0003 (large-v3), too little to justify holding a segment back. The binding constraint is the per-organisation request limit, so a deployment on the free plan (20 requests per minute) may choose upload_policy per_turn."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/groq/config.rs:521 (the default flush strategy is OnDisconnect); :545-548 (an unknown id is sent verbatim)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Groq has no streaming transcription interface, so model ids this gateway does not list are treated as file transcription models. On this gateway they are not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 10000,
+        "bills_silence": false,
+        "notes": "The 10 s minimum billed per request is stated for the endpoint, not per model."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://console.groq.com/docs/speech-to-text",
+          "https://console.groq.com/docs/api-reference"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/groq/config.rs:521",
+          "gateway/src/core/stt/groq/config.rs:545-548"
+        ],
+        "unverified": [
+          "everything model-specific; the row carries only endpoint-level facts from the speech-to-text page and API reference (25 MB attachment limit, 0.01 s minimum length, 10 s minimum billing, the 224-token prompt limit, `language` and `prompt` fields)",
+          "transports[0].latency (no figure can apply to an unknown model)"
+        ],
+        "notes": "Fail-slow default for a Groq model id the map has never seen. Groq has no streaming speech-to-text interface of any kind, so an unknown id can only be a file model and must never default to streaming."
+      }
+    }
+  ]
+}

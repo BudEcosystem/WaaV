@@ -44,6 +44,8 @@ pub enum TurnEvent {
     BargeInMopUp,
     /// The mute state flipped.
     MuteChanged { muted: bool },
+    /// The caller's turn closed with no input (a cough, or speech whose transcription was lost).
+    Aborted { turn_id: u64 },
 }
 
 /// Pluggable turn-policy controller. One per session.
@@ -161,6 +163,16 @@ impl TurnController {
             out.push(TurnEvent::MuteChanged { muted });
         }
         if muted && sig.is_user_input() {
+            return out;
+        }
+
+        // A segmented turn that closed with no text ends the open turn without input.
+        if let ControllerSignal::SpeechTurnClosed { had_text: false } = sig {
+            if self.turn_active.swap(false, Ordering::AcqRel) {
+                out.push(TurnEvent::Aborted {
+                    turn_id: self.current_turn_id.load(Ordering::Acquire),
+                });
+            }
             return out;
         }
 

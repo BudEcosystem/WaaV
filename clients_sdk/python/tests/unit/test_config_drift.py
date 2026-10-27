@@ -44,6 +44,7 @@ _SCHEMA_TO_REACH = {
     "LiveKitWebSocketConfig": "LiveKitWebSocketConfig",
     "DAGWebSocketConfig": "DAGWebSocketConfig",
     "ConversationWebSocketConfig": "ConversationWebSocketConfig",
+    "AgentWebSocketConfig": "AgentWebSocketConfig",
 }
 
 
@@ -244,11 +245,11 @@ class TestExtractorSanity:
 
     def test_extractor_reads_known_props(self, openapi_text: str):
         conv = extract_schema_properties(openapi_text, "ConversationWebSocketConfig")
-        # The two required fields and a representative reasoning field must parse.
+        # The required field, base_url and a representative reasoning field must parse.
         assert {"base_url", "model", "reasoning_model"} <= conv
-        # 29-field flagship surface — assert the count matches the digest so a
+        # 32-field flagship surface — assert the count matches the digest so a
         # parser regression (under/over-collecting) is caught.
-        assert len(conv) == 29, f"expected 29 conversation props, parsed {len(conv)}: {sorted(conv)}"
+        assert len(conv) == 32, f"expected 32 conversation props, parsed {len(conv)}: {sorted(conv)}"
 
     def test_extractor_missing_schema_raises(self, openapi_text: str):
         with pytest.raises(AssertionError):

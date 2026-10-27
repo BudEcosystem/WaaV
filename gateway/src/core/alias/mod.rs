@@ -83,6 +83,14 @@ pub struct AliasStt {
     /// Canonical language token (e.g. `en-US`); resolved by the P2 language mapper.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// The leg's own server (an OpenAI-compatible base such as `http://127.0.0.1:8080/v1`),
+    /// instead of the process-wide `OPENAI_BASE_URL`. SERVER-CONFIG-ONLY: never echoed and never
+    /// settable by a client; validated at startup with the egress rules (`validate_aliases`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Operator credential (`core::credentials`) the leg sends to `base_url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 /// Sparse TTS defaults carried by an alias (the `[aliases.x.tts]` block).
@@ -105,6 +113,16 @@ pub struct AliasTts {
     /// Canonical emotion token (e.g. `friendly`); resolved by the emotion mapper.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emotion: Option<crate::core::emotion::Emotion>,
+    /// The leg's own OpenAI-compatible speech server; see [`AliasStt::base_url`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Operator credential the leg sends to `base_url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    /// The synthesis request's timeout, seconds, when the client names none (the default is
+    /// 60 s; a model loading on demand can take longer). Clamped like a client's value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
 }
 
 /// Sparse LLM / conversation-loop defaults carried by an alias (the `[aliases.x.llm]`
@@ -140,6 +158,10 @@ pub struct AliasLlm {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "openai"))]
     pub provider_kind: Option<crate::core::llm::AdapterKind>,
+    /// Operator credential (`core::credentials`) the LLM leg uses when the client sends no key.
+    /// The NAME only — the secret stays in the credential's env var / file, bound to its hosts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 /// One alias definition (one `[aliases.<name>]` table in `config.yaml`).
@@ -174,6 +196,180 @@ pub struct AliasDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
     pub interaction: Option<serde_json::Value>,
+    /// Whether the OpenAI-compatible routes may resolve this alias as a `model`
+    /// (`POST /v1/audio/speech` → its TTS leg, `/v1/audio/transcriptions` → its STT leg). Off by
+    /// default: only aliases the operator marks are reachable that way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub openai_compatible: bool,
+}
+
+/// A leg's own server, from an alias: where the leg goes and which operator credential it sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasLegEndpoint {
+    pub provider: String,
+    pub base_url: String,
+    pub credential_ref: Option<String>,
+}
+
+impl AliasLegEndpoint {
+    /// Whether this endpoint governs a leg whose (final) provider is `provider`: a client that
+    /// chose another provider does not get its traffic sent to the alias's server.
+    pub fn applies_to(&self, provider: &str) -> bool {
+        self.provider.trim().eq_ignore_ascii_case(provider.trim())
+    }
+
+    /// The base an OpenAI-shaped server is called at, with its version segment
+    /// (`http://h:8080` and `http://h:8080/v1` both become `http://h:8080/v1`).
+    pub fn openai_api_base(&self) -> String {
+        waav_segmented_stt::vendor::openai::join_api_path(&self.base_url, "/v1")
+    }
+}
+
+impl AliasDefinition {
+    /// The STT leg's own server, when the alias names one.
+    pub fn stt_endpoint(&self) -> Option<AliasLegEndpoint> {
+        let leg = self.stt.as_ref()?;
+        Some(AliasLegEndpoint {
+            provider: leg.provider.clone()?,
+            base_url: leg.base_url.clone()?,
+            credential_ref: leg.credential_ref.clone(),
+        })
+    }
+
+    /// The TTS leg's own server, when the alias names one.
+    pub fn tts_endpoint(&self) -> Option<AliasLegEndpoint> {
+        let leg = self.tts.as_ref()?;
+        Some(AliasLegEndpoint {
+            provider: leg.provider.clone()?,
+            base_url: leg.base_url.clone()?,
+            credential_ref: leg.credential_ref.clone(),
+        })
+    }
+}
+
+/// An alias's leg endpoints for one session (each `None` when the alias names no server).
+#[derive(Debug, Clone, Default)]
+pub struct AliasLegs {
+    pub stt: Option<AliasLegEndpoint>,
+    pub tts: Option<AliasLegEndpoint>,
+}
+
+impl AliasLegs {
+    pub fn of(def: &AliasDefinition) -> Self {
+        Self {
+            stt: def.stt_endpoint(),
+            tts: def.tts_endpoint(),
+        }
+    }
+}
+
+/// The key an alias leg sends to its own server.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AliasLegKey {
+    /// Empty when the server gets none (a keyless local server).
+    pub key: String,
+    /// The operator holds a key for the provider but it may not go to this server: the leg runs
+    /// keyless, and the client is told (`config_warning`), so a 401 has an explanation.
+    pub withheld: bool,
+}
+
+/// The key decision for an alias leg, the one rule every route applies: the client's own key;
+/// else the alias's `credential_ref`, bound to the leg's server (a credential bound elsewhere is
+/// an error, never a silent fallback); else the operator's key for the provider only where the
+/// operator approved that server (`core::client_destination::operator_approved`); else none.
+pub fn alias_leg_key(
+    endpoint: &AliasLegEndpoint,
+    client_key: Option<&str>,
+    operator_key: impl FnOnce() -> Option<String>,
+) -> Result<AliasLegKey, String> {
+    if let Some(key) = client_key.map(str::trim).filter(|k| !k.is_empty()) {
+        return Ok(AliasLegKey {
+            key: key.to_string(),
+            withheld: false,
+        });
+    }
+    if let Some(name) = endpoint.credential_ref.as_deref() {
+        let (bound, _) = crate::core::credentials::global_credentials()
+            .bind(name, &endpoint.base_url)
+            .map_err(|e| format!("alias leg ({}): {e}", endpoint.provider))?;
+        let key = bound.current().ok_or_else(|| {
+            format!(
+                "alias leg ({}): credential '{name}' is declared but holds no value",
+                endpoint.provider
+            )
+        })?;
+        return Ok(AliasLegKey {
+            key,
+            withheld: false,
+        });
+    }
+    let operator = operator_key().filter(|k| !k.trim().is_empty());
+    if crate::core::client_destination::operator_approved(&endpoint.provider, &endpoint.base_url) {
+        return Ok(AliasLegKey {
+            key: operator.unwrap_or_default(),
+            withheld: false,
+        });
+    }
+    Ok(AliasLegKey {
+        key: String::new(),
+        withheld: operator.is_some(),
+    })
+}
+
+/// Startup checks for the server's aliases: a leg's `base_url` needs the leg's `provider` and
+/// must pass the egress rules (an http(s) URL, and a private target only where the operator
+/// allows it), so a mistake stops the server instead of failing every session; an alias marked
+/// `openai_compatible` needs an STT or TTS leg.
+pub fn validate_aliases(config: &AliasConfig) -> Result<(), String> {
+    for (name, def) in &config.aliases {
+        for (leg, provider, base) in [
+            (
+                "stt",
+                def.stt.as_ref().and_then(|l| l.provider.as_deref()),
+                def.stt.as_ref().and_then(|l| l.base_url.as_deref()),
+            ),
+            (
+                "tts",
+                def.tts.as_ref().and_then(|l| l.provider.as_deref()),
+                def.tts.as_ref().and_then(|l| l.base_url.as_deref()),
+            ),
+        ] {
+            let Some(base) = base else { continue };
+            if provider.is_none_or(|p| p.trim().is_empty()) {
+                return Err(format!(
+                    "alias '{name}': {leg}.base_url needs {leg}.provider (the provider that speaks to it)"
+                ));
+            }
+            crate::core::net::validate_url_for_ssrf(base, crate::core::net::HTTP_WS_URL_SCHEMES)
+                .map_err(|e| {
+                    format!(
+                        "alias '{name}': {leg}.base_url {base:?} is not allowed: {e}. A private \
+                     address needs WAAV_PRIVATE_EGRESS_ALLOWLIST (host:port)"
+                    )
+                })?;
+        }
+        // The OpenAI-compatible routes run a leg's own server through the self-hosted vendor,
+        // which speaks OpenAI's API; another provider's base would be ignored there, silently.
+        if def.openai_compatible {
+            for (leg, endpoint) in [("stt", def.stt_endpoint()), ("tts", def.tts_endpoint())] {
+                if let Some(endpoint) = endpoint
+                    && !endpoint.provider.trim().eq_ignore_ascii_case("openai")
+                {
+                    return Err(format!(
+                        "alias '{name}': openai_compatible serves a leg's base_url as an \
+                         OpenAI-compatible server, so {leg}.provider must be openai (got {:?})",
+                        endpoint.provider
+                    ));
+                }
+            }
+        }
+        if def.openai_compatible && def.stt.is_none() && def.tts.is_none() {
+            return Err(format!(
+                "alias '{name}': openai_compatible needs an stt or tts leg to serve"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Configuration for the alias registry, assembled at server-config load.
@@ -350,7 +546,9 @@ fn default_alias_stt() -> STTWebSocketConfig {
         extras: Default::default(),
         translation: None,
         turn_detection: None,
+        transcription_mode: None,
         audio_in_codec: None,
+        noise_suppression: None,
     }
 }
 
@@ -407,12 +605,15 @@ fn fallback_alias_conversation() -> ConversationWebSocketConfig {
         reasoning_model: None,
         reasoning_base_url: None,
         reasoning_api_key: None,
+        credential_ref: None,
+        reasoning_credential_ref: None,
         reasoning_provider_kind: None,
         reasoning_route: Default::default(),
         reasoning_budget_ms: None,
         degradation_message: None,
         max_llm_calls_per_turn: None,
         max_reasoning_tokens: None,
+        llm_timeout_ms: None,
     }
 }
 
@@ -498,6 +699,11 @@ pub fn splice_alias(
         {
             cfg.emotion = Some(e);
         }
+        if let Some(secs) = a.request_timeout_secs
+            && cfg.request_timeout.is_none()
+        {
+            cfg.request_timeout = Some(secs);
+        }
     }
 
     // ── LLM / conversation loop ───────────────────────────────────────────────────
@@ -538,6 +744,13 @@ pub fn splice_alias(
         {
             cfg.provider_kind = Some(pk);
         }
+        // The alias names the operator's credential; a client key (or ref) of its own wins.
+        if let Some(r) = &a.credential_ref
+            && cfg.api_key.is_none()
+            && cfg.credential_ref.is_none()
+        {
+            cfg.credential_ref = Some(r.clone());
+        }
     }
 
     // ── DAG template ──────────────────────────────────────────────────────────────
@@ -576,12 +789,18 @@ fn build_echo(
         provider: (!c.provider.is_empty()).then(|| c.provider.clone()),
         model: (!c.model.is_empty()).then(|| c.model.clone()),
         language: (!c.language.is_empty()).then(|| c.language.clone()),
+        // The leg's server stays server-side: never echoed.
+        base_url: None,
+        credential_ref: None,
     });
     let echo_tts = def.tts.as_ref().and(tts.as_ref()).map(|c| AliasTts {
         provider: (!c.provider.is_empty()).then(|| c.provider.clone()),
         voice: c.voice_id.clone(),
         model: (!c.model.is_empty()).then(|| c.model.clone()),
         emotion: c.emotion,
+        base_url: None,
+        credential_ref: None,
+        request_timeout_secs: None,
     });
     let echo_llm = def
         .llm
@@ -596,6 +815,8 @@ fn build_echo(
             reasoning_effort: c.reasoning_effort,
             reasoning_model: c.reasoning_model.clone(),
             provider_kind: c.provider_kind,
+            // The credential's NAME is not a secret, but the echo stays minimal.
+            credential_ref: None,
         });
     let echo_dag = def
         .dag_template
@@ -677,6 +898,7 @@ pub fn splice_alias_realtime(
             voice: voice.clone(),
             model: model.clone(),
             emotion: def.tts.as_ref().and_then(|t| t.emotion),
+            ..Default::default()
         }),
         llm: def.llm.as_ref().map(|l| AliasLlm {
             base_url: None,
@@ -685,6 +907,7 @@ pub fn splice_alias_realtime(
             reasoning_effort: l.reasoning_effort,
             reasoning_model: l.reasoning_model.clone(),
             provider_kind: l.provider_kind,
+            credential_ref: None,
         }),
         dag_template: None,
     }

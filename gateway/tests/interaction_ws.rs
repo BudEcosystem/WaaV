@@ -611,8 +611,8 @@ struct Plain {
 }
 
 /// A session with this `interaction` value (or none) through fixed steps: config, a `speak`,
-/// a spoken turn that the conversation loop answers, and three messages a session without the
-/// mode refuses.
+/// a spoken turn and a typed one (`agent_input`) that the conversation loop answers, and two
+/// messages a session without the mode refuses.
 async fn plain_session(gateway: &Gateway, interaction: Option<Value>) -> Plain {
     gateway
         .llm
@@ -633,8 +633,13 @@ async fn plain_session(gateway: &Gateway, interaction: Option<Value>) -> Plain {
     gateway.stt.speech_final("what time is it").await;
     client.until("tts_playback_complete", 2).await;
 
+    // A conversation session takes typed turns too.
+    client
+        .send(json!({ "type": "agent_input", "text": "hello" }))
+        .await;
+    client.until("tts_playback_complete", 3).await;
+
     for message in [
-        json!({ "type": "agent_input", "text": "hello" }),
         json!({ "type": "task_cancel", "task_id": "task_nobody" }),
         json!({ "type": "task_answer", "request_id": "q_nobody_1", "outcome": "accept" }),
     ] {
@@ -669,13 +674,28 @@ async fn a_session_that_does_not_ask_is_the_same_with_the_switch_on() {
     assert_eq!(plain.ready["protocol_version"], "1.0");
     assert!(plain.ready.get("interaction").is_none(), "{}", plain.ready);
     // Nothing of protocol 1.1 is among them.
-    let known = ["ready", "tts_playback_complete", "stt_result", "error"];
+    let known = [
+        "ready",
+        "tts_playback_complete",
+        "stt_result",
+        "error",
+        "agent_response_started",
+        "assistant_transcript",
+        "agent_response_done",
+    ];
     let is_1_0 = |kind: &String| kind.starts_with("audio:") || known.contains(&kind.as_str());
     assert!(plain.types.iter().all(is_1_0), "{:?}", plain.types);
     // The conversation loop answered the spoken turn in both.
     assert_eq!(
         gateway.tts.spoken(),
-        ["Hello there.", "It is noon.", "Hello there.", "It is noon."]
+        [
+            "Hello there.",
+            "It is noon.",
+            "It is noon.",
+            "Hello there.",
+            "It is noon.",
+            "It is noon."
+        ]
     );
 }
 
@@ -1856,12 +1876,13 @@ async fn a_file_only_model_is_refused_and_a_streaming_fallback_is_said() {
     config["stt_config"]["provider"] = json!("deepgram");
     config["stt_config"]["model"] = json!("whisper-large");
     client.send(config).await;
+    // Refused with a streaming model to use instead: by the speech-to-text resolver when it
+    // covers the session (`stt_live_unsupported`, the model in `details`), else by name.
     let refused = client.until("error", 1).await;
     let message = refused["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("whisper-large") && message.contains("/transcribe/batch"),
-        "{refused}"
-    );
+    let names_model =
+        message.contains("whisper-large") || refused["details"]["model"] == "whisper-large";
+    assert!(names_model && message.contains("nova-3"), "{refused}");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(client.of_type("ready").is_empty(), "{}", client.timeline());
     client.close().await;

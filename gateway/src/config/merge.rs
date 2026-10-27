@@ -680,30 +680,25 @@ pub fn merge_config(
                 .as_ref()
                 .and_then(|d| d.provider_operation_secs),
             "DAG_PROVIDER_OPERATION_SECS",
-        )?
-        .unwrap_or(30),
+        )?,
         stt_endpoint_secs: yaml_or_env::<u64>(
             yaml.dag_timeouts.as_ref().and_then(|d| d.stt_endpoint_secs),
             "DAG_STT_ENDPOINT_SECS",
-        )?
-        .unwrap_or(60),
+        )?,
         tts_endpoint_secs: yaml_or_env::<u64>(
             yaml.dag_timeouts.as_ref().and_then(|d| d.tts_endpoint_secs),
             "DAG_TTS_ENDPOINT_SECS",
-        )?
-        .unwrap_or(60),
+        )?,
         llm_endpoint_secs: yaml_or_env::<u64>(
             yaml.dag_timeouts.as_ref().and_then(|d| d.llm_endpoint_secs),
             "DAG_LLM_ENDPOINT_SECS",
-        )?
-        .unwrap_or(120),
+        )?,
         websocket_operation_secs: yaml_or_env::<u64>(
             yaml.dag_timeouts
                 .as_ref()
                 .and_then(|d| d.websocket_operation_secs),
             "DAG_WEBSOCKET_OPERATION_SECS",
-        )?
-        .unwrap_or(30),
+        )?,
     };
 
     // P3: server-side alias registry. config.yaml is the ONLY definition source (no env

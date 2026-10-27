@@ -42,8 +42,10 @@ pub use crate::core::llm::{
     FunctionDefinition, MessageRole, ResponseFormat, ToolCall, ToolDefinition, Usage,
 };
 
+/// A node that names no `timeout_ms` gets the operator's `WAAV_LLM_TIMEOUT_MS` (else 60 s), the same
+/// default as the conversation path, so one knob covers both.
 fn default_timeout_ms() -> u64 {
-    60000
+    crate::core::llm::default_timeout_ms()
 }
 
 fn default_max_history() -> usize {
@@ -55,7 +57,9 @@ fn default_max_history() -> usize {
 /// Kept as a distinct type (rather than aliasing `LlmClientConfig`) so the
 /// node's JSON schema and `Default` are stable; it converts into
 /// `LlmClientConfig` for the shared client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (below) and redacts `api_key` and every `headers` value.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmEndpointConfig {
     /// Custom base URL (e.g., "https://api.openai.com/v1", "http://localhost:11434/v1").
     pub base_url: String,
@@ -140,6 +144,12 @@ pub struct LlmEndpointConfig {
     pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
 }
 
+impl std::fmt::Debug for LlmEndpointConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::observability::trace_redact::redacted_debug("LlmEndpointConfig", self, f)
+    }
+}
+
 impl Default for LlmEndpointConfig {
     fn default() -> Self {
         Self {
@@ -204,9 +214,13 @@ impl From<LlmEndpointConfig> for LlmClientConfig {
             extra: c.extra,
             provider_kind: c.provider_kind,
             reasoning_effort: c.reasoning_effort,
-            // Env fallback stays the client default; Bud mode refuses it process-wide
-            // (`resolve_api_key`, FRD-023 RT0).
+            // Env fallback stays the client default for OPERATOR templates; a client
+            // definition turns it off (`LlmEndpointNode::try_new_for_client`). Bud mode refuses
+            // it process-wide (`resolve_api_key`, FRD-023 RT0).
             allow_env_fallback: true,
+            bound_credential: None,
+            private_grants: Vec::new(),
+            guarded_egress: false,
         }
     }
 }
@@ -298,6 +312,58 @@ impl LlmEndpointNode {
     pub fn try_new(id: impl Into<String>, config: LlmEndpointConfig) -> DAGResult<Self> {
         super::endpoint::validate_url_for_ssrf(&config.base_url)?;
         Ok(Self::new(id, config))
+    }
+
+    /// An LLM node from a CLIENT definition (inline `dag_config.definition`).
+    ///
+    /// The gateway never reads its environment for it. The key is the client's own literal
+    /// `api_key`, or an operator credential (`credential_ref`, or the legacy `api_key:
+    /// "${NAME}"`) that is bound to this `base_url`'s host — refused otherwise. With no key, the
+    /// vendor's implicit binding applies only toward the vendor's own host (`OPENAI_API_KEY` →
+    /// `api.openai.com`). The SSRF check honours the credential's port-scoped private grant, and
+    /// the HTTP client re-checks the addresses it dials.
+    pub fn try_new_for_client(
+        id: impl Into<String>,
+        mut config: LlmEndpointConfig,
+        credential_ref: Option<&str>,
+    ) -> DAGResult<Self> {
+        let id = id.into();
+        let probe: LlmClientConfig = config.clone().into();
+        let default_env_key = crate::core::llm::LlmAdapter::default_env_key(
+            crate::core::llm::adapter::select_adapter(&probe),
+        );
+        let registry = crate::core::credentials::global_credentials();
+        registry
+            .refuse_operator_only(config.api_key.as_deref(), credential_ref)
+            .map_err(|e| DAGError::ConfigError(format!("LLM node '{id}': {e}")))?;
+        let key = registry
+            .resolve_client_key(
+                config.api_key.as_deref(),
+                credential_ref,
+                &config.base_url,
+                default_env_key,
+            )
+            .map_err(|e| DAGError::ConfigError(format!("LLM node '{id}': {e}")))?;
+        crate::core::net::validate_url_for_ssrf_with_grants(
+            &config.base_url,
+            crate::core::net::HTTP_URL_SCHEMES,
+            &key.private_grants,
+        )
+        .map_err(|e| DAGError::ConfigError(format!("LLM node '{id}': {e}")))?;
+
+        config.api_key = key.literal;
+        let streaming = config.streaming;
+        let mut client_config: LlmClientConfig = config.into();
+        client_config.allow_env_fallback = false;
+        client_config.bound_credential = key.bound;
+        client_config.private_grants = key.private_grants;
+        client_config.guarded_egress = true;
+        Ok(Self {
+            id,
+            streaming,
+            client: LlmClient::new(client_config),
+            session_credential: None,
+        })
     }
 
     /// Create from JSON config.

@@ -247,6 +247,19 @@ await talk.stopListening();
 await talk.disconnect();
 ```
 
+### Voice agents (Bud control plane)
+
+Name a Bud voice agent and it decides both speech legs, the voice and turn-taking. `stt`/`tts`
+may carry only the audio format; the gateway refuses a `model` on them.
+
+```typescript
+const agentTalk = await bud.talk.connect({ agent: 'support' }); // or { id: 'support', version: 2 }
+```
+
+Under the Bud control plane, a conversation loop's `ConversationConfig` needs only `model` (a Bud
+chat deployment); leave `baseUrl` unset, since the gateway refuses one there. A speech leg whose
+`model` names a Bud deployment may also leave out `provider`.
+
 ---
 
 ## Realtime Audio-to-Audio
@@ -927,6 +940,17 @@ globalThis.WebSocket = WebSocket as any;
 
 const bud = new BudClient({ baseUrl: 'http://localhost:3001' });
 ```
+
+---
+
+## How the API key is sent on a WebSocket
+
+- **Node with the `ws` package:** as the `Authorization: Bearer` header of the upgrade request.
+- **Browsers (and other WebSockets that can't set headers):** as `?token=` on the URL. Query
+  strings end up in proxy access logs, so a gateway can refuse them (`AUTH_QUERY_TOKEN=deny`). In
+  that case use the `ws` package from a server.
+
+The key is never included in the URL that errors and timeouts report.
 
 ---
 

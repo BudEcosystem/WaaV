@@ -249,6 +249,11 @@ pub struct ElevenLabsSTTConfig {
     /// Disable in production for privacy.
     pub enable_logging: bool,
 
+    /// Zero-retention mode (`enable_logging=false`), for a deployment with
+    /// `stt.data_retention: none`. ElevenLabs logs by default and offers this mode to enterprise
+    /// keys; another key is refused by the vendor rather than logged.
+    pub zero_retention: bool,
+
     /// Regional endpoint selection.
     ///
     /// Choose based on latency requirements or data residency needs.
@@ -339,6 +344,7 @@ impl Default for ElevenLabsSTTConfig {
             min_speech_duration_ms: Some(50),      // Minimum 50ms of speech to count
             min_silence_duration_ms: Some(300),    // 300ms silence for end-of-speech
             enable_logging: false,
+            zero_retention: false,
             region: ElevenLabsRegion::default(),
             // Advanced features disabled by default
             keyterms: None,
@@ -494,7 +500,9 @@ impl ElevenLabsSTTConfig {
             url.push_str(&format!("&min_silence_duration_ms={duration}"));
         }
 
-        if self.enable_logging {
+        if self.zero_retention {
+            url.push_str("&enable_logging=false");
+        } else if self.enable_logging {
             url.push_str("&enable_logging=true");
         }
 
@@ -609,6 +617,12 @@ impl ElevenLabsSTTConfig {
         // Plumb the test/diagnostic WS endpoint override (e.g. localhost mock) through from the
         // standardized config so `build_websocket_url` can redirect the connection.
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        // A deployment's canonical data settings (Release 5).
+        let data = crate::core::stt::data_settings::DataSettings::from_extras(&std.extras.0);
+        if data.eu {
+            cfg.region = ElevenLabsRegion::Eu;
+        }
+        cfg.zero_retention = data.no_retention;
         cfg
     }
 

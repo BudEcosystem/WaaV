@@ -143,7 +143,7 @@ fn a_background_run_is_recorded_as_the_turn_of_its_plain_path() {
             streaming: true,
             ..Default::default()
         };
-        let (fast, _) = resolve_llm_legs(&conversation, None).expect("llm legs");
+        let fast = resolve_llm_legs(&conversation).expect("llm legs").llm;
         let (tx, mut rx) = mpsc::channel(16);
         let spec = RunSpec {
             run: RunId(3),

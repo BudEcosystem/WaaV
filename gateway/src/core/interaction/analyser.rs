@@ -27,10 +27,6 @@ use super::types::{DuplexEvent, Ms};
 const MODEL_RATE: u32 = 16_000;
 const CHUNK: usize = 512;
 const CHUNK_MS: u32 = 32;
-/// Silero reads each chunk behind the last 64 samples of the one before. Without that context
-/// it scores speech near zero (measured: 0 of 173 chunks of a spoken phrase voiced, against
-/// 163 with it).
-const CONTEXT: usize = 64;
 /// Voiced chunks in a row that make an onset (64 ms).
 const ONSET_CHUNKS: u32 = 2;
 /// Voiced chunks between two reports of a stretch's level (128 ms).
@@ -284,8 +280,6 @@ async fn run(
     let mut resampler = StreamResampler::new();
     let mut pending: Vec<f32> = Vec::with_capacity(4 * CHUNK);
     let mut tracker = Tracker::new();
-    // The context, then the chunk.
-    let mut framed = vec![0.0f32; CONTEXT + CHUNK];
     let threshold = vad.config().threshold;
     let (turn, mut answers) = turn.spawn();
     // Stretches of speech so far: a probability asked for in one is stale in the next.
@@ -375,9 +369,8 @@ async fn run(
             // canceller thins a caller who speaks over the echo, and the echo it removed is
             // told from the caller below.
             let came = defence.aec().then(|| defence.came(end)).flatten();
-            framed.copy_within(CHUNK.., 0);
-            framed[CONTEXT..].copy_from_slice(came.as_deref().unwrap_or(chunk));
-            let voiced = match vad.probability_with_context(&framed) {
+            // The detector reads each chunk behind the previous one's tail (its context).
+            let voiced = match vad.probability(came.as_deref().unwrap_or(chunk)) {
                 Ok(probability) => probability > threshold,
                 Err(error) => {
                     warn!(%error, "interaction analyser: voice activity failed");

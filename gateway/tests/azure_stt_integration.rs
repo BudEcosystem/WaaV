@@ -538,8 +538,13 @@ fn test_azure_default_client() {
 
 /// Helper function to get Azure credentials from environment
 fn get_azure_credentials() -> Option<(String, String)> {
-    let key = std::env::var("AZURE_SPEECH_SUBSCRIPTION_KEY").ok()?;
-    let region = std::env::var("AZURE_SPEECH_REGION").unwrap_or_else(|_| "eastus".to_string());
+    let key = std::env::var("AZURE_SPEECH_SUBSCRIPTION_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
+    let region = std::env::var("AZURE_SPEECH_REGION")
+        .ok()
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "eastus".to_string());
     Some((key, region))
 }
 

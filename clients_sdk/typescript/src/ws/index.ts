@@ -19,6 +19,8 @@ export {
   type ReadyEvent,
   type SessionErrorEvent,
   type ConfigWarningEvent,
+  type SessionVadEvent,
+  type SttWarningEvent,
   type ConnectionStateEvent,
   type MetricsEvent,
   type ReconnectEvent,

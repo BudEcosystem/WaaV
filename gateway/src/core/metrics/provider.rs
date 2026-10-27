@@ -863,9 +863,12 @@ mod tests {
         }
 
         let snapshot = metrics.snapshot();
-        // Min should be ~5ms, max should be ~25ms
-        assert!(snapshot.ttfb_min_ms >= 5 && snapshot.ttfb_min_ms <= 15);
-        assert!(snapshot.ttfb_max_ms >= 20 && snapshot.ttfb_max_ms <= 40);
+        // `thread::sleep` guarantees AT LEAST its duration, never at most: on a loaded host a 25 ms
+        // sleep can wake well past 40 ms, which failed this test about one run in five. So the
+        // bounds the sleeps guarantee, and the ordering the concurrent updates must keep.
+        assert!(snapshot.ttfb_min_ms >= 5, "min {}", snapshot.ttfb_min_ms);
+        assert!(snapshot.ttfb_max_ms >= 25, "max {}", snapshot.ttfb_max_ms);
+        assert!(snapshot.ttfb_min_ms < snapshot.ttfb_max_ms);
     }
 
     // -------------------------------------------------------------------------

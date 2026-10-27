@@ -5,252 +5,16 @@
 //!
 //! API Reference: https://platform.openai.com/docs/api-reference/audio/createTranscription
 
-use serde::{Deserialize, Serialize};
-
 // =============================================================================
-// Response Types
+// Response types: the shared OpenAI-compatible set, under this client's names
 // =============================================================================
 
-/// Simple transcription response (json format).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TranscriptionResponse {
-    /// The transcribed text.
-    pub text: String,
-}
-
-/// Verbose transcription response (verbose_json format).
-///
-/// Contains detailed information including word-level timestamps,
-/// segment information, and metadata.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct VerboseTranscriptionResponse {
-    /// The transcribed text (full transcript).
-    pub text: String,
-
-    /// The language of the audio (ISO-639-1 code).
-    #[serde(default)]
-    pub language: Option<String>,
-
-    /// Duration of the audio in seconds.
-    #[serde(default)]
-    pub duration: Option<f64>,
-
-    /// Transcription segments with timing information.
-    #[serde(default)]
-    pub segments: Vec<TranscriptionSegment>,
-
-    /// Word-level timing information (if requested).
-    #[serde(default)]
-    pub words: Vec<TranscriptionWord>,
-}
-
-/// A segment of transcribed text with timing.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TranscriptionSegment {
-    /// Segment ID (0-indexed).
-    pub id: i32,
-
-    /// Start time of the segment in seconds.
-    pub start: f64,
-
-    /// End time of the segment in seconds.
-    pub end: f64,
-
-    /// Transcribed text for this segment.
-    pub text: String,
-
-    /// Token IDs for this segment.
-    #[serde(default)]
-    pub tokens: Vec<i32>,
-
-    /// Average log probability of tokens.
-    #[serde(default)]
-    pub avg_logprob: Option<f64>,
-
-    /// Compression ratio of the segment.
-    #[serde(default)]
-    pub compression_ratio: Option<f64>,
-
-    /// Probability that this segment is not speech.
-    #[serde(default)]
-    pub no_speech_prob: Option<f64>,
-
-    /// Temperature used for this segment.
-    #[serde(default)]
-    pub temperature: Option<f64>,
-
-    /// Seek position in the audio.
-    #[serde(default)]
-    pub seek: Option<i32>,
-}
-
-/// A word with timing information.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TranscriptionWord {
-    /// The word text.
-    pub word: String,
-
-    /// Start time of the word in seconds.
-    pub start: f64,
-
-    /// End time of the word in seconds.
-    pub end: f64,
-}
-
-// =============================================================================
-// Diarization Response Types (for diarized_json format)
-// =============================================================================
-
-/// Diarized transcription response (diarized_json format).
-///
-/// Contains transcription with speaker identification, enabling attribution
-/// of speech to individual speakers. Available with gpt-4o-transcribe models.
-///
-/// API Reference: https://platform.openai.com/docs/api-reference/audio/createTranscription
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DiarizedTranscriptionResponse {
-    /// The full transcribed text.
-    pub text: String,
-
-    /// The language of the audio (ISO-639-1 code).
-    #[serde(default)]
-    pub language: Option<String>,
-
-    /// Duration of the audio in seconds.
-    #[serde(default)]
-    pub duration: Option<f64>,
-
-    /// List of speakers identified in the audio.
-    /// Each speaker has an ID and optional recognized name.
-    #[serde(default)]
-    pub speakers: Vec<DiarizedSpeaker>,
-
-    /// Transcription segments with speaker attribution.
-    #[serde(default)]
-    pub segments: Vec<DiarizedSegment>,
-
-    /// Word-level information with speaker attribution (if include_logprobs is true).
-    #[serde(default)]
-    pub words: Vec<DiarizedWord>,
-}
-
-/// Speaker information from diarization.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DiarizedSpeaker {
-    /// Unique speaker identifier (e.g., "speaker_0", "speaker_1").
-    pub id: String,
-
-    /// Recognized speaker name (if known speaker references were provided).
-    #[serde(default)]
-    pub name: Option<String>,
-
-    /// Confidence score for speaker identification (0.0 to 1.0).
-    #[serde(default)]
-    pub confidence: Option<f64>,
-}
-
-/// A segment of transcribed text with speaker attribution.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DiarizedSegment {
-    /// Segment ID (0-indexed).
-    pub id: i32,
-
-    /// Start time of the segment in seconds.
-    pub start: f64,
-
-    /// End time of the segment in seconds.
-    pub end: f64,
-
-    /// Transcribed text for this segment.
-    pub text: String,
-
-    /// Speaker ID for this segment (e.g., "speaker_0").
-    #[serde(default)]
-    pub speaker: Option<String>,
-
-    /// Average log probability of tokens in this segment.
-    #[serde(default)]
-    pub avg_logprob: Option<f64>,
-
-    /// Probability that this segment contains no speech.
-    #[serde(default)]
-    pub no_speech_prob: Option<f64>,
-
-    /// Token IDs for this segment.
-    #[serde(default)]
-    pub tokens: Vec<i32>,
-
-    /// Temperature used for this segment.
-    #[serde(default)]
-    pub temperature: Option<f64>,
-
-    /// Compression ratio of the segment.
-    #[serde(default)]
-    pub compression_ratio: Option<f64>,
-
-    /// Seek position in the audio.
-    #[serde(default)]
-    pub seek: Option<i32>,
-}
-
-/// A word with timing and speaker information from diarization.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DiarizedWord {
-    /// The word text.
-    pub word: String,
-
-    /// Start time of the word in seconds.
-    pub start: f64,
-
-    /// End time of the word in seconds.
-    pub end: f64,
-
-    /// Speaker ID for this word (e.g., "speaker_0").
-    #[serde(default)]
-    pub speaker: Option<String>,
-
-    /// Log probability of the word (available when include_logprobs is true).
-    #[serde(default)]
-    pub logprob: Option<f64>,
-}
-
-// =============================================================================
-// Error Types
-// =============================================================================
-
-/// OpenAI API error response.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OpenAIErrorResponse {
-    /// Error details.
-    pub error: OpenAIError,
-}
-
-/// OpenAI API error details.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OpenAIError {
-    /// Human-readable error message.
-    pub message: String,
-
-    /// Error type identifier.
-    #[serde(rename = "type")]
-    pub error_type: String,
-
-    /// Parameter that caused the error (if applicable).
-    #[serde(default)]
-    pub param: Option<String>,
-
-    /// Error code (if applicable).
-    #[serde(default)]
-    pub code: Option<String>,
-}
-
-impl std::fmt::Display for OpenAIError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", self.message, self.error_type)
-    }
-}
-
-impl std::error::Error for OpenAIError {}
+pub use waav_segmented_stt::vendor::openai::{
+    DiarizedSegment, DiarizedSpeaker, DiarizedTranscriptionResponse, DiarizedWord,
+    ErrorBody as OpenAIError, ErrorResponse as OpenAIErrorResponse,
+    Segment as TranscriptionSegment, TranscriptionResponse, VerboseTranscriptionResponse,
+    Word as TranscriptionWord,
+};
 
 // =============================================================================
 // Parsed Response (unified type)
@@ -383,151 +147,6 @@ impl TranscriptionResult {
     }
 }
 
-// =============================================================================
-// WAV Header Construction
-// =============================================================================
-
-/// Utility functions for constructing WAV files from raw PCM data.
-///
-/// OpenAI Whisper API requires properly formatted audio files.
-/// This module helps package raw PCM audio into WAV format.
-pub mod wav {
-    /// WAV creation error.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum WavError {
-        /// Sample rate cannot be zero.
-        ZeroSampleRate,
-        /// Channels cannot be zero.
-        ZeroChannels,
-        /// Bits per sample cannot be zero.
-        ZeroBitsPerSample,
-        /// PCM data size exceeds maximum WAV file size.
-        DataTooLarge,
-        /// WAV header arithmetic overflowed.
-        HeaderOverflow,
-    }
-
-    impl std::fmt::Display for WavError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::ZeroSampleRate => write!(f, "Sample rate cannot be zero"),
-                Self::ZeroChannels => write!(f, "Number of channels cannot be zero"),
-                Self::ZeroBitsPerSample => write!(f, "Bits per sample cannot be zero"),
-                Self::DataTooLarge => write!(f, "PCM data exceeds maximum WAV file size"),
-                Self::HeaderOverflow => write!(f, "WAV header arithmetic overflowed"),
-            }
-        }
-    }
-
-    impl std::error::Error for WavError {}
-
-    /// Create a WAV file header for PCM audio.
-    ///
-    /// # Arguments
-    /// * `data_size` - Size of the audio data in bytes
-    /// * `sample_rate` - Sample rate in Hz (e.g., 16000)
-    /// * `channels` - Number of channels (1 for mono, 2 for stereo)
-    /// * `bits_per_sample` - Bits per sample (typically 16)
-    ///
-    /// # Returns
-    /// A 44-byte WAV header
-    pub fn create_header(
-        data_size: u32,
-        sample_rate: u32,
-        channels: u16,
-        bits_per_sample: u16,
-    ) -> [u8; 44] {
-        try_create_header(data_size, sample_rate, channels, bits_per_sample)
-            .expect("Invalid WAV header parameters")
-    }
-
-    /// Create a WAV file header for PCM audio with checked geometry.
-    pub fn try_create_header(
-        data_size: u32,
-        sample_rate: u32,
-        channels: u16,
-        bits_per_sample: u16,
-    ) -> Result<[u8; 44], WavError> {
-        if sample_rate == 0 {
-            return Err(WavError::ZeroSampleRate);
-        }
-        if channels == 0 {
-            return Err(WavError::ZeroChannels);
-        }
-        if bits_per_sample == 0 {
-            return Err(WavError::ZeroBitsPerSample);
-        }
-
-        let byte_rate = sample_rate
-            .checked_mul(u32::from(channels))
-            .and_then(|value| value.checked_mul(u32::from(bits_per_sample)))
-            .map(|value| value / 8)
-            .ok_or(WavError::HeaderOverflow)?;
-        let block_align = channels
-            .checked_mul(bits_per_sample)
-            .map(|value| value / 8)
-            .ok_or(WavError::HeaderOverflow)?;
-        let file_size = 36u32.checked_add(data_size).ok_or(WavError::DataTooLarge)?;
-
-        let mut header = [0u8; 44];
-
-        // RIFF chunk descriptor
-        header[0..4].copy_from_slice(b"RIFF");
-        header[4..8].copy_from_slice(&file_size.to_le_bytes());
-        header[8..12].copy_from_slice(b"WAVE");
-
-        // fmt sub-chunk
-        header[12..16].copy_from_slice(b"fmt ");
-        header[16..20].copy_from_slice(&16u32.to_le_bytes()); // Subchunk1 size (16 for PCM)
-        header[20..22].copy_from_slice(&1u16.to_le_bytes()); // Audio format (1 = PCM)
-        header[22..24].copy_from_slice(&channels.to_le_bytes());
-        header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
-        header[28..32].copy_from_slice(&byte_rate.to_le_bytes());
-        header[32..34].copy_from_slice(&block_align.to_le_bytes());
-        header[34..36].copy_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data sub-chunk
-        header[36..40].copy_from_slice(b"data");
-        header[40..44].copy_from_slice(&data_size.to_le_bytes());
-
-        Ok(header)
-    }
-
-    /// Create a complete WAV file from raw PCM data.
-    ///
-    /// # Arguments
-    /// * `pcm_data` - Raw PCM audio data (16-bit signed little-endian)
-    /// * `sample_rate` - Sample rate in Hz
-    /// * `channels` - Number of channels
-    ///
-    /// # Returns
-    /// Complete WAV file as bytes
-    pub fn create_wav(pcm_data: &[u8], sample_rate: u32, channels: u16) -> Vec<u8> {
-        try_create_wav(pcm_data, sample_rate, channels).expect("Invalid WAV parameters")
-    }
-
-    /// Create a complete WAV file from raw PCM data with checked geometry.
-    pub fn try_create_wav(
-        pcm_data: &[u8],
-        sample_rate: u32,
-        channels: u16,
-    ) -> Result<Vec<u8>, WavError> {
-        if pcm_data.len() > (u32::MAX as usize).saturating_sub(36) {
-            return Err(WavError::DataTooLarge);
-        }
-
-        let data_size = u32::try_from(pcm_data.len()).map_err(|_| WavError::DataTooLarge)?;
-        let header = try_create_header(data_size, sample_rate, channels, 16)?;
-        let capacity = 44usize
-            .checked_add(pcm_data.len())
-            .ok_or(WavError::DataTooLarge)?;
-        let mut wav = Vec::with_capacity(capacity);
-        wav.extend_from_slice(&header);
-        wav.extend_from_slice(pcm_data);
-        Ok(wav)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +211,7 @@ mod tests {
     fn test_transcription_result_text() {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Hello".to_string(),
+            ..Default::default()
         });
         assert_eq!(simple.text(), "Hello");
 
@@ -601,6 +221,7 @@ mod tests {
             duration: None,
             segments: vec![],
             words: vec![],
+            ..Default::default()
         });
         assert_eq!(verbose.text(), "World");
 
@@ -628,6 +249,7 @@ mod tests {
                 seek: None,
             }],
             words: vec![],
+            ..Default::default()
         });
 
         let confidence = verbose.confidence();
@@ -636,53 +258,9 @@ mod tests {
         // Test default confidence when no log probs
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
+            ..Default::default()
         });
         assert_eq!(simple.confidence(), 1.0);
-    }
-
-    #[test]
-    fn test_wav_header_creation() {
-        let header = wav::create_header(1000, 16000, 1, 16);
-        assert_eq!(&header[0..4], b"RIFF");
-        assert_eq!(&header[8..12], b"WAVE");
-        assert_eq!(&header[12..16], b"fmt ");
-        assert_eq!(&header[36..40], b"data");
-
-        // Check sample rate (bytes 24-28)
-        let sample_rate = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
-        assert_eq!(sample_rate, 16000);
-    }
-
-    #[test]
-    fn test_wav_creation() {
-        let pcm_data = vec![0u8; 100];
-        let wav = wav::create_wav(&pcm_data, 16000, 1);
-        assert_eq!(wav.len(), 44 + 100); // Header + data
-        assert_eq!(&wav[0..4], b"RIFF");
-    }
-
-    #[test]
-    fn try_wav_rejects_invalid_geometry_without_panicking() {
-        assert_eq!(
-            wav::try_create_wav(&[0, 0], 0, 1),
-            Err(wav::WavError::ZeroSampleRate)
-        );
-        assert_eq!(
-            wav::try_create_wav(&[0, 0], 16_000, 0),
-            Err(wav::WavError::ZeroChannels)
-        );
-        assert_eq!(
-            wav::try_create_header(10, 16_000, 1, 0),
-            Err(wav::WavError::ZeroBitsPerSample)
-        );
-        assert_eq!(
-            wav::try_create_header(u32::MAX, 16_000, 1, 16),
-            Err(wav::WavError::DataTooLarge)
-        );
-        assert_eq!(
-            wav::try_create_wav(&[0, 0], u32::MAX, u16::MAX),
-            Err(wav::WavError::HeaderOverflow)
-        );
     }
 
     #[test]
@@ -829,6 +407,7 @@ mod tests {
     fn test_transcription_result_has_diarization() {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
+            ..Default::default()
         });
         assert!(!simple.has_diarization());
 
@@ -838,6 +417,7 @@ mod tests {
             duration: None,
             segments: vec![],
             words: vec![],
+            ..Default::default()
         });
         assert!(!verbose.has_diarization());
 

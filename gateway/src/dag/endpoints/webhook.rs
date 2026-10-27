@@ -11,7 +11,8 @@ use crate::dag::error::{DAGError, DAGResult};
 use crate::dag::nodes::DAGData;
 
 fn ssrf_protected_http_client() -> DAGResult<reqwest::Client> {
-    crate::core::net::ssrf_protected_client(crate::core::net::HTTP_URL_SCHEMES).map_err(|e| {
+    // Connect-time guard too: the URL is client-supplied (DNS rebinding).
+    crate::core::net::guarded_client(crate::core::net::HTTP_URL_SCHEMES).map_err(|e| {
         DAGError::ConfigError(format!("failed to build DAG webhook adapter client: {e}"))
     })
 }

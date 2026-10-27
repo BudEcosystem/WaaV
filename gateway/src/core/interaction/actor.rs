@@ -493,8 +493,10 @@ impl Background {
 
     /// The LLM legs of a conversation config.
     pub(crate) fn llm(llm: &crate::core::conversation::ConversationConfig) -> Result<Self, String> {
-        crate::core::conversation::resolve_llm_legs(llm, None)
-            .map(|(fast, reasoning)| Self::Llm(fast, reasoning))
+        // Keyed as the conversation loop's legs are (`core::credentials`); a withheld key is
+        // logged there.
+        crate::core::conversation::resolve_llm_legs(llm)
+            .map(|legs| Self::Llm(legs.llm, legs.reasoning_llm))
             .map_err(|e| e.to_string())
     }
 }

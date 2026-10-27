@@ -953,6 +953,29 @@ websocket.onmessage = (event) => {
 };
 ```
 
+#### 9. Reply Messages (conversation and voice-agent sessions)
+
+A session that answers the caller sends four messages per reply, so a client can show captions,
+keep a written record or check what was said. That means a session with `conversation_config` or
+an alias with an `llm` leg (the conversation loop), or a voice agent. All four carry the reply's
+`turn_index`.
+
+| Message | When |
+|---|---|
+| `agent_response_started` | A reply begins. `input` is the caller's words that started it. It is absent for the idle check-in and async-tool follow-ups. |
+| `assistant_transcript` | Each piece of the reply as it is handed to speech: `delta`, already spaced, so concatenating the deltas gives the reply. It includes a latency filler ("one moment") when one is spoken. |
+| `agent_truncated` | The caller cut the reply off. `spoken` is what had been sent to speech; `audio_end_ms` is the reply's audio delivered by then. |
+| `agent_response_done` | The reply ended. `status` is `completed`, `cancelled` (barge-in), `failed` (every LLM tier failed, so the apology was spoken) or `incomplete` (a reasoning tier stalled after a partial answer); `transcript` is the whole reply. |
+
+```json
+{"type": "agent_response_started", "turn_index": 0, "kind": "agent", "input": "What is the capital of France?"}
+{"type": "assistant_transcript", "turn_index": 0, "delta": "Paris is the capital of France."}
+{"type": "agent_response_done", "turn_index": 0, "kind": "agent", "status": "completed", "transcript": "Paris is the capital of France."}
+```
+
+The transcript of a turn arrives before its `tts_playback_complete`. Clients that don't know these
+types can ignore them.
+
 ---
 
 ## Configuration

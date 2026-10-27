@@ -112,6 +112,10 @@ pub async fn realtime_handler(
 
     ws.max_frame_size(MAX_WS_FRAME_SIZE)
         .max_message_size(MAX_WS_MESSAGE_SIZE)
+        // A browser that sends its key as the `openai-insecure-api-key.<key>` subprotocol offers
+        // `realtime` beside it; selecting it in the 101 is what Node's `ws` and browsers expect
+        // (the key itself is never echoed). A client offering none sees no change.
+        .protocols([crate::handlers::openai_realtime::handshake::SUBPROTOCOL])
         .on_upgrade(move |socket| {
             // Held for the session: released when it ends (FRD-022 Phase 0.1 — realtime
             // sessions used to leak their slot).
@@ -1225,44 +1229,7 @@ pub(crate) fn provider_for(
     trace_parent: &str,
 ) -> Result<Box<dyn BaseRealtime>, (&'static str, String)> {
     // Get API key from config based on provider
-    let api_key = match provider_name.to_lowercase().as_str() {
-        "openai" => app_state.config.openai_api_key.clone(),
-        "hume" => app_state.config.hume_api_key.clone(),
-        // OpenAI-protocol clones (own credentials, GA wire reused by delegation).
-        "azure" | "azure-openai" | "azure_openai" => app_state.config.azure_openai_api_key.clone(),
-        "grok" | "xai" => app_state.config.grok_api_key.clone(),
-        "inworld" => app_state.config.inworld_api_key.clone(),
-        // Deepgram Voice Agent (S2S) reuses the EXISTING deepgram credential
-        // (shared with Deepgram STT/TTS — no new config field).
-        "deepgram" | "deepgram-agent" | "deepgram_voice_agent" => {
-            app_state.config.deepgram_api_key.clone()
-        }
-        // ElevenLabs Conversational AI (S2S) reuses the EXISTING elevenlabs
-        // credential (shared with ElevenLabs STT/TTS — no new config field).
-        "elevenlabs" | "elevenlabs-convai" | "11labs" => {
-            app_state.config.elevenlabs_api_key.clone()
-        }
-        // Google Gemini Live (BidiGenerateContent S2S) uses the dedicated Gemini
-        // API key (the `?key=` query param) — distinct from `google_credentials`
-        // (the service-account JSON for Google STT/TTS).
-        "gemini" | "gemini-live" | "google" => app_state.config.gemini_api_key.clone(),
-        // Ultravox (hosted S2S model API) uses the dedicated Ultravox API key
-        // (the `X-API-Key` create-call header).
-        "ultravox" | "fixie" => app_state.config.ultravox_api_key.clone(),
-        // AWS Nova Sonic (Amazon Bedrock S2S) authenticates with AWS credentials
-        // via the `aws-config` default chain (env / shared config / IAM role), NOT
-        // an api-key — so there is NO `nova_sonic_api_key` config field. Supply a
-        // present-but-empty key so the "missing_api_key" guard below is satisfied;
-        // `NovaSonicProtocol::from_config` ignores `cfg.api_key` entirely and the
-        // transport resolves SigV4 credentials at connect (exactly like the AWS
-        // Transcribe STT provider).
-        "nova_sonic" | "nova-sonic" | "aws" => Some(String::new()),
-        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone) uses the dedicated
-        // Yandex API key (a Yandex IAM token / static API key), passed as the
-        // `Authorization: Bearer <token>` value. The folder id is injected below.
-        "yandex" | "yandexgpt" | "yandex-cloud" => app_state.config.yandex_api_key.clone(),
-        _ => None,
-    };
+    let api_key = app_state.config.get_realtime_api_key(provider_name);
 
     let Some(api_key) = api_key else {
         let message = format!("API key not configured for provider: {}", provider_name);
@@ -1275,18 +1242,6 @@ pub(crate) fn provider_for(
     realtime_config.provider_fixes =
         crate::core::interaction::config::session_fixes(config.provider_fixes.as_ref()).0;
     realtime_config.provider_fixes_decided = true;
-    // Fix `openai_stt_default` on OpenAI's own realtime: the input transcription of a session
-    // that names no `transcription_model` is `whisper-1`'s successor (OpenAI retires
-    // `whisper-1` on 2027-02-26). Azure transcribes with a deployment of its own, and xAI with
-    // its own model, so neither is moved.
-    if config.transcription_model.is_none()
-        && realtime_config.fix("openai_stt_default")
-        && crate::core::interaction::regime::provider_id(provider_name) == "openai"
-        && let Some(transcription) = realtime_config.input_audio_transcription.as_mut()
-    {
-        transcription.model =
-            crate::core::stt::openai::OpenAISTTConfig::default_model_id(true).to_owned();
-    }
     // Interaction mode's half-cascade: the provider replies in text only (its protocol reads
     // this server-set marker; no client message sets it).
     if config.text_only {
@@ -1472,11 +1427,13 @@ pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) ->
 
     let input_audio_transcription = if config.transcribe_input.unwrap_or(true) {
         Some(InputTranscriptionConfig {
-            // Use configured model or default to whisper-1
+            // The configured model, or OpenAI's default for every path (addendum B6: `whisper-1`
+            // is retired on 2027-02-26).
             model: config
                 .transcription_model
                 .clone()
-                .unwrap_or_else(|| "whisper-1".to_string()),
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL.to_string()),
         })
     } else {
         None

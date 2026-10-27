@@ -82,6 +82,11 @@ pub struct SileroVAD {
     /// Shape: [1, chunk_size]
     input_buffer: Array2<f32>,
 
+    /// The last samples of the previous chunk. Silero v5 reads each chunk with this context in
+    /// front of it (64 samples at 16 kHz, 32 at 8 kHz), as the reference wrapper does; without it
+    /// the model scores real speech near zero.
+    context: Vec<f32>,
+
     /// Consecutive speech frames count
     speech_frames: u32,
 
@@ -136,6 +141,7 @@ impl SileroVAD {
         let state = Array3::zeros((2, 1, SILERO_V5_STATE_SIZE));
         let sample_rate_tensor = Array1::from_vec(vec![config.sample_rate as i64]);
         let input_buffer = Array2::zeros((1, config.chunk_size));
+        let context = vec![0.0; context_len(config.sample_rate)];
 
         info!(
             "Silero VAD initialized successfully. Model: {:?}",
@@ -148,6 +154,7 @@ impl SileroVAD {
             state,
             sample_rate_tensor,
             input_buffer,
+            context,
             speech_frames: 0,
             silence_frames: 0,
             in_speech: false,
@@ -180,16 +187,8 @@ impl SileroVAD {
 
     /// Gets the model path, downloading if necessary.
     async fn get_or_download_model() -> Result<std::path::PathBuf> {
-        // Check standard locations
-        let possible_paths = [
-            std::path::PathBuf::from("models/silero_vad.onnx"),
-            std::path::PathBuf::from("./silero_vad.onnx"),
-            dirs::cache_dir()
-                .unwrap_or_default()
-                .join("waav")
-                .join("models")
-                .join("silero_vad.onnx"),
-        ];
+        // Check standard locations (the image bakes the model under `$CACHE_PATH/models`).
+        let possible_paths = crate::core::model_dir::model_candidates("silero_vad.onnx");
 
         for path in &possible_paths {
             if path.exists() {
@@ -199,10 +198,7 @@ impl SileroVAD {
         }
 
         // Download the model
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("waav")
-            .join("models");
+        let cache_dir = crate::core::model_dir::model_cache_dir();
 
         tokio::fs::create_dir_all(&cache_dir)
             .await
@@ -338,6 +334,7 @@ impl SileroVAD {
         if elapsed >= self.config.state_reset_interval_secs {
             // Reset only the LSTM states, not the speech/silence tracking
             self.state.fill(0.0);
+            self.context.fill(0.0);
             self.last_state_reset = Instant::now();
 
             if self.config.debug_logging {
@@ -349,34 +346,33 @@ impl SileroVAD {
         }
     }
 
-    /// Speech probability of one chunk handed over WITH the model's context: the last 64
-    /// samples of the previous chunk followed by the chunk itself (576 samples at 16 kHz).
-    /// This is the input Silero v5 was trained on (its reference wrapper prepends the
-    /// context); on the bare chunk that [`Self::process`] feeds, the model scores speech near
-    /// zero. The caller keeps the context and applies the threshold. Used by interaction mode
-    /// only; `process` and its speech tracking are untouched.
-    pub fn probability_with_context(&mut self, context_and_chunk: &[f32]) -> Result<f32> {
+    /// Speech probability of one chunk, read behind the previous chunk's context exactly as
+    /// [`Self::process`] reads it, without `process`'s speech tracking: the caller applies the
+    /// threshold. Used by interaction mode, which tracks speech itself.
+    pub fn probability(&mut self, chunk: &[f32]) -> Result<f32> {
         self.maybe_reset_state();
-        self.infer(context_and_chunk.to_vec())
+        self.infer(chunk)
     }
 
     /// Runs ONNX inference and returns the speech probability.
     fn run_inference(&mut self) -> Result<f32> {
-        // Input audio: shape [1, chunk_size]
-        let input_data: Vec<f32> = self.input_buffer.iter().copied().collect();
-        self.infer(input_data)
+        let chunk: Vec<f32> = self.input_buffer.iter().copied().collect();
+        self.infer(&chunk)
     }
 
-    /// One inference over `input_data` (shape [1, len]), carrying the recurrent state.
-    fn infer(&mut self, input_data: Vec<f32>) -> Result<f32> {
+    /// One inference over `chunk`, carrying the recurrent state and the context.
+    fn infer(&mut self, chunk: &[f32]) -> Result<f32> {
         // Prepare input tensors using ort 2.0 API.
         // Silero VAD v5 expects: `input`, `state` (unified [2,1,128]), `sr`.
         // (The v4 model used `input`, `sr`, `h`, `c`; feeding those to v5 fails with
         //  `Invalid input name: h` — confirmed live.)
-        let input_tensor = ort::value::Tensor::from_array((
-            [1usize, input_data.len()],
-            input_data.into_boxed_slice(),
-        ))?;
+
+        // Input audio: shape [1, context + chunk_size], the previous chunk's tail in front.
+        let input_data = model_input(&self.context, chunk);
+        let width = input_data.len();
+        let input_tensor =
+            ort::value::Tensor::from_array(([1usize, width], input_data.into_boxed_slice()))?;
+        carry_context(&mut self.context, chunk);
 
         // Sample rate: scalar i64 (shape []). v5 expects a rank-0 / single-element sr.
         let sr_value = self.sample_rate_tensor[0];
@@ -487,6 +483,7 @@ impl SileroVAD {
     /// Call this when starting a new conversation or after a long pause.
     pub fn reset(&mut self) {
         self.state.fill(0.0);
+        self.context.fill(0.0);
         self.speech_frames = 0;
         self.silence_frames = 0;
         self.in_speech = false;
@@ -521,10 +518,91 @@ impl SileroVAD {
 // Tests
 // =============================================================================
 
+/// Samples of context Silero v5 reads in front of each chunk: 64 at 16 kHz, 32 at 8 kHz.
+fn context_len(sample_rate: u32) -> usize {
+    if sample_rate == 8000 { 32 } else { 64 }
+}
+
+/// The model's input for one chunk: the context, then the chunk.
+fn model_input(context: &[f32], chunk: &[f32]) -> Vec<f32> {
+    let mut v = Vec::with_capacity(context.len() + chunk.len());
+    v.extend_from_slice(context);
+    v.extend_from_slice(chunk);
+    v
+}
+
+/// Keep the chunk's last samples as the next chunk's context.
+fn carry_context(context: &mut [f32], chunk: &[f32]) {
+    let n = context.len().min(chunk.len());
+    let keep = context.len() - n;
+    context.copy_within(n.., 0);
+    context[keep..].copy_from_slice(&chunk[chunk.len() - n..]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+
+    /// Silero v5 scores a bare 512-sample chunk of real speech near zero (measured: at most 0.011
+    /// over three seconds of speech, against 1.0 with the context), so every chunk must carry the
+    /// previous chunk's last 64 samples in front of it.
+    #[test]
+    fn each_chunk_reaches_the_model_behind_the_previous_chunks_tail() {
+        assert_eq!(context_len(16_000), 64);
+        assert_eq!(context_len(8_000), 32);
+        let mut ctx = vec![0.0f32; 64];
+        let first: Vec<f32> = (0..512).map(|i| i as f32).collect();
+        let input = model_input(&ctx, &first);
+        assert_eq!(input.len(), 576);
+        assert!(
+            input[..64].iter().all(|v| *v == 0.0),
+            "a fresh stream starts on silence"
+        );
+        assert_eq!(&input[64..], &first[..]);
+        carry_context(&mut ctx, &first);
+        assert_eq!(ctx, (448..512).map(|i| i as f32).collect::<Vec<_>>());
+        let second: Vec<f32> = (512..1024).map(|i| i as f32).collect();
+        let input = model_input(&ctx, &second);
+        assert_eq!(
+            &input[..64],
+            &first[448..],
+            "the previous chunk's last 64 samples"
+        );
+    }
+
+    /// With real speech: `WAAV_SILERO_SPEECH_WAV=/path/speech-16k-mono.wav ORT_DYLIB_PATH=…
+    /// cargo test --features silero-vad silero_hears_real_speech -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs the Silero model, ONNX Runtime and a 16 kHz speech recording"]
+    async fn silero_hears_real_speech() {
+        let Ok(path) = std::env::var("WAAV_SILERO_SPEECH_WAV") else {
+            eprintln!("WAAV_SILERO_SPEECH_WAV unset; nothing to check");
+            return;
+        };
+        let bytes = std::fs::read(path).expect("read the recording");
+        let samples: Vec<f32> = bytes[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| i16::from_le_bytes(b) as f32 / 32768.0)
+            .collect();
+        let mut vad = SileroVAD::new(SileroVADConfig::default())
+            .await
+            .expect("load Silero");
+        let probs: Vec<f32> = samples
+            .as_chunks::<512>()
+            .0
+            .iter()
+            .map(|c| vad.process(c.as_slice()).expect("process").probability)
+            .collect();
+        let speech = probs.iter().filter(|p| **p > 0.5).count();
+        assert!(
+            speech * 3 >= probs.len(),
+            "speech frames {speech} of {}: {probs:?}",
+            probs.len()
+        );
+    }
 
     // Note: Most tests require the ONNX model file.
     // These are integration tests that should be run with the model available.

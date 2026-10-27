@@ -308,8 +308,8 @@ impl Rig {
                 (Background::Agent(agent), Some(bud))
             }
             (None, None) => {
-                let (fast, reasoning) = resolve_llm_legs(&conversation, None).expect("llm legs");
-                (Background::Llm(fast, reasoning), None)
+                let legs = resolve_llm_legs(&conversation).expect("llm legs");
+                (Background::Llm(legs.llm, legs.reasoning_llm), None)
             }
         };
         // A caller comes back with the session's resume key, else its stream_id.

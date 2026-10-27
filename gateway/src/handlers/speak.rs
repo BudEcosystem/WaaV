@@ -427,13 +427,16 @@ pub async fn speak_handler(
         Ok(provider) => provider,
         Err(e) => {
             error!("Failed to create TTS provider: {:?}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Failed to create TTS provider: {}", e)
-                })),
-            )
-                .into_response();
+            // The config is the caller's `tts_config`: a refusal of it is theirs to fix.
+            let failure = if matches!(e.inner(), TTSError::InvalidConfiguration(_)) {
+                SynthesisError::Rejected(VoiceFailure::new(
+                    VoiceErrorType::InvalidRequest,
+                    format!("Failed to create TTS provider: {e}"),
+                ))
+            } else {
+                SynthesisError::failed("Failed to create TTS provider", &e)
+            };
+            return failure.into_speak_response();
         }
     };
 
@@ -451,13 +454,8 @@ pub async fn speak_handler(
     // Connect to provider
     if let Err(e) = tts_provider.connect().await {
         error!("Failed to connect to TTS provider: {:?}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Failed to connect to TTS provider: {}", e)
-            })),
-        )
-            .into_response();
+        return SynthesisError::failed("Failed to connect to TTS provider", &e)
+            .into_speak_response();
     }
 
     // The audio goes out as it is synthesised (chunked), except where the format needs the
@@ -499,7 +497,7 @@ pub async fn speak_handler(
             .metrics
             .provider(&tts_config.provider, crate::core::metrics::channel::TTS)
             .record_outcome(false, collector.ttfb(), collector.start.elapsed());
-        return synthesis_failure("Failed to synthesize speech", e);
+        return SynthesisError::from(e).into_speak_response();
     }
 
     // Wait for completion with timeout
@@ -526,7 +524,7 @@ pub async fn speak_handler(
         Ok(result) => result,
         Err(e) => {
             error!("TTS synthesis error: {:?}", e);
-            return synthesis_failure("TTS synthesis error", e);
+            return SynthesisError::from(e).into_speak_response();
         }
     };
 
@@ -566,55 +564,6 @@ pub async fn speak_handler(
         audio_data,
     )
         .into_response()
-}
-
-/// The answer to a synthesis that failed, always with the vendor's message: a vendor's rate
-/// limit is a 429 (with its `Retry-After` when it gave one); a request the vendor refused (an
-/// unknown voice: 400) or a key it refused (401, 403) keeps that client-error status; a vendor
-/// 5xx is a 502; WaaV's own full pool a 503 with `Retry-After: 1`; anything else a 500.
-fn synthesis_failure(context: &str, e: TTSError) -> Response {
-    let body = Json(serde_json::json!({ "error": format!("{context}: {e}") }));
-    let status = |code: u16| StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
-    match SynthesisError::from(e) {
-        SynthesisError::Rejected(f) => (
-            status(
-                f.vendor_status
-                    .filter(|c| (400..500).contains(c))
-                    .unwrap_or(400),
-            ),
-            body,
-        )
-            .into_response(),
-        SynthesisError::Vendor { status: code, .. }
-            if (400..500).contains(&code) && code != 429 =>
-        {
-            (status(code), body).into_response()
-        }
-        SynthesisError::Vendor { status: code, .. } if code >= 500 => {
-            (StatusCode::BAD_GATEWAY, body).into_response()
-        }
-        SynthesisError::Vendor {
-            status: 429,
-            retry_after,
-            ..
-        } => {
-            let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
-            if let Some(wait) = retry_after {
-                resp.headers_mut().insert(
-                    header::RETRY_AFTER,
-                    header::HeaderValue::from(wait.as_secs().max(1)),
-                );
-            }
-            resp
-        }
-        SynthesisError::Saturated(_) => {
-            let mut resp = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
-            resp.headers_mut()
-                .insert(header::RETRY_AFTER, header::HeaderValue::from(1u64));
-            resp
-        }
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, body).into_response(),
-    }
 }
 
 /// The HTTP content type of an audio format a provider reports.
@@ -664,7 +613,7 @@ async fn streamed_speech(
         error!("Failed to synthesize speech: {:?}", e);
         record(&state, &provider, &collector, false);
         let _ = tts_provider.disconnect().await;
-        return synthesis_failure("Failed to synthesize speech", e);
+        return SynthesisError::from(e).into_speak_response();
     }
 
     // The first chunk, an error, or the end of a synthesis that made no audio.
@@ -682,7 +631,7 @@ async fn streamed_speech(
                 Ok(Some(Err(e))) => {
                     error!("TTS synthesis error: {:?}", e);
                     record(&state, &provider, &collector, false);
-                    synthesis_failure("TTS synthesis error", e)
+                    SynthesisError::from(e).into_speak_response()
                 }
                 _ => fail(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -805,6 +754,64 @@ pub enum SynthesisError {
 }
 
 impl SynthesisError {
+    /// The status a WaaV route answers this failure with, and its `Retry-After` in seconds.
+    ///
+    /// A vendor 429 stays a 429 and a saturated pool is a 503 (both retryable, both timed), a
+    /// timeout is a 504, and a request the vendor (or WaaV) refused as built is a 400. Every
+    /// other failure upstream of WaaV, the vendor's credential or billing, its 5xx, the network,
+    /// is a 502: the distinction tells an operator whether to look at the vendor or at WaaV. Only
+    /// WaaV's own failures are a 500.
+    pub fn http_status(&self) -> (StatusCode, Option<u64>) {
+        let retry = |d: &Option<Duration>| Some(d.map(|d| d.as_secs().max(1)).unwrap_or(1));
+        match self {
+            Self::Saturated(_) => (StatusCode::SERVICE_UNAVAILABLE, Some(1)),
+            Self::Vendor {
+                status: 429,
+                retry_after,
+                ..
+            } => (StatusCode::TOO_MANY_REQUESTS, retry(retry_after)),
+            // The vendor's status decides, as in `verdict`: 401/402/403 are the operator's
+            // credential or billing (not the caller's to fix), 429 is a rate, 5xx the vendor.
+            Self::Rejected(f) => match f
+                .vendor_status
+                .or_else(|| crate::core::deployment_policy::status_in(&f.message))
+            {
+                Some(401..=403) | Some(500..) => (StatusCode::BAD_GATEWAY, None),
+                Some(429) => (StatusCode::TOO_MANY_REQUESTS, Some(1)),
+                _ => (StatusCode::BAD_REQUEST, None),
+            },
+            other => match other.failure().class {
+                VoiceErrorType::VendorTimeout | VoiceErrorType::Deadline => {
+                    (StatusCode::GATEWAY_TIMEOUT, None)
+                }
+                VoiceErrorType::InvalidRequest
+                | VoiceErrorType::InputDecode
+                | VoiceErrorType::VendorRejected => (StatusCode::BAD_REQUEST, None),
+                VoiceErrorType::Internal | VoiceErrorType::Config => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, None)
+                }
+                _ => (StatusCode::BAD_GATEWAY, None),
+            },
+        }
+    }
+
+    /// `{"error": <message>}` with [`Self::http_status`] (and `Retry-After`), for `/speak`.
+    fn into_speak_response(self) -> Response {
+        let (status, retry_after) = self.http_status();
+        let mut resp = (
+            status,
+            Json(serde_json::json!({ "error": self.failure().message })),
+        )
+            .into_response();
+        if let Some(secs) = retry_after {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(secs),
+            );
+        }
+        resp
+    }
+
     /// The classified failure, whichever variant carries it.
     pub fn failure(&self) -> &VoiceFailure {
         match self {
@@ -1091,6 +1098,65 @@ mod tests {
     /// FRD-022 §6.3: the status that decides retry, failover and the breaker survives the
     /// conversion — a vendor 429 keeps its Retry-After, a bad key its 401, a 5xx its code.
     #[test]
+    fn a_failure_answers_with_the_status_of_its_cause() {
+        let status = |e: TTSError| SynthesisError::from(e).http_status();
+        assert_eq!(
+            status(TTSError::RateLimited {
+                retry_after_secs: Some(7),
+                message: "slow down".into()
+            }),
+            (StatusCode::TOO_MANY_REQUESTS, Some(7))
+        );
+        assert_eq!(
+            status(TTSError::Saturated("pool".into())).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(TTSError::RequestRejected("bad voice".into())).0,
+            StatusCode::BAD_REQUEST
+        );
+        // A rejection carrying the vendor's billing or credential status is upstream (502).
+        assert_eq!(
+            status(TTSError::RequestRejected(
+                "cartesia rejected the request (402 Payment Required): credits".into()
+            ))
+            .0,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status(TTSError::RequestRejected(
+                "elevenlabs rejected the request (422 Unprocessable Entity)".into()
+            ))
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        // The vendor's credential or billing, its outage, the network: upstream of WaaV.
+        for e in [
+            TTSError::ProviderError(
+                "cartesia rejected the request (402 Payment Required): credits".into(),
+            ),
+            TTSError::ProviderError("vendor returned 503 Service Unavailable".into()),
+            TTSError::AuthenticationFailed("invalid key".into()),
+            TTSError::NetworkError("connection reset".into()),
+        ] {
+            assert_eq!(status(e).0, StatusCode::BAD_GATEWAY);
+        }
+        // A provider error with no vendor status is WaaV's own (voice_error's taxonomy).
+        assert_eq!(
+            status(TTSError::ProviderError("zero sample_rate".into())).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status(TTSError::TimeoutError("slow".into())).0,
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
+            status(TTSError::InternalError("bug".into())).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
     fn vendor_statuses_survive_the_conversion() {
         match SynthesisError::from(TTSError::RateLimited {
             retry_after_secs: Some(20),
@@ -1320,8 +1386,8 @@ mod tests {
     }
 
     /// A vendor's 429 reaches the caller as a 429 with the vendor's own words and its
-    /// `Retry-After` when it gave one (none is made up); a full local pool is a 503; anything
-    /// else stays a 500.
+    /// `Retry-After` (1 s when it gave none); a full local pool is a 503; a refused request keeps
+    /// its 400; the vendor's credential and outage are upstream (502); anything else stays a 500.
     #[tokio::test]
     async fn a_vendor_rate_limit_is_answered_429_with_its_message() {
         let limited = |retry_after_secs| TTSError::VendorStatus {
@@ -1331,10 +1397,11 @@ mod tests {
                 message: "Too many concurrent requests. Current limit: 2".into(),
             }),
         };
-        let resp = synthesis_failure("TTS synthesis error", limited(None));
+        let speak_failure = |e: TTSError| SynthesisError::from(e).into_speak_response();
+        let resp = speak_failure(limited(None));
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(resp.headers().get(header::RETRY_AFTER).is_none());
-        let resp = synthesis_failure("TTS synthesis error", limited(Some(3)));
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
+        let resp = speak_failure(limited(Some(3)));
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(resp.headers()[header::RETRY_AFTER], "3");
         let body = axum::body::to_bytes(resp.into_body(), 4096)
@@ -1344,35 +1411,28 @@ mod tests {
             String::from_utf8_lossy(&body).contains("Current limit: 2"),
             "the vendor's message is kept: {body:?}"
         );
-        let resp = synthesis_failure("x", TTSError::Saturated("cartesia".into()));
+        let resp = speak_failure(TTSError::Saturated("cartesia".into()));
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
-        let resp = synthesis_failure("x", TTSError::ProviderError("down".into()));
+        let resp = speak_failure(TTSError::ProviderError("down".into()));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let refused = |status, error| TTSError::VendorStatus {
             status,
             error: Box::new(error),
         };
-        let resp = synthesis_failure(
-            "x",
-            refused(
-                400,
-                TTSError::RequestRejected("cartesia rejected the request (400): voice".into()),
-            ),
-        );
+        let resp = speak_failure(refused(
+            400,
+            TTSError::RequestRejected("cartesia rejected the request (400): voice".into()),
+        ));
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let resp = synthesis_failure(
-            "x",
-            refused(
-                401,
-                TTSError::AuthenticationFailed("cartesia API error (401 Unauthorized)".into()),
-            ),
-        );
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let resp = synthesis_failure(
-            "x",
-            TTSError::ProviderError("API error (503 Service Unavailable): overloaded".into()),
-        );
+        let resp = speak_failure(refused(
+            401,
+            TTSError::AuthenticationFailed("cartesia API error (401 Unauthorized)".into()),
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let resp = speak_failure(TTSError::ProviderError(
+            "API error (503 Service Unavailable): overloaded".into(),
+        ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

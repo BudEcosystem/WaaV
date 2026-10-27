@@ -220,18 +220,17 @@ const CLIENT_API_KEY: &str = "0e1f7c2a-4b1d-4c0e-9a55-5a1f000000b3";
 const TTS_VENDOR_MODEL: &str = "kokoro-v1";
 const STT_VENDOR_MODEL: &str = "whisper-large-v3";
 
-/// The ciphertext half of bud-auth's fixture key pair: a hosted endpoint needs a credential that
-/// opens. The private half (`test_cred_private.pem`) is `*.pem` and therefore git-ignored, so it is
-/// read at run time rather than compiled in — see [`test_decryptor`].
-const TEST_CREDENTIAL: &str = include_str!("../../bud-auth/tests/fixtures/test_cred_encrypted.hex");
+#[path = "support/credential_keys.rs"]
+mod credential_keys;
 
-/// bud-auth's fixture private key, when this checkout has it (its own credential tests need it too).
+/// A credential a hosted endpoint can open: encrypted to a key made at run time (bud-auth's `*.pem`
+/// fixtures are git-ignored), see `support/credential_keys.rs` and [`test_decryptor`].
+static TEST_CREDENTIAL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| credential_keys::credential_key().ciphertext.clone());
+
+/// The private half of [`TEST_CREDENTIAL`]'s key pair.
 fn test_pem() -> Option<String> {
-    std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../bud-auth/tests/fixtures/test_cred_private.pem"
-    ))
-    .ok()
+    Some(credential_keys::credential_key().pem.clone())
 }
 
 fn test_decryptor() -> bud_auth::CredentialDecryptor {
@@ -1689,6 +1688,70 @@ async fn tts_failures_without_a_vendor_answer_are_classified() {
     f.assert_none();
 }
 
+/// Release 5 data settings on the upload route. Azure OpenAI keeps audio by account setting, so a
+/// deployment asking for no retention is refused before anything is sent, on the passthrough that
+/// forwards the file whole (found on pde-ditto: that branch returned before the check). A
+/// self-hosted server is the operator's own, so it carries both settings and is served.
+#[tokio::test]
+async fn the_upload_route_refuses_a_data_setting_the_vendor_cannot_carry() {
+    let vendor = stt_vendor().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/openai/deployments/whisper-deploy/audio/transcriptions",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({"text": "from azure"})),
+        )
+        .mount(&vendor)
+        .await;
+    let azure = json!({
+        "vendor": "azure_openai",
+        "api_base": vendor.uri(),
+        "endpoints": ["audio_transcription"],
+        "model": "whisper-deploy",
+        "credential": TEST_CREDENTIAL.trim(),
+        "config": {"stt": {"data_retention": "none"}},
+    });
+    let app = gateway(vec![(STT_EP, azure)]).await;
+    let wav = wav_secs(1.0, 16_000);
+    let reply = upload(
+        &app,
+        "/v1/audio/transcriptions",
+        &[("model", "stt-a")],
+        ("a.wav", "audio/wav", &wav),
+    )
+    .await;
+    assert_eq!(reply.status, 500, "{}", reply.text());
+    assert!(
+        reply.text().contains("stt_data_setting_unavailable"),
+        "{}",
+        reply.text()
+    );
+    assert!(
+        vendor
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "no audio reached the vendor"
+    );
+
+    // A self-hosted server carries both: it is the operator's own address.
+    let mut hosted = stt_entry(&base(&vendor), None);
+    hosted["config"] = json!({"stt": {"data_retention": "none", "data_region": "eu"}});
+    let app = gateway(vec![(STT_EP, hosted)]).await;
+    let reply = upload(
+        &app,
+        "/v1/audio/transcriptions",
+        &[("model", "stt-a")],
+        ("a.wav", "audio/wav", &wav),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+}
+
 /// ⚑ TC-EMIT-03 (STT rows), TC-EMIT-04.
 #[tokio::test]
 async fn stt_failures_are_classified() {
@@ -2963,7 +3026,7 @@ async fn vendor_spans_carry_no_credential_header_or_inference_fact_key() {
         );
         return;
     }
-    // What `TEST_CREDENTIAL` decrypts to (bud-auth's `credentials::tests::PLAIN`).
+    // What `TEST_CREDENTIAL` decrypts to (`credential_keys::VENDOR_KEY`).
     const SECRET: &str = "dg_vendor_key_abc123";
     let cap = Capture::install();
     let tts = tts_vendor(vec![0u8; 4_800], "audio/pcm").await;
@@ -3597,16 +3660,18 @@ async fn an_open_breaker_is_circuit_open_not_a_vendor_failure() {
     let tts = tts_vendor(wav_secs(1.0, 24_000), "audio/wav").await;
     let stt = stt_vendor().await;
     let policies = waav_gateway::core::deployment_policy::DeploymentPolicies::local();
-    open_breaker(&policies, TTS_EP);
-    open_breaker(&policies, STT_EP);
     let app = gateway_with_policies(
         vec![
             (TTS_EP, tts_entry(&base(&tts), None, None)),
             (STT_EP, stt_entry(&base(&stt), None)),
         ],
-        policies,
+        policies.clone(),
     )
     .await;
+    // Opened once the gateway is up: a breaker stays open 30 s, and building the gateway (models and all)
+    // can take longer than that on a loaded machine.
+    open_breaker(&policies, TTS_EP);
+    open_breaker(&policies, STT_EP);
 
     let mut f = Findings::default();
     let reply = speech(
@@ -3665,11 +3730,12 @@ async fn behind_an_open_breaker_a_fallbacks_real_failure_is_recorded() {
     let primary_stt = stt_vendor().await;
     let fallback = failing_vendor(500).await;
     let policies = waav_gateway::core::deployment_policy::DeploymentPolicies::local();
-    open_breaker(&policies, TTS_EP);
-    open_breaker(&policies, STT_EP);
     let mut table = tts_fallback_table(&primary_tts, &fallback);
     table.extend(stt_fallback_table(&primary_stt, &fallback));
-    let app = gateway_with_policies(table, policies).await;
+    let app = gateway_with_policies(table, policies.clone()).await;
+    // Opened once the gateway is up (a breaker stays open 30 s; see above).
+    open_breaker(&policies, TTS_EP);
+    open_breaker(&policies, STT_EP);
 
     let mut f = Findings::default();
     let reply = speech(

@@ -28,6 +28,7 @@ pub mod realtime;
 pub mod recording;
 pub mod sip;
 pub mod speak;
+pub mod stt_capability;
 pub mod tasks;
 pub mod transcribe;
 pub mod voice_catalog;

@@ -1,0 +1,1193 @@
+{
+  "provider_id": "azure_openai",
+  "provider": {
+    "aliases": [
+      "azure-openai"
+    ],
+    "default_model": null,
+    "model_string": "deployment_name",
+    "registered_in_gateway": false,
+    "deployment_model_source": "table_only",
+    "egress": "public_only",
+    "deployment_base": "required",
+    "notes": "The vendor id for speech-to-text models deployed in Azure OpenAI. It is not Azure AI Speech, which is the separate provider id azure (microsoft-azure). The two spellings are AZURE_OPENAI_NAMES in gateway/src/core/tts/self_hosted.rs:112, matched by is_azure_openai (:131-134). The id is recognised but has no speech-to-text plugin (gateway/src/plugin/builtin/mod.rs registers it for text-to-speech at :1826 and as a realtime alias at :2007-2008 only); a live call that names such a deployment is refused today with the codes unsupported_deployment and stt_not_streaming (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826), which integration decisions addendum A1 keeps for an Azure OpenAI deployment the segmented engine does not cover, until the Bud-side check on them is answered. The upload route forwards the file whole (gateway/src/handlers/transcribe.rs:839-913). On Azure the model string on the wire is the name the customer gave the deployment, and it goes into the URL path (self_hosted.rs:171-200). budapp publishes the credential's deployment id in voice_table.model when there is one and the model name otherwise (transcribe.rs:827-829). Today's leg code sends config.stt.model when set, otherwise voice_table.model (bud_legs.rs:216-226). Because a deployment name says nothing about the base model, a row is found from the base model the deployment override declares (underlying_model), else from the name itself, which matches an exact or pattern row only when the customer named the deployment after the base model, else the provider default row, which is file upload. The name sent to Azure is always the deployment name. default_model is null because there is no deployment to fall back to; an empty model is a configuration error (self_hosted.rs:177-183)."
+  },
+  "rows": [
+    {
+      "id": "azure_openai:any",
+      "match": {
+        "provider": "azure_openai",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "profile": "azure-openai-file"
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/handlers/ws/bud_legs.rs:122-134 (code unsupported_deployment, /ws and DAG legs) and :815-826 (code stt_not_streaming, voice-agent legs)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "An Azure OpenAI transcription deployment answers one uploaded audio file per request and has no live streaming interface this gateway can use. This gateway does not yet serve it on a live call for this deployment. Use the deployment for file transcription, choose a streaming transcription deployment for the call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "The unit depends on the base model behind the deployment. Only uploaded segments are sent."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+          "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/whisper-quickstart",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/reference-preview-latest"
+        ],
+        "code_refs": [
+          "gateway/src/handlers/ws/bud_legs.rs:122-134",
+          "gateway/src/handlers/ws/bud_legs.rs:815-826",
+          "gateway/src/core/tts/self_hosted.rs:112",
+          "gateway/src/core/tts/self_hosted.rs:171-200",
+          "gateway/src/handlers/transcribe.rs:825-845"
+        ],
+        "unverified": [
+          "transports[0].latency (none published)",
+          "transports[0].limits.max_upload_bytes (Microsoft pages disagree: 'Audio files must be 25 MB or smaller' against 'Message size for audio files: 20 MB'; the lower is recorded)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) (3 is the documented default for the audio API; per-model quotas are not listed)",
+          "transports[0].limits.rates[].scope (the page does not say whether the quota is per deployment, per resource or per subscription)",
+          "transports[0].limits.rates (concurrent_requests)",
+          "billing.min_billed_ms",
+          "billing.unit"
+        ],
+        "notes": "Provider default: what a deployment name resolves to when nothing declares its base model. It fails slow. Every Azure OpenAI model served by the /audio interface is file-only, so file upload is right for all of them. It is wrong only for a deployment of a realtime-only base model (gpt-live-transcribe, gpt-realtime-whisper), where each upload would be rejected by Azure; such a deployment must declare its base model. In Bud a realtime transcription deployment is published with the capability realtime_session, and the gateway's leg resolver accepts only deployments with the capability audio_transcription as a speech-to-text leg (bud_legs.rs:31, :812), so the wrong case is not expected to be reachable through Bud today."
+      }
+    },
+    {
+      "id": "azure_openai:whisper",
+      "match": {
+        "provider": "azure_openai",
+        "model": "whisper"
+      },
+      "lifecycle": {
+        "status": "retiring",
+        "shutdown_on": "2026-12-15",
+        "replacement": [
+          "gpt-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter; its only Azure OpenAI transcription code is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826). Even once the adapter exists, Azure's default quota of 3 audio requests per minute cannot carry a conversation, so a quota increase is a precondition and its absence must be reported as a configuration warning at session start.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for the audio API on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 20971520,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "context_window_ms": 30000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 3,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Azure's default quota for the speech-to-text audio API. Microsoft raises it on request; a deployment with a higher quota declares it in the deployment override. Whether it counts per deployment, per resource or per subscription is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_tokens": 224,
+                "note": "OpenAI's documented limit for whisper-1, the same base model; the Azure pages do not restate it."
+              }
+            ],
+            "response_formats": [
+              "json",
+              "verbose_json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "api_key_header"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/transcribe.rs:839-913 (transcribe_azure_openai) and :947-1027; URL builder gateway/src/core/tts/self_hosted.rs:171-200; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+            "notes": "The multipart body is OpenAI's, but the address is {api_base}/openai/deployments/{deployment}/audio/transcriptions?api-version=... and the key travels in an api-key header, never in Authorization (self_hosted.rs:125; transcribe.rs:1023-1025). The address must be https and must pass the private-address filter, so an Azure Private Link endpoint is refused today (self_hosted.rs:215-228). The gateway sends api-version 2025-04-01-preview unless the deployment sets provider_params.api_version (self_hosted.rs:115; gateway/src/handlers/openai_audio.rs:1557-1561). The existing code has a 300 second deadline, returns the body unparsed and has no circuit breaker, so only its request half can be reused. Azure ignores stream=true for this model, so text never arrives in pieces. verbose_json is accepted and Microsoft says it returns per-segment probabilities, but the field names are not spelled out on the Azure pages, so no quality signal is claimed until a live response has been read."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "upload_policy": "per_turn",
+            "rationale": "Azure's default quota for the speech-to-text audio API is 3 requests per minute. One upload per caller turn is the most that quota can carry, so segments are held and uploaded once per turn, one at a time. Restore the gateway defaults (upload at each pause, two in flight) only for a deployment whose quota increase is confirmed."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/handlers/ws/bud_legs.rs:122-134 (code unsupported_deployment, /ws and DAG legs) and :815-826 (code stt_not_streaming, voice-agent legs)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Azure OpenAI serves this model by transcribing one uploaded audio file per request; it has no live streaming interface. This gateway does not yet serve it on a live call for this deployment. Use the deployment for file transcription, choose a streaming transcription deployment for the call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Azure's retail price list (region eastus2) has a per-hour Whisper meter. No minimum billed duration is documented. gateway/src/config/pricing.rs has no azure_openai entry, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/model-retirement-schedule",
+          "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/whisper-quickstart",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/reference-preview-latest",
+          "https://prices.azure.com/api/retail/prices"
+        ],
+        "code_refs": [
+          "gateway/src/handlers/ws/bud_legs.rs:122-134",
+          "gateway/src/handlers/ws/bud_legs.rs:815-826",
+          "gateway/src/core/tts/self_hosted.rs:112",
+          "gateway/src/core/tts/self_hosted.rs:171-200",
+          "gateway/src/handlers/transcribe.rs:825-845"
+        ],
+        "unverified": [
+          "transports[0].latency (none published)",
+          "transports[0].limits.max_upload_bytes (Microsoft pages disagree: 'Audio files must be 25 MB or smaller' against 'Message size for audio files: 20 MB'; the lower is recorded)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) (3 is the documented default for the audio API; per-model quotas are not listed)",
+          "transports[0].limits.rates[].scope (the page does not say whether the quota is per deployment, per resource or per subscription)",
+          "transports[0].limits.rates (concurrent_requests)",
+          "billing.min_billed_ms",
+          "transports[0].limits.context_window_ms (30 s is the Whisper window from the design brief and the audit; not on the Azure pages)",
+          "transports[0].quality_signals (Azure documents segment probabilities under verbose_json without naming the fields; OpenAI's whisper-1 returns no_speech_prob, avg_logprob and compression_ratio)",
+          "billing.unit (the retail price list has a per-hour meter named Speech-to-Text-Batch-Whisper; that it is the meter for the synchronous audio API was not confirmed)",
+          "lifecycle.replacement (the retirement schedule names no successor; gpt-transcribe is the model Microsoft's quickstart recommends for offline transcription)",
+          "transports[0].dialect.context_params[0].max_tokens (224 tokens is OpenAI's documented prompt limit for whisper-1; not restated on the Azure pages)"
+        ],
+        "notes": "On Azure the id sent on the wire is the customer's deployment name, so this row matches only when the deployment override declares this base model or when the deployment happens to be named after it; see the provider notes. Base model whisper, version 001. Microsoft lists it as generally available with retirement on 2026-12-15, which the map records as retiring; OpenAI deprecated the same model on its own service on 2026-08-26. File-only: 'Streaming is not supported for the whisper-1 model and will be ignored.' The language field is ISO 639-1 and Microsoft says it improves accuracy and latency."
+      }
+    },
+    {
+      "id": "azure_openai:whisper-any",
+      "match": {
+        "provider": "azure_openai",
+        "model_glob": "whisper-*"
+      },
+      "lifecycle": {
+        "status": "retiring",
+        "shutdown_on": "2026-12-15",
+        "replacement": [
+          "gpt-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter; its only Azure OpenAI transcription code is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826). Even once the adapter exists, Azure's default quota of 3 audio requests per minute cannot carry a conversation, so a quota increase is a precondition and its absence must be reported as a configuration warning at session start.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for the audio API on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 20971520,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "context_window_ms": 30000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 3,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Azure's default quota for the speech-to-text audio API. Microsoft raises it on request; a deployment with a higher quota declares it in the deployment override. Whether it counts per deployment, per resource or per subscription is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_tokens": 224,
+                "note": "OpenAI's documented limit for whisper-1, the same base model; the Azure pages do not restate it."
+              }
+            ],
+            "response_formats": [
+              "json",
+              "verbose_json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "api_key_header"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/transcribe.rs:839-913 (transcribe_azure_openai) and :947-1027; URL builder gateway/src/core/tts/self_hosted.rs:171-200; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+            "notes": "The multipart body is OpenAI's, but the address is {api_base}/openai/deployments/{deployment}/audio/transcriptions?api-version=... and the key travels in an api-key header, never in Authorization (self_hosted.rs:125; transcribe.rs:1023-1025). The address must be https and must pass the private-address filter, so an Azure Private Link endpoint is refused today (self_hosted.rs:215-228). The gateway sends api-version 2025-04-01-preview unless the deployment sets provider_params.api_version (self_hosted.rs:115; gateway/src/handlers/openai_audio.rs:1557-1561). The existing code has a 300 second deadline, returns the body unparsed and has no circuit breaker, so only its request half can be reused. Azure ignores stream=true for this model, so text never arrives in pieces. verbose_json is accepted and Microsoft says it returns per-segment probabilities, but the field names are not spelled out on the Azure pages, so no quality signal is claimed until a live response has been read."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "upload_policy": "per_turn",
+            "rationale": "Azure's default quota for the speech-to-text audio API is 3 requests per minute. One upload per caller turn is the most that quota can carry, so segments are held and uploaded once per turn, one at a time. Restore the gateway defaults (upload at each pause, two in flight) only for a deployment whose quota increase is confirmed."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/handlers/ws/bud_legs.rs:122-134 (code unsupported_deployment, /ws and DAG legs) and :815-826 (code stt_not_streaming, voice-agent legs)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Azure OpenAI serves this model by transcribing one uploaded audio file per request; it has no live streaming interface. This gateway does not yet serve it on a live call for this deployment. Use the deployment for file transcription, choose a streaming transcription deployment for the call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Azure's retail price list (region eastus2) has a per-hour Whisper meter. No minimum billed duration is documented. gateway/src/config/pricing.rs has no azure_openai entry, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/model-retirement-schedule",
+          "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/whisper-quickstart",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/reference-preview-latest",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio-websockets",
+          "https://prices.azure.com/api/retail/prices"
+        ],
+        "code_refs": [
+          "gateway/src/handlers/ws/bud_legs.rs:122-134",
+          "gateway/src/handlers/ws/bud_legs.rs:815-826",
+          "gateway/src/core/tts/self_hosted.rs:112",
+          "gateway/src/core/tts/self_hosted.rs:171-200",
+          "gateway/src/handlers/transcribe.rs:825-845"
+        ],
+        "unverified": [
+          "transports[0].latency (none published)",
+          "transports[0].limits.max_upload_bytes (Microsoft pages disagree: 'Audio files must be 25 MB or smaller' against 'Message size for audio files: 20 MB'; the lower is recorded)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) (3 is the documented default for the audio API; per-model quotas are not listed)",
+          "transports[0].limits.rates[].scope (the page does not say whether the quota is per deployment, per resource or per subscription)",
+          "transports[0].limits.rates (concurrent_requests)",
+          "billing.min_billed_ms",
+          "transports[0].limits.context_window_ms (30 s is the Whisper window from the design brief and the audit; not on the Azure pages)",
+          "transports[0].quality_signals (Azure documents segment probabilities under verbose_json without naming the fields; OpenAI's whisper-1 returns no_speech_prob, avg_logprob and compression_ratio)",
+          "billing.unit (the retail price list has a per-hour meter named Speech-to-Text-Batch-Whisper; that it is the meter for the synchronous audio API was not confirmed)",
+          "lifecycle.replacement (the retirement schedule names no successor; gpt-transcribe is the model Microsoft's quickstart recommends for offline transcription)",
+          "transports[0].dialect.context_params[0].max_tokens (224 tokens is OpenAI's documented prompt limit for whisper-1; not restated on the Azure pages)"
+        ],
+        "notes": "Covers deployment or model names such as whisper-1. That is the name the gateway's own comments and tests use for an Azure OpenAI Whisper deployment (gateway/src/core/tts/self_hosted.rs:108-109, :708-717) and the name Microsoft's own reference and realtime samples use for the model. Same facts as the exact row for whisper; confidence is assumed because a deployment name is the customer's choice and proves nothing about the base model behind it."
+      }
+    },
+    {
+      "id": "azure_openai:gpt-transcribe",
+      "match": {
+        "provider": "azure_openai",
+        "model": "gpt-transcribe"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter; its only Azure OpenAI transcription code is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826). Even once the adapter exists, Azure's default quota of 3 audio requests per minute cannot carry a conversation, so a quota increase is a precondition and its absence must be reported as a configuration warning at session start.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for the audio API on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 20971520,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 3,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Azure's default quota for the speech-to-text audio API. Microsoft raises it on request; a deployment with a higher quota declares it in the deployment override. Whether it counts per deployment, per resource or per subscription is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "api_key_header"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/transcribe.rs:839-913 (transcribe_azure_openai) and :947-1027; URL builder gateway/src/core/tts/self_hosted.rs:171-200; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+            "notes": "The multipart body is OpenAI's, but the address is {api_base}/openai/deployments/{deployment}/audio/transcriptions?api-version=... and the key travels in an api-key header, never in Authorization (self_hosted.rs:125; transcribe.rs:1023-1025). The address must be https and must pass the private-address filter, so an Azure Private Link endpoint is refused today (self_hosted.rs:215-228). The gateway sends api-version 2025-04-01-preview unless the deployment sets provider_params.api_version (self_hosted.rs:115; gateway/src/handlers/openai_audio.rs:1557-1561). The existing code has a 300 second deadline, returns the body unparsed and has no circuit breaker, so only its request half can be reused. On OpenAI's own service this model takes languages[] instead of language ('Don't send both') and also keywords[]; the Azure pages read do not say which fields the Azure deployment route accepts for it, so no language is sent until a live request settles it."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "upload_policy": "per_turn",
+            "rationale": "Azure's default quota for the speech-to-text audio API is 3 requests per minute. One upload per caller turn is the most that quota can carry, so segments are held and uploaded once per turn, one at a time. Restore the gateway defaults (upload at each pause, two in flight) only for a deployment whose quota increase is confirmed."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/handlers/ws/bud_legs.rs:122-134 (code unsupported_deployment, /ws and DAG legs) and :815-826 (code stt_not_streaming, voice-agent legs)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Azure OpenAI serves this model by transcribing one uploaded audio file per request; it has no live streaming interface. This gateway does not yet serve it on a live call for this deployment. Use the deployment for file transcription, choose a streaming transcription deployment for the call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "The Azure price for this model was not retrievable. Only uploaded segments are sent."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+          "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/whisper-quickstart",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/model-retirement-schedule",
+          "https://developers.openai.com/api/docs/guides/speech-to-text"
+        ],
+        "code_refs": [
+          "gateway/src/handlers/ws/bud_legs.rs:122-134",
+          "gateway/src/handlers/ws/bud_legs.rs:815-826",
+          "gateway/src/core/tts/self_hosted.rs:112",
+          "gateway/src/core/tts/self_hosted.rs:171-200",
+          "gateway/src/handlers/transcribe.rs:825-845"
+        ],
+        "unverified": [
+          "transports[0].latency (none published)",
+          "transports[0].limits.max_upload_bytes (Microsoft pages disagree: 'Audio files must be 25 MB or smaller' against 'Message size for audio files: 20 MB'; the lower is recorded)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) (3 is the documented default for the audio API; per-model quotas are not listed)",
+          "transports[0].limits.rates[].scope (the page does not say whether the quota is per deployment, per resource or per subscription)",
+          "transports[0].limits.rates (concurrent_requests)",
+          "billing.min_billed_ms",
+          "transports[0].dialect.language_param (OpenAI documents languages[] for this model; not confirmed on Azure, so none is recorded)",
+          "transports[0].dialect.context_params (prompt is a documented field of the Azure audio API; keywords[] is documented by OpenAI only)",
+          "transports[0].dialect.response_formats",
+          "transports[0].quality_signals (OpenAI returns detected languages for this model; not confirmed on Azure)",
+          "billing.unit"
+        ],
+        "notes": "On Azure the id sent on the wire is the customer's deployment name, so this row matches only when the deployment override declares this base model or when the deployment happens to be named after it; see the provider notes. The file model Microsoft recommends: 'gpt-transcribe is an offline transcription model and isn't a Realtime API model. For streaming transcription, use gpt-realtime-whisper or gpt-live-transcribe.' It is not in the retirement schedule."
+      }
+    },
+    {
+      "id": "azure_openai:gpt-4o-transcribe",
+      "match": {
+        "provider": "azure_openai",
+        "model": "gpt-4o-transcribe"
+      },
+      "lifecycle": {
+        "status": "retiring",
+        "shutdown_on": "2026-10-15",
+        "replacement": [
+          "gpt-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter; its only Azure OpenAI transcription code is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826). Even once the adapter exists, Azure's default quota of 3 audio requests per minute cannot carry a conversation, so a quota increase is a precondition and its absence must be reported as a configuration warning at session start.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for the audio API on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 20971520,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 3,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Azure's default quota for the speech-to-text audio API. Microsoft raises it on request; a deployment with a higher quota declares it in the deployment override. Whether it counts per deployment, per resource or per subscription is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "token_logprobs"
+          ],
+          "quality_signals_require": [
+            "include[]=logprobs",
+            "response_format=json"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "api_key_header"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/transcribe.rs:839-913 (transcribe_azure_openai) and :947-1027; URL builder gateway/src/core/tts/self_hosted.rs:171-200; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+            "notes": "The multipart body is OpenAI's, but the address is {api_base}/openai/deployments/{deployment}/audio/transcriptions?api-version=... and the key travels in an api-key header, never in Authorization (self_hosted.rs:125; transcribe.rs:1023-1025). The address must be https and must pass the private-address filter, so an Azure Private Link endpoint is refused today (self_hosted.rs:215-228). The gateway sends api-version 2025-04-01-preview unless the deployment sets provider_params.api_version (self_hosted.rs:115; gateway/src/handlers/openai_audio.rs:1557-1561). The existing code has a 300 second deadline, returns the body unparsed and has no circuit breaker, so only its request half can be reused. stream=true returns the text of the uploaded file in pieces for this model; that would make interim results arrive after the upload, never while the caller speaks, and is not used here."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "upload_policy": "per_turn",
+            "rationale": "Azure's default quota for the speech-to-text audio API is 3 requests per minute. One upload per caller turn is the most that quota can carry, so segments are held and uploaded once per turn, one at a time. Restore the gateway defaults (upload at each pause, two in flight) only for a deployment whose quota increase is confirmed."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/handlers/ws/bud_legs.rs:122-134 (code unsupported_deployment, /ws and DAG legs) and :815-826 (code stt_not_streaming, voice-agent legs)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Azure OpenAI serves this model by transcribing one uploaded audio file per request; it has no live streaming interface. This gateway does not yet serve it on a live call for this deployment. Use the deployment for file transcription, choose a streaming transcription deployment for the call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "OpenAI bills this model per token; the Azure price was not retrievable."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/model-retirement-schedule",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/reference-preview-latest",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/realtime-audio-reference",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio-websockets"
+        ],
+        "code_refs": [
+          "gateway/src/handlers/ws/bud_legs.rs:122-134",
+          "gateway/src/handlers/ws/bud_legs.rs:815-826",
+          "gateway/src/core/tts/self_hosted.rs:112",
+          "gateway/src/core/tts/self_hosted.rs:171-200",
+          "gateway/src/handlers/transcribe.rs:825-845"
+        ],
+        "recheck_on": "2026-10-15",
+        "unverified": [
+          "transports[0].latency (none published)",
+          "transports[0].limits.max_upload_bytes (Microsoft pages disagree: 'Audio files must be 25 MB or smaller' against 'Message size for audio files: 20 MB'; the lower is recorded)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) (3 is the documented default for the audio API; per-model quotas are not listed)",
+          "transports[0].limits.rates[].scope (the page does not say whether the quota is per deployment, per resource or per subscription)",
+          "transports[0].limits.rates (concurrent_requests)",
+          "billing.min_billed_ms",
+          "billing.unit",
+          "lifecycle.replacement (the retirement schedule names no successor version)",
+          "whether a standalone realtime transcription session accepts a deployment of this model"
+        ],
+        "notes": "On Azure the id sent on the wire is the customer's deployment name, so this row matches only when the deployment override declares this base model or when the deployment happens to be named after it; see the provider notes. Not a current model: its only listed version (2025-03-20) retires on 2026-10-15, twelve days after this row was written, with no successor version in the schedule. The row exists so that a session on such a deployment gets a named warning rather than the provider default. File upload is the only transport listed. Microsoft's realtime reference lets a deployment of this model transcribe input audio inside a speech-to-speech realtime session, with Azure cutting the audio, but whether Azure allows a standalone transcription session with it is not stated, and OpenAI's own pages contradict each other on the same point. Do not add a socket transport for this id without a live test."
+      }
+    },
+    {
+      "id": "azure_openai:gpt-4o-mini-transcribe",
+      "match": {
+        "provider": "azure_openai",
+        "model": "gpt-4o-mini-transcribe"
+      },
+      "lifecycle": {
+        "status": "retiring",
+        "shutdown_on": "2027-06-15",
+        "replacement": [
+          "gpt-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter; its only Azure OpenAI transcription code is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826). Even once the adapter exists, Azure's default quota of 3 audio requests per minute cannot carry a conversation, so a quota increase is a precondition and its absence must be reported as a configuration warning at session start.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for the audio API on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 20971520,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 3,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Azure's default quota for the speech-to-text audio API. Microsoft raises it on request; a deployment with a higher quota declares it in the deployment override. Whether it counts per deployment, per resource or per subscription is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "token_logprobs"
+          ],
+          "quality_signals_require": [
+            "include[]=logprobs",
+            "response_format=json"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "api_key_header"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/transcribe.rs:839-913 (transcribe_azure_openai) and :947-1027; URL builder gateway/src/core/tts/self_hosted.rs:171-200; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+            "notes": "The multipart body is OpenAI's, but the address is {api_base}/openai/deployments/{deployment}/audio/transcriptions?api-version=... and the key travels in an api-key header, never in Authorization (self_hosted.rs:125; transcribe.rs:1023-1025). The address must be https and must pass the private-address filter, so an Azure Private Link endpoint is refused today (self_hosted.rs:215-228). The gateway sends api-version 2025-04-01-preview unless the deployment sets provider_params.api_version (self_hosted.rs:115; gateway/src/handlers/openai_audio.rs:1557-1561). The existing code has a 300 second deadline, returns the body unparsed and has no circuit breaker, so only its request half can be reused."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "upload_policy": "per_turn",
+            "rationale": "Azure's default quota for the speech-to-text audio API is 3 requests per minute. One upload per caller turn is the most that quota can carry, so segments are held and uploaded once per turn, one at a time. Restore the gateway defaults (upload at each pause, two in flight) only for a deployment whose quota increase is confirmed."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/handlers/ws/bud_legs.rs:122-134 (code unsupported_deployment, /ws and DAG legs) and :815-826 (code stt_not_streaming, voice-agent legs)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Azure OpenAI serves this model by transcribing one uploaded audio file per request; it has no live streaming interface. This gateway does not yet serve it on a live call for this deployment. Use the deployment for file transcription, choose a streaming transcription deployment for the call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "OpenAI bills this model per token; the Azure price was not retrievable."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/model-retirement-schedule",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/reference-preview-latest",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/realtime-audio-reference",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio-websockets"
+        ],
+        "code_refs": [
+          "gateway/src/handlers/ws/bud_legs.rs:122-134",
+          "gateway/src/handlers/ws/bud_legs.rs:815-826",
+          "gateway/src/core/tts/self_hosted.rs:112",
+          "gateway/src/core/tts/self_hosted.rs:171-200",
+          "gateway/src/handlers/transcribe.rs:825-845"
+        ],
+        "recheck_on": "2026-10-15",
+        "unverified": [
+          "transports[0].latency (none published)",
+          "transports[0].limits.max_upload_bytes (Microsoft pages disagree: 'Audio files must be 25 MB or smaller' against 'Message size for audio files: 20 MB'; the lower is recorded)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) (3 is the documented default for the audio API; per-model quotas are not listed)",
+          "transports[0].limits.rates[].scope (the page does not say whether the quota is per deployment, per resource or per subscription)",
+          "transports[0].limits.rates (concurrent_requests)",
+          "billing.min_billed_ms",
+          "billing.unit",
+          "lifecycle.replacement (the retirement schedule names no successor)",
+          "whether a standalone realtime transcription session accepts a deployment of this model"
+        ],
+        "notes": "On Azure the id sent on the wire is the customer's deployment name, so this row matches only when the deployment override declares this base model or when the deployment happens to be named after it; see the provider notes. Two versions exist on Azure. Version 2025-03-20 retires on 2026-10-15; version 2025-12-15 retires on 2027-06-15, which is the date recorded. The version is a property of the deployment and is not visible in the id, so a deployment still on the older version stops working eight months before the recorded date. File upload is the only transport listed. Microsoft's realtime reference lets a deployment of this model transcribe input audio inside a speech-to-speech realtime session, with Azure cutting the audio, but whether Azure allows a standalone transcription session with it is not stated, and OpenAI's own pages contradict each other on the same point. Do not add a socket transport for this id without a live test."
+      }
+    },
+    {
+      "id": "azure_openai:gpt-4o-transcribe-diarize",
+      "match": {
+        "provider": "azure_openai",
+        "model": "gpt-4o-transcribe-diarize"
+      },
+      "lifecycle": {
+        "status": "retiring",
+        "shutdown_on": "2027-04-15",
+        "replacement": [
+          "gpt-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "azure_openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter; its only Azure OpenAI transcription code is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826). Even once the adapter exists, Azure's default quota of 3 audio requests per minute cannot carry a conversation, so a quota increase is a precondition and its absence must be reported as a configuration warning at session start.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Microsoft publishes no latency for the audio API on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 20971520,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 3,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Azure's default quota for the speech-to-text audio API. Microsoft raises it on request; a deployment with a higher quota declares it in the deployment override. Whether it counts per deployment, per resource or per subscription is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "api_key_header"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/transcribe.rs:839-913 (transcribe_azure_openai) and :947-1027; URL builder gateway/src/core/tts/self_hosted.rs:171-200; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+            "notes": "The multipart body is OpenAI's, but the address is {api_base}/openai/deployments/{deployment}/audio/transcriptions?api-version=... and the key travels in an api-key header, never in Authorization (self_hosted.rs:125; transcribe.rs:1023-1025). The address must be https and must pass the private-address filter, so an Azure Private Link endpoint is refused today (self_hosted.rs:215-228). The gateway sends api-version 2025-04-01-preview unless the deployment sets provider_params.api_version (self_hosted.rs:115; gateway/src/handlers/openai_audio.rs:1557-1561). The existing code has a 300 second deadline, returns the body unparsed and has no circuit breaker, so only its request half can be reused. Speaker labels add nothing on a single caller leg. OpenAI documents that this model takes no prompt and needs chunking_strategy for audio longer than 30 seconds; the gateway's 25 second segment cap stays under that."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "upload_policy": "per_turn",
+            "rationale": "Azure's default quota for the speech-to-text audio API is 3 requests per minute. One upload per caller turn is the most that quota can carry, so segments are held and uploaded once per turn, one at a time. Restore the gateway defaults (upload at each pause, two in flight) only for a deployment whose quota increase is confirmed."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/handlers/ws/bud_legs.rs:122-134 (code unsupported_deployment, /ws and DAG legs) and :815-826 (code stt_not_streaming, voice-agent legs)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Azure OpenAI serves this model by transcribing one uploaded audio file per request; it has no live streaming interface. This gateway does not yet serve it on a live call for this deployment. Use the deployment for file transcription, choose a streaming transcription deployment for the call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "OpenAI bills this model per token; the Azure price was not retrievable."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/model-retirement-schedule",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/reference-preview-latest",
+          "https://developers.openai.com/api/docs/guides/speech-to-text"
+        ],
+        "code_refs": [
+          "gateway/src/handlers/ws/bud_legs.rs:122-134",
+          "gateway/src/handlers/ws/bud_legs.rs:815-826",
+          "gateway/src/core/tts/self_hosted.rs:112",
+          "gateway/src/core/tts/self_hosted.rs:171-200",
+          "gateway/src/handlers/transcribe.rs:825-845"
+        ],
+        "unverified": [
+          "transports[0].latency (none published)",
+          "transports[0].limits.max_upload_bytes (Microsoft pages disagree: 'Audio files must be 25 MB or smaller' against 'Message size for audio files: 20 MB'; the lower is recorded)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) (3 is the documented default for the audio API; per-model quotas are not listed)",
+          "transports[0].limits.rates[].scope (the page does not say whether the quota is per deployment, per resource or per subscription)",
+          "transports[0].limits.rates (concurrent_requests)",
+          "billing.min_billed_ms",
+          "transports[0].quality_signals (Microsoft's reference lists this model among those that return log probabilities with include[]=logprobs; OpenAI's reference does not; none is claimed)",
+          "transports[0].dialect.context_params (no prompt, per OpenAI; not restated on the Azure pages)",
+          "billing.unit",
+          "lifecycle.replacement (the retirement schedule names no successor; gpt-transcribe does not label speakers)"
+        ],
+        "notes": "On Azure the id sent on the wire is the customer's deployment name, so this row matches only when the deployment override declares this base model or when the deployment happens to be named after it; see the provider notes. Version 2025-10-15 retires on 2027-04-15. File-only: OpenAI states speaker labelling 'isn't supported in Realtime transcription sessions'."
+      }
+    },
+    {
+      "id": "azure_openai:gpt-live-transcribe",
+      "match": {
+        "provider": "azure_openai",
+        "model": "gpt-live-transcribe"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "openai_realtime_transcription",
+          "enabled_from_release": 4,
+          "disabled_reason": "Before Release 4 the gateway has no speech-to-text client for the OpenAI Realtime transcription session; its only code for that socket is a pass-through relay. Release 4 adds the gateway-driven commit client for OpenAI and Azure OpenAI (addendum B11), enabled for Azure only after a live probe with a real deployment.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 3600000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 10,
+                "plan": null,
+                "scope": "account",
+                "note": "Default of the GPT-Live concurrent session table on Azure's quotas page, per subscription (recorded as account). Whether it applies to this model is not stated."
+              }
+            ]
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              24000
+            ],
+            "channels": 1
+          },
+          "commit": {
+            "audio_gating": "speech_only"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "language_format": "iso639_1",
+            "context_params": [],
+            "wire": "openai_realtime_ga"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "relay only: gateway/src/handlers/openai_realtime/upstream.rs:113-191 (builds {base}/realtime?intent=transcription for openai and /openai/v1/realtime?intent=transcription with an api-key header for azure_openai); session and event types to reuse: gateway/src/core/realtime/openai/protocol.rs",
+            "notes": "How the session must work: open the socket with intent=transcription; send session.update with session.type set to transcription, input format audio/pcm at 24 kHz (the gateway must resample from the caller's rate), the transcription model, and turn_detection null; append base64 audio continuously; when the gateway's own voice detector decides the utterance has ended, send input_audio_buffer.commit. Text arrives as conversation.item.input_audio_transcription.delta while the caller speaks and as ...completed after the commit. Completions for different turns may arrive out of order and must be matched by item_id. A commit on an empty buffer is an error. The live models reject the vendor's own voice detection, which is why the gateway owns endpointing here. The intent=transcription query is what the gateway relay, Pipecat and LiveKit dial and what Microsoft's sample uses; it is absent from OpenAI's own pages. The language and context fields are left out of this profile because they differ by model (languages and keywords on gpt-live-transcribe, language and no prompt on gpt-realtime-whisper) and a profile cannot see the model. On Azure the socket is wss://{resource}.openai.azure.com/openai/v1/realtime?intent=transcription with an api-key header and no api-version; the deployment name goes in session.audio.input.transcription.model. Microsoft's sample sets turn_detection to none and sends the commit itself at 24 kHz. A session lasts at most 60 minutes, so a longer call needs a reconnect."
+          },
+          "enable_requires": [
+            "live_probe"
+          ]
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/handlers/ws/bud_legs.rs:122-134 (code unsupported_deployment, /ws and DAG legs) and :815-826 (code stt_not_streaming, voice-agent legs); a deployment published with the capability realtime_session is not accepted as a speech-to-text leg at all, because the leg resolver requires audio_transcription (bud_legs.rs:31, :812)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Azure OpenAI serves this model only over its live transcription socket, and this gateway does not yet have a client for that socket. Choose an Azure OpenAI file model such as gpt-transcribe, or a streaming transcription model from another provider."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Microsoft says the model is billed by audio duration; the unit of the price was not retrieved. Whether silence streamed between commits is billed is not documented."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio-websockets",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+          "https://developers.openai.com/api/docs/guides/realtime-transcription",
+          "https://developers.openai.com/api/docs/guides/realtime-vad"
+        ],
+        "code_refs": [
+          "gateway/src/handlers/ws/bud_legs.rs:122-134",
+          "gateway/src/handlers/ws/bud_legs.rs:815-826",
+          "gateway/src/core/tts/self_hosted.rs:112",
+          "gateway/src/core/tts/self_hosted.rs:171-200",
+          "gateway/src/handlers/transcribe.rs:825-845",
+          "gateway/src/handlers/ws/bud_legs.rs:31"
+        ],
+        "unverified": [
+          "transports[0].interim_results (text while the caller speaks is documented by OpenAI for this model; the Azure page does not restate it)",
+          "transports[0].latency (no figure for Azure)",
+          "transports[0].limits.rates (concurrent_sessions) (the quotas page has a table of concurrent session limits, default 10 per subscription; whether it applies to this model is not stated)",
+          "transports[0].limits.rates[].scope (a subscription is recorded as account)",
+          "transports[0].limits.max_session_ms (60 minutes is quoted by the audit from Microsoft's realtime pages; the fact-check did not re-read it)",
+          "transports[0].dialect.language_param and transports[0].dialect.context_params (not stated for Azure)",
+          "whether Azure's own voice detection can be used in a transcription session (the documented pattern has the client commit)",
+          "billing.unit",
+          "billing.min_billed_ms",
+          "billing.bills_silence",
+          "transports[0].stream_audio.encodings (mu-law and A-law are documented for OpenAI's socket; the Azure pages read state PCM16 mono at 24 kHz only)"
+        ],
+        "notes": "On Azure the id sent on the wire is the customer's deployment name, so this row matches only when the deployment override declares this base model or when the deployment happens to be named after it; see the provider notes. No file interface exists for this model, so the only way to reach it on a live call is a socket on which the gateway's own voice detector sends the commit, and that client does not exist yet. In Bud a realtime transcription deployment is published with the capability realtime_session, which the gateway's leg resolver does not accept as a speech-to-text leg (it requires audio_transcription; bud_legs.rs:31, :812), so wiring it also needs a change there. Version 2026-07-29; Microsoft calls it the 'current recommended model for realtime transcription scenarios'. On OpenAI's service the model takes languages (plural), keywords and a prompt, and returns no word timestamps, speaker labels or confidence. Enabled from Release 4 on 2026-10-04 (addendum B11), gated on a live probe."
+      }
+    },
+    {
+      "id": "azure_openai:gpt-realtime-whisper",
+      "match": {
+        "provider": "azure_openai",
+        "model": "gpt-realtime-whisper"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "openai_realtime_transcription",
+          "enabled_from_release": 4,
+          "disabled_reason": "Before Release 4 the gateway has no speech-to-text client for the OpenAI Realtime transcription session; its only code for that socket is a pass-through relay. Release 4 adds the gateway-driven commit client for OpenAI and Azure OpenAI (addendum B11), enabled for Azure only after a live probe with a real deployment.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 3600000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 10,
+                "plan": null,
+                "scope": "account",
+                "note": "Default of the GPT-Live concurrent session table on Azure's quotas page, per subscription (recorded as account). Whether it applies to this model is not stated."
+              }
+            ]
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              24000
+            ],
+            "channels": 1
+          },
+          "commit": {
+            "audio_gating": "speech_only"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "language_format": "iso639_1",
+            "context_params": [],
+            "wire": "openai_realtime_ga"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "relay only: gateway/src/handlers/openai_realtime/upstream.rs:113-191 (builds {base}/realtime?intent=transcription for openai and /openai/v1/realtime?intent=transcription with an api-key header for azure_openai); session and event types to reuse: gateway/src/core/realtime/openai/protocol.rs",
+            "notes": "How the session must work: open the socket with intent=transcription; send session.update with session.type set to transcription, input format audio/pcm at 24 kHz (the gateway must resample from the caller's rate), the transcription model, and turn_detection null; append base64 audio continuously; when the gateway's own voice detector decides the utterance has ended, send input_audio_buffer.commit. Text arrives as conversation.item.input_audio_transcription.delta while the caller speaks and as ...completed after the commit. Completions for different turns may arrive out of order and must be matched by item_id. A commit on an empty buffer is an error. The live models reject the vendor's own voice detection, which is why the gateway owns endpointing here. The intent=transcription query is what the gateway relay, Pipecat and LiveKit dial and what Microsoft's sample uses; it is absent from OpenAI's own pages. The language and context fields are left out of this profile because they differ by model (languages and keywords on gpt-live-transcribe, language and no prompt on gpt-realtime-whisper) and a profile cannot see the model. On Azure the socket is wss://{resource}.openai.azure.com/openai/v1/realtime?intent=transcription with an api-key header and no api-version; the deployment name goes in session.audio.input.transcription.model. Microsoft's sample sets turn_detection to none and sends the commit itself at 24 kHz. A session lasts at most 60 minutes, so a longer call needs a reconnect."
+          },
+          "enable_requires": [
+            "live_probe"
+          ]
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/handlers/ws/bud_legs.rs:122-134 (code unsupported_deployment, /ws and DAG legs) and :815-826 (code stt_not_streaming, voice-agent legs); a deployment published with the capability realtime_session is not accepted as a speech-to-text leg at all, because the leg resolver requires audio_transcription (bud_legs.rs:31, :812)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Azure OpenAI serves this model only over its live transcription socket, and this gateway does not yet have a client for that socket. Choose an Azure OpenAI file model such as gpt-transcribe, or a streaming transcription model from another provider."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Microsoft says the model is billed by audio duration; the unit of the price was not retrieved. Whether silence streamed between commits is billed is not documented."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio-websockets",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/realtime-audio",
+          "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+          "https://developers.openai.com/api/docs/guides/realtime-vad",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets"
+        ],
+        "code_refs": [
+          "gateway/src/handlers/ws/bud_legs.rs:122-134",
+          "gateway/src/handlers/ws/bud_legs.rs:815-826",
+          "gateway/src/core/tts/self_hosted.rs:112",
+          "gateway/src/core/tts/self_hosted.rs:171-200",
+          "gateway/src/handlers/transcribe.rs:825-845",
+          "gateway/src/handlers/ws/bud_legs.rs:31"
+        ],
+        "unverified": [
+          "transports[0].interim_results (text while the caller speaks is documented by OpenAI for this model; the Azure page does not restate it)",
+          "transports[0].latency (no figure for Azure)",
+          "transports[0].limits.rates (concurrent_sessions) (the quotas page has a table of concurrent session limits, default 10 per subscription; whether it applies to this model is not stated)",
+          "transports[0].limits.rates[].scope (a subscription is recorded as account)",
+          "transports[0].limits.max_session_ms (60 minutes is quoted by the audit from Microsoft's realtime pages; the fact-check did not re-read it)",
+          "transports[0].dialect.language_param and transports[0].dialect.context_params (not stated for Azure)",
+          "whether Azure's own voice detection can be used in a transcription session (the documented pattern has the client commit)",
+          "billing.unit",
+          "billing.min_billed_ms",
+          "billing.bills_silence",
+          "transports[0].stream_audio.encodings (mu-law and A-law are documented for OpenAI's socket; the Azure pages read state PCM16 mono at 24 kHz only)"
+        ],
+        "notes": "On Azure the id sent on the wire is the customer's deployment name, so this row matches only when the deployment override declares this base model or when the deployment happens to be named after it; see the provider notes. No file interface exists for this model, so the only way to reach it on a live call is a socket on which the gateway's own voice detector sends the commit, and that client does not exist yet. In Bud a realtime transcription deployment is published with the capability realtime_session, which the gateway's leg resolver does not accept as a speech-to-text leg (it requires audio_transcription; bud_legs.rs:31, :812), so wiring it also needs a change there. Version 2026-05-06, described as an 'audio model for real-time low-latency transcription'. On OpenAI's service the model rejects a prompt and takes a singular language; OpenAI's pages disagree on whether the delay setting applies only to it. A third-party benchmark of OpenAI's own endpoint measured a median of 740 ms and a 99th percentile of 1080 ms from end of speech to final text; that figure is not recorded as this row's latency because it was not measured on Azure. Enabled from Release 4 on 2026-10-04 (addendum B11), gated on a live probe."
+      }
+    }
+  ]
+}

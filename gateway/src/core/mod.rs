@@ -8,6 +8,7 @@ pub mod alias;
 pub mod audio;
 pub mod cache;
 pub mod capabilities;
+pub mod client_destination;
 pub mod conversation;
 pub mod credentials;
 /// FRD-022: a Bud deployment's rate limits, concurrency cap, retry, fallback and breakers.
@@ -23,6 +24,8 @@ pub mod interaction;
 pub mod lang;
 pub mod llm;
 pub mod metrics;
+#[cfg(any(feature = "smart-turn", feature = "silero-vad"))]
+pub mod model_dir;
 pub(crate) mod model_integrity;
 // Canonical SSRF/URL validation shared by the DAG endpoint nodes, the
 // streaming-TTS endpoint override, and the conversation LLM URL check.

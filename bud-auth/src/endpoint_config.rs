@@ -174,6 +174,114 @@ pub struct SttSettings {
     /// The streaming-only features, applied on `/ws` and ignored by the prerecorded upload.
     #[serde(default)]
     pub streaming: Option<SttStreaming>,
+
+    /// Segmented speech-to-text on live calls: how a file-only model is served (the gateway cuts
+    /// the caller's audio at pauses and uploads each utterance). A malformed block is dropped.
+    #[serde(default, deserialize_with = "lenient")]
+    pub segmented: Option<SttSegmented>,
+
+    /// Corrections to the capability map for this deployment: a transport profile, the model a
+    /// self-hosted server really runs, latency and limit figures. A malformed block is dropped.
+    #[serde(default, deserialize_with = "lenient")]
+    pub capability_override: Option<SttCapabilityOverride>,
+
+    /// The languages callers of this deployment speak, sent to models that take a candidate list
+    /// when the session names none (detection on short segments is unreliable).
+    #[serde(default)]
+    pub expected_languages: Option<Vec<String>>,
+
+    /// `eu`: the vendor processes the audio in the EU, or the deployment is refused on a vendor
+    /// that cannot be asked to. Absent or `vendor_default`: the vendor's default location.
+    #[serde(default)]
+    pub data_region: Option<String>,
+    /// `none`: the vendor keeps nothing (ElevenLabs zero-retention logging, Deepgram's
+    /// improvement-programme opt-out), or the deployment is refused on a vendor without that
+    /// switch. Absent or `vendor_default`: the vendor's default.
+    #[serde(default)]
+    pub data_retention: Option<String>,
+}
+
+/// Parse a block, or drop it with a warning: one bad value must not take the deployment down.
+fn lenient<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(raw.and_then(|v| match serde_json::from_value::<T>(v) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::warn!(error = %e, "malformed speech-to-text settings block dropped");
+            None
+        }
+    }))
+}
+
+/// `stt.segmented`. Every field optional: the gateway's defaults and the capability map apply.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Deserialize)]
+pub struct SttSegmented {
+    /// The deployment's own switch (`false` keeps today's client or today's refusal).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// `auto`, `streaming` or `segmented`: the preference for this deployment, below a request's.
+    #[serde(default)]
+    pub transcription_mode: Option<String>,
+    /// `standard` or `low_latency` (prefers a vendor socket the gateway commits on, and hedges).
+    #[serde(default)]
+    pub latency_tier: Option<String>,
+    #[serde(default)]
+    pub pre_roll_ms: Option<u32>,
+    #[serde(default)]
+    pub trailing_silence_ms: Option<u32>,
+    #[serde(default)]
+    pub max_segment_ms: Option<u32>,
+    #[serde(default)]
+    pub max_in_flight: Option<u32>,
+    #[serde(default)]
+    pub request_timeout_ms: Option<u32>,
+    /// 3,000 to 10,000 ms; raised to the silence ceiling plus 2,500 ms when below it.
+    #[serde(default)]
+    pub deadline_ms: Option<u32>,
+    /// `per_pause` or `per_turn`.
+    #[serde(default)]
+    pub upload_policy: Option<String>,
+}
+
+/// `stt.capability_override`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Deserialize)]
+pub struct SttCapabilityOverride {
+    /// A named transport profile of the capability map (`vllm-file`, `speaches-file`, …).
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The model a self-hosted server runs, when the deployment's model is only a name.
+    #[serde(default)]
+    pub underlying_model: Option<String>,
+    #[serde(default)]
+    pub realtime_url: Option<String>,
+    #[serde(default)]
+    pub latency: Option<OverrideLatency>,
+    #[serde(default)]
+    pub limits: Option<OverrideLimits>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Deserialize)]
+pub struct OverrideLatency {
+    #[serde(default)]
+    pub ttfs_p50_ms: Option<u32>,
+    #[serde(default)]
+    pub ttfs_p99_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Deserialize)]
+pub struct OverrideLimits {
+    #[serde(default)]
+    pub max_audio_ms: Option<u32>,
+    #[serde(default)]
+    pub max_upload_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<u32>,
+    #[serde(default)]
+    pub requests_per_minute: Option<u32>,
 }
 
 /// `stt.streaming`: the five canonical features that need a continuous audio stream
@@ -407,6 +515,9 @@ const KNOWN_STT: &[&str] = &[
     "sentiment",
     "noise_suppression",
     "streaming",
+    "segmented",
+    "capability_override",
+    "expected_languages",
 ];
 
 const KNOWN_TRANSLATION: &[&str] = &["target_languages", "translate_to_english", "partials"];
@@ -530,6 +641,55 @@ fn warn_unmodelled<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_segmented_blocks_parse_and_a_malformed_one_is_dropped_alone() {
+        let s = parse_endpoint_settings(
+            "ep",
+            &serde_json::json!({"stt": {
+                "model": "scribe_v2",
+                "segmented": {"deadline_ms": 8000, "upload_policy": "per_turn", "transcription_mode": "segmented", "latency_tier": "standard"},
+                "capability_override": {"profile": "vllm-file", "underlying_model": "openai/whisper-large-v3",
+                                        "limits": {"requests_per_minute": 30}},
+                "expected_languages": ["en", "hi"]
+            }}),
+        );
+        let stt = s.stt();
+        let seg = stt.segmented.as_ref().unwrap();
+        assert_eq!(seg.deadline_ms, Some(8000));
+        assert_eq!(seg.upload_policy.as_deref(), Some("per_turn"));
+        assert_eq!(seg.transcription_mode.as_deref(), Some("segmented"));
+        let ov = stt.capability_override.as_ref().unwrap();
+        assert_eq!(ov.profile.as_deref(), Some("vllm-file"));
+        assert_eq!(ov.limits.as_ref().unwrap().requests_per_minute, Some(30));
+        assert_eq!(
+            stt.expected_languages.as_deref(),
+            Some(&["en".to_string(), "hi".to_string()][..])
+        );
+
+        let bad = parse_endpoint_settings(
+            "ep",
+            &serde_json::json!({"stt": {"model": "scribe_v2", "segmented": {"deadline_ms": "soon"}}}),
+        );
+        assert_eq!(
+            bad.stt().model.as_deref(),
+            Some("scribe_v2"),
+            "the rest of the block survives"
+        );
+        assert!(bad.stt().segmented.is_none());
+    }
+
+    #[test]
+    fn the_data_settings_parse() {
+        let s = parse_endpoint_settings(
+            "ep",
+            &serde_json::json!({"stt": {"data_region": "eu", "data_retention": "none"}}),
+        );
+        assert_eq!(s.stt().data_region.as_deref(), Some("eu"));
+        assert_eq!(s.stt().data_retention.as_deref(), Some("none"));
+        let absent = parse_endpoint_settings("ep", &serde_json::json!({"stt": {}}));
+        assert!(absent.stt().data_region.is_none() && absent.stt().data_retention.is_none());
+    }
+
     use super::*;
 
     fn parse(json: &str) -> VoiceEndpointSettings {

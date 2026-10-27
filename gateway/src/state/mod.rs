@@ -86,6 +86,9 @@ pub struct AppState {
     pub livekit_sip_handler: Option<Arc<LiveKitSipHandler>>,
     /// Authentication client for validating bearer tokens (if auth is enabled)
     pub auth_client: Option<Arc<AuthClient>>,
+    /// Which standalone authenticators run, in which order (`AUTH_MODE`), and whether a
+    /// responder `200` must name the caller (`AUTH_RESPONDER_REQUIRE_IDENTITY`).
+    pub auth_policy: crate::auth::AuthPolicy,
     /// Active WebSocket connection count (for global limit enforcement)
     pub active_ws_connections: Arc<AtomicUsize>,
     /// Connection count per IP address (for per-IP limit enforcement)
@@ -164,7 +167,10 @@ impl AppState {
         capability: &str,
         bearer: Option<&str>,
     ) -> Option<ResolvedVoiceEndpoint> {
-        let plane = self.bud_mode.as_ref()?.plane();
+        let Some(bud) = self.bud_mode.as_ref() else {
+            return self.resolve_alias_voice_endpoint(name, capability);
+        };
+        let plane = bud.plane();
         let token = bearer?;
 
         // A caller names an ALIAS ("tts-deepgram"); the voice table is keyed by ENDPOINT ID
@@ -202,6 +208,98 @@ impl AppState {
 }
 
 impl AppState {
+    /// Standalone `/v1/audio/*`: a server alias the operator marked `openai_compatible`, as the
+    /// endpoint record the OpenAI-compatible pipeline runs on (its STT leg for transcription and
+    /// translation, its TTS leg for speech). Without Bud mode every `model` used to be "not
+    /// found", so an OpenAI SDK client could not use a standalone gateway at all.
+    ///
+    /// A leg with its own OpenAI-compatible server (`base_url`) runs as the `self_hosted` vendor at
+    /// that server's `/v1`, keyed by [`crate::core::alias::alias_leg_key`] (the same rule `/ws`
+    /// applies); a leg without one runs on its provider with the gateway's key for it.
+    fn resolve_alias_voice_endpoint(
+        &self,
+        name: &str,
+        capability: &str,
+    ) -> Option<ResolvedVoiceEndpoint> {
+        use crate::core::alias::{AliasLegEndpoint, alias_leg_key, global_aliases};
+        let def = global_aliases()
+            .resolve(name)
+            .filter(|d| d.openai_compatible)?;
+        let (provider, model, voice, language, endpoint): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<AliasLegEndpoint>,
+        ) = match capability {
+            "text_to_speech" => {
+                let leg = def.tts.as_ref()?;
+                (
+                    leg.provider.clone()?,
+                    leg.model.clone(),
+                    leg.voice.clone(),
+                    None,
+                    def.tts_endpoint(),
+                )
+            }
+            "audio_transcription" | "audio_translation" => {
+                let leg = def.stt.as_ref()?;
+                (
+                    leg.provider.clone()?,
+                    leg.model.clone(),
+                    None,
+                    leg.language.clone(),
+                    def.stt_endpoint(),
+                )
+            }
+            _ => return None,
+        };
+        let (vendor, api_base, credential) = match &endpoint {
+            Some(endpoint) => {
+                let key = match alias_leg_key(endpoint, None, || {
+                    self.config.get_api_key(&provider).ok()
+                }) {
+                    Ok(key) => key,
+                    Err(e) => {
+                        tracing::warn!(alias = %name, error = %e, "alias leg credential refused");
+                        return None;
+                    }
+                };
+                (
+                    "self_hosted".to_string(),
+                    Some(endpoint.openai_api_base()),
+                    Some(key.key).filter(|k| !k.is_empty()),
+                )
+            }
+            None => (
+                provider.clone(),
+                None,
+                self.config
+                    .get_api_key(&provider)
+                    .ok()
+                    .filter(|k| !k.is_empty()),
+            ),
+        };
+        Some(ResolvedVoiceEndpoint {
+            endpoint_id: format!("alias:{name}"),
+            alias: None,
+            endpoint: bud_auth::credentials::VoiceEndpoint {
+                vendor,
+                api_base,
+                credential,
+                credential_parts: None,
+                endpoints: vec![capability.to_string()],
+                model,
+                voice,
+                language,
+                config: Default::default(),
+                pricing: None,
+                provider_params: Default::default(),
+                policy: Default::default(),
+            },
+        })
+    }
+
     /// Resolve `prompt:<name>[:v<n>]` to a voice agent this caller may reach (spec 025 §5.4).
     ///
     /// The alias is looked up in the caller's own allowlist — its key map, the published overlay
@@ -408,11 +506,17 @@ impl AppState {
             (None, None)
         };
 
+        // Which authenticators run is decided ONCE, here, and reported: an operator who sets
+        // both an API secret and AUTH_SERVICE_URL must be told what actually happens.
+        let auth_policy = crate::auth::AuthPolicy::from_env()?;
+        auth_policy.startup_report(&config, crate::config::validation::bud_mode_configured());
+
         // Initialize auth client if JWT-based auth is configured
         // Note: API secret auth doesn't need a client - it's handled directly in middleware
-        let auth_client = if config.auth_required && config.has_jwt_auth() {
+        let auth_client = if config.auth_required && auth_policy.responder_active(&config) {
             match AuthClient::from_config(&config).await {
                 Ok(client) => {
+                    let client = client.with_require_identity(auth_policy.require_identity);
                     tracing::info!(
                         "JWT authentication enabled with service: {}",
                         config
@@ -561,6 +665,7 @@ impl AppState {
             recording_bucket,
             livekit_sip_handler,
             auth_client,
+            auth_policy,
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
             connections_per_ip: Arc::new(DashMap::new()),
             shutdown: CancellationToken::new(),
@@ -1025,9 +1130,8 @@ mod tests {
     #[serial]
     async fn app_state_try_new_rejects_malformed_core_runtime_env_without_panic() {
         cleanup_core_runtime_env();
-        unsafe {
-            std::env::set_var("WAAV_EAGER_WARMUP", "sometimes");
-        }
+        // This thread only: in the shared environment, a parallel test's AppState read it.
+        crate::core::state::set_test_env_override("WAAV_EAGER_WARMUP", Some("sometimes"));
 
         let err = match AppState::try_new(minimal_test_config()).await {
             Ok(_) => panic!("malformed runtime env must fail AppState::try_new"),
@@ -1038,6 +1142,7 @@ mod tests {
             "error should name bad env var: {err}"
         );
 
+        crate::core::state::set_test_env_override("WAAV_EAGER_WARMUP", None);
         cleanup_core_runtime_env();
     }
 }

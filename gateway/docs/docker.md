@@ -63,6 +63,7 @@ The server will be available at `http://localhost:3001`.
 | `AUTH_SERVICE_URL` | External auth service URL | - |
 | `AUTH_SIGNING_KEY_PATH` | Path to JWT signing key | - |
 | `AUTH_TIMEOUT_SECONDS` | Auth request timeout | `5` |
+| `AUTH_QUERY_TOKEN` | `deny` refuses `?token=` credentials (query strings are logged) | `allow` |
 
 Minimal multi-secret example:
 

@@ -382,6 +382,11 @@ impl ElevenLabsTTS {
                 "API key is required for ElevenLabs".to_string(),
             ));
         }
+        // The voice id is the request's path segment (`/v1/text-to-speech/{voice_id}`).
+        if let Some(voice) = config.voice_id.as_deref() {
+            crate::core::net::validate_path_segment("voice_id", voice)
+                .map_err(super::base::TTSError::InvalidConfiguration)?;
+        }
 
         // The rate the audio is LABELLED with must be the rate ElevenLabs is asked for. The
         // shared provider labels chunks with `config.sample_rate`, and `output_format_for` maps
@@ -652,6 +657,25 @@ impl BaseTTS for ElevenLabsTTS {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_voice_id_cannot_leave_its_path_segment() {
+        let config = |voice: &str| TTSConfig {
+            api_key: "k".into(),
+            voice_id: Some(voice.into()),
+            ..Default::default()
+        };
+        assert!(ElevenLabsTTS::new(config("21m00Tcm4TlvDq8ikWAM")).is_ok());
+        for bad in ["../../voices/abc/edit", "a?b=c", ".."] {
+            assert!(
+                matches!(
+                    ElevenLabsTTS::new(config(bad)),
+                    Err(super::super::base::TTSError::InvalidConfiguration(m)) if m.contains("voice_id")
+                ),
+                "{bad}"
+            );
+        }
+    }
 
     // W1 keystone (TTS analog): the standardized voice features (stability, similarity_boost,
     // style, speaker boost, speed) flow into ElevenLabs `VoiceSettings` — previously unreachable

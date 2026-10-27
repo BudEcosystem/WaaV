@@ -39,7 +39,6 @@ use super::super::http_resilience::HttpBreaker;
 use super::config::{FlushStrategy, GroqResponseFormat, GroqSTTConfig};
 use super::messages::{
     GroqErrorResponse, TranscriptionResponse, TranscriptionResult, VerboseTranscriptionResponse,
-    wav,
 };
 
 // =============================================================================
@@ -61,6 +60,10 @@ const MAX_RETRIES: u32 = 3;
 
 /// Base delay for exponential backoff (milliseconds).
 const BASE_RETRY_DELAY_MS: u64 = 500;
+
+/// The longest a retry waits, whatever Groq's `Retry-After` asks (milliseconds): the limit the
+/// segmented sessions' rate gate puts on the same signal.
+const MAX_RETRY_DELAY_MS: u64 = 60_000;
 
 /// Default connect timeout in seconds.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -180,34 +183,33 @@ impl RateLimitInfo {
         })
     }
 
-    /// Parse Retry-After header value.
-    /// Can be seconds (integer) or duration string.
+    /// Parse a Retry-After value, in milliseconds: seconds (whole or fractional), an HTTP date, or
+    /// a duration string such as `500ms` or `2m59.56s`.
     pub fn parse_retry_after(s: &str) -> Option<u64> {
-        // Try parsing as seconds (integer)
-        if let Ok(secs) = s.parse::<u64>() {
-            return Some(secs * 1000); // Convert to ms
-        }
-        // Try parsing as duration string
-        Self::parse_duration_string(s)
+        waav_segmented_stt::vendor::parse_retry_after(s, std::time::SystemTime::now())
+            .or_else(|| waav_segmented_stt::vendor::parse_compound_duration(s))
+            .map(|d| d.as_millis() as u64)
     }
 
-    /// Parse duration strings like "1s", "500ms", "1m".
+    /// Parse a duration string, in milliseconds: `500ms`, `5s`, `2m`, `2m59.56s`, `1h`.
     pub fn parse_duration_string(s: &str) -> Option<u64> {
-        let s = s.trim();
-        if s.ends_with("ms") {
-            s.trim_end_matches("ms").parse().ok()
-        } else if s.ends_with('s') {
-            s.trim_end_matches('s')
-                .parse::<u64>()
-                .ok()
-                .map(|v| v * 1000)
-        } else if s.ends_with('m') {
-            s.trim_end_matches('m')
-                .parse::<u64>()
-                .ok()
-                .map(|v| v * 60 * 1000)
-        } else {
-            None
+        waav_segmented_stt::vendor::parse_compound_duration(s).map(|d| d.as_millis() as u64)
+    }
+}
+
+/// A failed attempt, with the HTTP status Groq answered when it answered one: whether to try
+/// again is decided by the status, not by the error's text.
+#[derive(Debug)]
+struct SendFailure {
+    error: STTError,
+    status: Option<u16>,
+}
+
+impl From<STTError> for SendFailure {
+    fn from(error: STTError) -> Self {
+        Self {
+            error,
+            status: None,
         }
     }
 }
@@ -519,8 +521,11 @@ impl GroqSTT {
         // Clone config values we need since we can't borrow config across await
         let sample_rate = config.base.sample_rate;
         let channels = config.base.channels;
-        let wav_data = wav::try_create_wav(&self.audio_buffer, sample_rate, channels)
-            .map_err(|e| STTError::AudioProcessingError(format!("Failed to create WAV: {e}")))?;
+        let wav_data =
+            super::super::wav::encode_pcm16_wav(&self.audio_buffer, sample_rate, channels)
+                .map_err(|e| {
+                    STTError::AudioProcessingError(format!("Failed to create WAV: {e}"))
+                })?;
 
         // Clone config for use in retry loop (needed because send_request takes &mut self)
         let config_clone = config.clone();
@@ -532,10 +537,7 @@ impl GroqSTT {
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 // Use Retry-After header if available, otherwise exponential backoff
-                let delay = self
-                    .rate_limit_info
-                    .retry_after_ms
-                    .unwrap_or_else(|| BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1));
+                let delay = Self::retry_delay_ms(self.rate_limit_info.retry_after_ms, attempt);
 
                 debug!(
                     "Retry attempt {} after {}ms delay{}",
@@ -614,9 +616,9 @@ impl GroqSTT {
                     self.audio_buffer.clear();
                     return Ok(());
                 }
-                Err(e) => {
-                    // Check if error is retryable
-                    if Self::is_retryable_error(&e) && attempt < MAX_RETRIES - 1 {
+                Err(SendFailure { error: e, status }) => {
+                    // Transient by the status Groq answered, or a network failure.
+                    if Self::is_retryable(&e, status) && attempt < MAX_RETRIES - 1 {
                         warn!("Retryable error on attempt {}: {}", attempt + 1, e);
                         last_error = Some(e);
                         continue;
@@ -636,19 +638,27 @@ impl GroqSTT {
         }))
     }
 
-    /// Check if an error is retryable (transient).
-    pub(crate) fn is_retryable_error(error: &STTError) -> bool {
-        match error {
-            STTError::NetworkError(_) => true,
-            STTError::ProviderError(msg) => {
-                msg.contains("429")
-                    || msg.contains("rate limit")
-                    || msg.contains("500")
-                    || msg.contains("502")
-                    || msg.contains("503")
-                    || msg.contains("Service Unavailable")
-            }
-            _ => false,
+    /// How long to wait before retry `attempt` (from 1): Groq's `Retry-After` when it sent one,
+    /// else exponential backoff; at most [`MAX_RETRY_DELAY_MS`] either way.
+    pub(crate) fn retry_delay_ms(retry_after_ms: Option<u64>, attempt: u32) -> u64 {
+        retry_after_ms
+            .unwrap_or_else(|| BASE_RETRY_DELAY_MS * 2u64.pow(attempt.saturating_sub(1)))
+            .min(MAX_RETRY_DELAY_MS)
+    }
+
+    /// Whether an HTTP status from Groq is transient: a timeout, a rate limit (429), flex-tier
+    /// capacity (498) or a server error.
+    pub(crate) fn retryable_status(status: u16) -> bool {
+        matches!(status, 408 | 429 | 498) || (500..=599).contains(&status)
+    }
+
+    /// Whether a failed attempt is tried again: by the HTTP status when Groq answered, else only a
+    /// network failure. Not by the error's text: this client's own messages ("Rate limit
+    /// exceeded", "Server error") never matched the words the text test looked for.
+    pub(crate) fn is_retryable(error: &STTError, status: Option<u16>) -> bool {
+        match status {
+            Some(s) => Self::retryable_status(s),
+            None => matches!(error, STTError::NetworkError(_)),
         }
     }
 
@@ -660,7 +670,7 @@ impl GroqSTT {
         &mut self,
         wav_data: Vec<u8>,
         config: &GroqSTTConfig,
-    ) -> Result<TranscriptionResult, STTError> {
+    ) -> Result<TranscriptionResult, SendFailure> {
         let http_client = self.http_client.as_ref().ok_or_else(|| {
             STTError::ConfigurationError(
                 "Groq STT default HTTP client is unavailable; construct with GroqSTT::new, new_standard, or with_config".to_string(),
@@ -732,7 +742,7 @@ impl GroqSTT {
             Err(e) => {
                 call.transport_error(&e);
                 self.resilience.record_send_error();
-                return Err(STTError::NetworkError(format!("Request failed: {e}")));
+                return Err(STTError::NetworkError(format!("Request failed: {e}")).into());
             }
         };
 
@@ -741,11 +751,8 @@ impl GroqSTT {
         self.rate_limit_info = rate_limit_info;
 
         // Extract request ID for debugging
-        self.last_request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        self.last_request_id =
+            waav_segmented_stt::vendor::request_id(response.headers(), &["x-request-id"]);
 
         if let Some(ref request_id) = self.last_request_id {
             debug!("Groq request ID: {}", request_id);
@@ -765,9 +772,7 @@ impl GroqSTT {
             Ok(text) => text,
             Err(e) => {
                 call.transport_error(&e);
-                return Err(STTError::NetworkError(format!(
-                    "Failed to read response: {e}"
-                )));
+                return Err(STTError::NetworkError(format!("Failed to read response: {e}")).into());
             }
         };
         // The vendor's raw answer: the transcript, or its error body.
@@ -826,11 +831,14 @@ impl GroqSTT {
                 _ => STTError::ProviderError(format!("{}{}", error_msg, request_id_suffix)),
             };
 
-            return Err(stt_error);
+            return Err(SendFailure {
+                error: stt_error,
+                status: Some(status.as_u16()),
+            });
         }
 
         // Parse response and extract request ID from response body if available
-        self.parse_response(&response_text, config)
+        Ok(self.parse_response(&response_text, config)?)
     }
 
     /// Parse API response based on configured format.
@@ -1079,9 +1087,9 @@ impl BaseSTT for GroqSTT {
     ///
     /// # Error Handling
     ///
-    /// If the flush fails, the error is returned to the caller so they can
-    /// decide how to handle it (e.g., retry, save audio to disk, etc.).
-    /// The connection state is still updated to disconnected.
+    /// If the flush fails, the error is returned to the caller and the turn's audio is dropped.
+    /// The connection state is still updated to disconnected; the voice manager reconnects and
+    /// registers its callbacks again either way.
     async fn disconnect(&mut self) -> Result<(), STTError> {
         if !self.connected.load(Ordering::Acquire) {
             return Ok(()); // Already disconnected
@@ -1098,8 +1106,9 @@ impl BaseSTT for GroqSTT {
                         "Failed to flush {} bytes of audio during disconnect: {}",
                         buffer_len, e
                     );
-                    // Audio buffer is NOT cleared here - caller can retrieve it
-                    // via audio_buffer field if needed for recovery
+                    // The turn is lost and reported; its audio must not be uploaded again at the
+                    // front of the next turn's (nothing ever recovered it from here).
+                    self.audio_buffer.clear();
                     Err(e)
                 }
             }
@@ -1507,7 +1516,8 @@ mod tests {
         let err = stt
             .send_request(vec![0u8; 44], &config)
             .await
-            .expect_err("inert default client must fail with a typed error");
+            .expect_err("inert default client must fail with a typed error")
+            .error;
 
         match err {
             STTError::ConfigurationError(msg) => {
@@ -1600,23 +1610,48 @@ mod tests {
         assert!(!GroqSTT::is_audio_silent(&loud_audio, 0.01));
     }
 
+    /// A `Retry-After` of an hour (or an HTTP date an hour out) is not an hour inside the session.
+    #[test]
+    fn a_retry_waits_at_most_a_minute() {
+        assert_eq!(
+            GroqSTT::retry_delay_ms(Some(3_600_000), 1),
+            MAX_RETRY_DELAY_MS
+        );
+        assert_eq!(GroqSTT::retry_delay_ms(Some(2_000), 1), 2_000);
+        assert_eq!(GroqSTT::retry_delay_ms(None, 1), BASE_RETRY_DELAY_MS);
+        assert_eq!(GroqSTT::retry_delay_ms(None, 2), BASE_RETRY_DELAY_MS * 2);
+    }
+
+    /// Retries follow the status Groq answered. The messages this client builds for a 429
+    /// ("Rate limit exceeded: ...") and a 5xx ("Server error: ...") were never retried by the old
+    /// text test, which looked for "rate limit" and the bare status numbers.
     #[test]
     fn test_is_retryable_error() {
-        assert!(GroqSTT::is_retryable_error(&STTError::NetworkError(
-            "Connection reset".to_string()
-        )));
-        assert!(GroqSTT::is_retryable_error(&STTError::ProviderError(
-            "429 rate limit exceeded".to_string()
-        )));
-        assert!(GroqSTT::is_retryable_error(&STTError::ProviderError(
-            "503 Service Unavailable".to_string()
-        )));
-        assert!(!GroqSTT::is_retryable_error(
-            &STTError::AuthenticationFailed("Invalid API key".to_string())
+        let rate_limited = STTError::ProviderError("Rate limit exceeded: busy".to_string());
+        let server = STTError::ProviderError("Server error: Groq API error: down".to_string());
+        assert!(GroqSTT::is_retryable(&rate_limited, Some(429)));
+        assert!(GroqSTT::is_retryable(&server, Some(503)));
+        assert!(GroqSTT::is_retryable(&server, Some(504)));
+        assert!(
+            GroqSTT::is_retryable(&rate_limited, Some(498)),
+            "flex-tier capacity"
+        );
+        assert!(GroqSTT::is_retryable(
+            &STTError::NetworkError("Connection reset".to_string()),
+            None
         ));
-        assert!(!GroqSTT::is_retryable_error(&STTError::ConfigurationError(
-            "Invalid config".to_string()
-        )));
+        assert!(!GroqSTT::is_retryable(
+            &STTError::AuthenticationFailed("Invalid API key".to_string()),
+            Some(401)
+        ));
+        assert!(!GroqSTT::is_retryable(
+            &STTError::ConfigurationError("Invalid config".to_string()),
+            Some(400)
+        ));
+        assert!(!GroqSTT::is_retryable(
+            &STTError::ProviderError("Failed to parse response: x".to_string()),
+            None
+        ));
     }
 
     #[test]

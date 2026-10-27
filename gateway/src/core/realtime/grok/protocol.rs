@@ -116,7 +116,7 @@ impl GrokProtocol {
         if let Some(asked) = &cfg.input_audio_transcription {
             let mut transcription = Map::new();
             let model = asked.model.trim();
-            if !model.is_empty() && model != "whisper-1" {
+            if !model.is_empty() && !crate::core::realtime::is_openai_default_transcription(model) {
                 transcription.insert("model".into(), json!(model));
             }
             if let Some(language) = cfg
@@ -686,6 +686,17 @@ mod tests {
                     "output": {"format": {"type": "audio/pcm", "rate": 24000}}
                 }
             }})]
+        );
+        // Today's OpenAI default (`gpt-transcribe`) is not asked of xAI either.
+        let mut current = on.clone();
+        current.input_audio_transcription = Some(InputTranscriptionConfig {
+            model: crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL.into(),
+        });
+        let sent = as_json(&p, &p.build_session_config(&current, None)).remove(0);
+        assert!(
+            sent["session"]["audio"]["input"]["transcription"]
+                .get("model")
+                .is_none()
         );
         let manual = cfg(&["grok_session"], TurnDetectionConfig::None);
         let p = proto(&manual);

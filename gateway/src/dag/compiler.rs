@@ -113,14 +113,74 @@ impl std::fmt::Debug for CompiledNode {
     }
 }
 
+/// Which of the operator's keys a provider node falls back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerKeyKind {
+    /// STT / TTS: `ServerConfig::get_api_key`, as a `/ws` leg uses it.
+    Speech,
+    /// Speech-to-speech: `ServerConfig::get_realtime_api_key`, as `/realtime` uses it.
+    Realtime,
+}
+
+/// The gateway's own key for a provider, for a node whose `config` names none — what a `/ws`
+/// leg without a client key already uses. Without it a DAG provider node sent an EMPTY key (the
+/// vendor answered 401), while its compile-time refusal told the client to "omit config.api_key
+/// to use the gateway's key".
+#[derive(Clone)]
+pub struct ServerKeys(Arc<dyn Fn(ServerKeyKind, &str) -> Option<String> + Send + Sync>);
+
+impl ServerKeys {
+    /// The keys of `config` (copied once per compile; read at node build, never logged).
+    pub fn from_config(config: &crate::config::ServerConfig) -> Self {
+        let config = Arc::new(config.clone());
+        Self(Arc::new(move |kind, provider| {
+            match kind {
+                ServerKeyKind::Speech => config.get_api_key(provider).ok(),
+                ServerKeyKind::Realtime => config.get_realtime_api_key(provider),
+            }
+            .filter(|k| !k.trim().is_empty())
+        }))
+    }
+
+    /// A fixed lookup, for tests.
+    #[cfg(test)]
+    pub fn from_fn(
+        f: impl Fn(ServerKeyKind, &str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(f))
+    }
+
+    fn get(&self, kind: ServerKeyKind, provider: &str) -> Option<String> {
+        (self.0)(kind, provider)
+    }
+}
+
+/// Whether `name` is the provider's OWN key variable: `<PROVIDER>_API_KEY`, or the variable the
+/// server reads that provider's key from (`AZURE_SPEECH_SUBSCRIPTION_KEY`, `GNANI_TOKEN`, …).
+fn is_own_key_variable(provider: &str, name: &str) -> bool {
+    let formula = format!(
+        "{}_API_KEY",
+        provider.to_ascii_uppercase().replace(['-', '.'], "_")
+    );
+    name == formula || crate::config::provider_key_variable(provider) == Some(name)
+}
+
 /// DAG compiler
 pub struct DAGCompiler {
     rhai_engine: Arc<Engine>,
     evaluator: Arc<ConditionEvaluator>,
+    /// Whether the definition is CLIENT input (an inline `dag_config.definition`,
+    /// `POST /dag/validate`) rather than an operator template. A client definition never makes
+    /// the gateway read its environment: credential references must name an operator
+    /// credential bound to the node's host (`core::credentials`).
+    client_supplied: bool,
+    /// The gateway's own provider keys, for provider nodes whose config names none (standalone
+    /// only: a Bud-mode node's credential comes from its deployment).
+    server_keys: Option<ServerKeys>,
 }
 
 impl DAGCompiler {
-    /// Create a new DAG compiler
+    /// A compiler for CLIENT-supplied definitions (the secure default).
     pub fn new() -> Self {
         let engine = Arc::new(create_rhai_engine());
         let evaluator = Arc::new(ConditionEvaluator::new(engine.clone()));
@@ -128,6 +188,54 @@ impl DAGCompiler {
         Self {
             rhai_engine: engine,
             evaluator,
+            client_supplied: true,
+            server_keys: None,
+        }
+    }
+
+    /// Give provider nodes the gateway's own key for their provider when their config names
+    /// none, or names the provider's own key variable (`${DEEPGRAM_API_KEY}`), which then resolves
+    /// through the server's configuration (env or YAML) instead of the process environment.
+    pub fn with_server_keys(mut self, keys: ServerKeys) -> Self {
+        self.server_keys = Some(keys);
+        self
+    }
+
+    /// For a provider node: the config it runs with, and the server key it falls back to.
+    fn provider_key(
+        &self,
+        def: &NodeDefinition,
+        kind: ServerKeyKind,
+        provider: &str,
+    ) -> (serde_json::Value, Option<String>) {
+        let mut config = def.config.clone();
+        let Some(keys) = self.server_keys.as_ref() else {
+            return (config, None);
+        };
+        let names_own = config
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .and_then(crate::core::credentials::env_reference)
+            .is_some_and(|name| is_own_key_variable(provider, name));
+        if config.get("api_key").is_some() && !names_own {
+            return (config, None);
+        }
+        let key = keys.get(kind, provider);
+        if names_own
+            && key.is_some()
+            && let Some(map) = config.as_object_mut()
+        {
+            map.remove("api_key");
+        }
+        (config, key)
+    }
+
+    /// A compiler for an OPERATOR template (server config): `${VAR}` references resolve from the
+    /// process environment as before.
+    pub fn for_operator_template() -> Self {
+        Self {
+            client_supplied: false,
+            ..Self::new()
         }
     }
 
@@ -228,7 +336,23 @@ impl DAGCompiler {
 
     /// Compile a single node definition
     fn compile_node(&self, def: &NodeDefinition) -> DAGResult<CompiledNode> {
-        debug!(node_id = %def.id, node_type = ?def.node_type, "Compiling node");
+        // Name the node's type, never print the node: it carries client-supplied credentials
+        // (`api_key`, `headers`, `config.api_key`).
+        debug!(node_id = %def.id, node_type = %def.node_type.type_tag(), "Compiling node");
+
+        if self.client_supplied {
+            check_client_provider_credential(def)?;
+        }
+        if def.retry_on_failure
+            && !crate::dag::executor::RETRYABLE_KINDS.contains(&def.node_type.type_tag().as_str())
+        {
+            tracing::warn!(
+                node_id = %def.id,
+                node_type = %def.node_type.type_tag(),
+                "retry_on_failure is ignored for this node kind: a retry would repeat an effect \
+                 outside the gateway (or audio already spoken)"
+            );
+        }
 
         let node: Arc<dyn DAGNode> = match &def.node_type {
             NodeType::AudioInput => Arc::new(AudioInputNode::new(&def.id)),
@@ -246,8 +370,10 @@ impl DAGCompiler {
             } => {
                 // Thread the node's `config` blob so the provider credential (`"api_key"`,
                 // literal or `${ENV_VAR}`) reaches the STT config at execute time.
-                let mut node =
-                    STTProviderNode::new(&def.id, provider).with_config(def.config.clone());
+                let (config, server_key) = self.provider_key(def, ServerKeyKind::Speech, provider);
+                let mut node = STTProviderNode::new(&def.id, provider)
+                    .with_config(config)
+                    .with_server_key(server_key);
                 if let Some(m) = model {
                     node = node.with_model(m);
                 }
@@ -261,8 +387,10 @@ impl DAGCompiler {
                 voice_id,
                 model,
             } => {
-                let mut node =
-                    TTSProviderNode::new(&def.id, provider).with_config(def.config.clone());
+                let (config, server_key) = self.provider_key(def, ServerKeyKind::Speech, provider);
+                let mut node = TTSProviderNode::new(&def.id, provider)
+                    .with_config(config)
+                    .with_server_key(server_key);
                 if let Some(v) = voice_id {
                     node = node.with_voice(v);
                 }
@@ -275,8 +403,11 @@ impl DAGCompiler {
                 Arc::new(node)
             }
             NodeType::RealtimeProvider { provider, model } => {
-                let mut node =
-                    RealtimeProviderNode::new(&def.id, provider).with_config(def.config.clone());
+                let (config, server_key) =
+                    self.provider_key(def, ServerKeyKind::Realtime, provider);
+                let mut node = RealtimeProviderNode::new(&def.id, provider)
+                    .with_config(config)
+                    .with_server_key(server_key);
                 if let Some(m) = model {
                     node = node.with_model(m);
                 }
@@ -359,7 +490,8 @@ impl DAGCompiler {
                 headers,
                 reasoning_effort,
             } => {
-                // Build LLM config from node definition
+                // Build LLM config from node definition. A node with no `timeout_ms` gets the operator's
+                // WAAV_LLM_TIMEOUT_MS default (else 60 s), the same knob the conversation path reads.
                 let mut llm_config = LlmEndpointConfig {
                     base_url: base_url.clone(),
                     model: model.clone(),
@@ -368,7 +500,7 @@ impl DAGCompiler {
                     temperature: *temperature,
                     max_tokens: *max_tokens,
                     streaming: *streaming,
-                    timeout_ms: timeout_ms.unwrap_or(60000),
+                    timeout_ms: timeout_ms.unwrap_or_else(crate::core::llm::default_timeout_ms),
                     headers: headers.clone(),
                     assistant_id: assistant_id.clone(),
                     reasoning_effort: *reasoning_effort,
@@ -384,7 +516,7 @@ impl DAGCompiler {
                     llm_config.tools = Some(parsed_tools);
                 }
 
-                bud_or_checked_llm_node(def, llm_config)?
+                bud_or_checked_llm_node(def, llm_config, self.client_supplied)?
             }
             NodeType::Translate {
                 target_language,
@@ -431,11 +563,11 @@ impl DAGCompiler {
                     temperature: Some(temperature.unwrap_or(0.1)),
                     max_tokens: Some(max_tokens.unwrap_or(4000)),
                     streaming: false,
-                    timeout_ms: timeout_ms.unwrap_or(60000),
+                    timeout_ms: timeout_ms.unwrap_or_else(crate::core::llm::default_timeout_ms),
                     headers: headers.clone(),
                     ..Default::default()
                 };
-                bud_or_checked_llm_node(def, llm_config)?
+                bud_or_checked_llm_node(def, llm_config, self.client_supplied)?
             }
             NodeType::WebhookOutput { url, headers } => {
                 // Use try_new() for SSRF protection (S6): webhook URLs are client-supplied.
@@ -549,19 +681,61 @@ impl Default for DAGCompiler {
 /// excludes reconvergence/join nodes, which have at least one predecessor from a
 /// different branch and therefore execute once in the main sweep rather than per
 /// branch. This is the data needed for single-execution split handling.
-/// An LLM node: SSRF-checked when its `base_url` came with the template, or pointed at the Bud
-/// gateway with the caller's credential when the server bound it (FRD-023 WP-RT6.3).
+/// An LLM node: pointed at the Bud gateway with the caller's credential when the server bound
+/// it (FRD-023 WP-RT6.3); otherwise SSRF-checked, and — for a CLIENT definition — keyed only by
+/// the client's own literal key or an operator credential bound to its `base_url`
+/// (`config.credential_ref`, or the legacy `api_key: "${NAME}"`).
 fn bud_or_checked_llm_node(
     def: &NodeDefinition,
     llm_config: LlmEndpointConfig,
+    client_supplied: bool,
 ) -> DAGResult<Arc<dyn DAGNode>> {
     match def.bud.as_ref().and_then(|b| b.session_credential.clone()) {
         Some(credential) => Ok(Arc::new(LlmEndpointNode::for_bud_gateway(
             &def.id, llm_config, credential,
         ))),
-        // Use try_new() for SSRF protection on the client-supplied base_url.
+        None if client_supplied => {
+            let credential_ref = def.config.get("credential_ref").and_then(|v| v.as_str());
+            Ok(Arc::new(LlmEndpointNode::try_new_for_client(
+                &def.id,
+                llm_config,
+                credential_ref,
+            )?))
+        }
+        // An operator template: SSRF-checked, `${VAR}` from the environment as before.
         None => Ok(Arc::new(LlmEndpointNode::try_new(&def.id, llm_config)?)),
     }
+}
+
+/// A CLIENT definition's STT/TTS/realtime node may not make the gateway read an arbitrary
+/// environment variable: `config.api_key: "${NAME}"` is accepted only when NAME is the
+/// provider's own key variable (`DEEPGRAM_API_KEY` for `deepgram` — the key the gateway uses
+/// anyway when the node names none). `${AWS_SECRET_ACCESS_KEY}` on a deepgram node used to send
+/// that secret to Deepgram (any `*_TOKEN` / `*_ACCESS_KEY` name passed the old suffix check).
+fn check_client_provider_credential(def: &NodeDefinition) -> DAGResult<()> {
+    let provider = match &def.node_type {
+        NodeType::SttProvider { provider, .. }
+        | NodeType::TtsProvider { provider, .. }
+        | NodeType::RealtimeProvider { provider, .. } => provider,
+        _ => return Ok(()),
+    };
+    let Some(name) = def
+        .config
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .and_then(crate::core::credentials::env_reference)
+    else {
+        return Ok(());
+    };
+    if is_own_key_variable(provider, name) {
+        return Ok(());
+    }
+    Err(DAGError::ConfigError(format!(
+        "node '{}' ({provider}): config.api_key \"${{{name}}}\" is not accepted in a client \
+         DAG — this gateway does not read arbitrary environment variables for a client. Omit \
+         config.api_key to use the gateway's {provider} key, or send your own key",
+        def.id
+    )))
 }
 
 fn compute_split_plans(
@@ -705,6 +879,91 @@ impl CompiledDAG {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_keys() -> ServerKeys {
+        ServerKeys::from_fn(|kind, provider| match (kind, provider) {
+            (ServerKeyKind::Speech, "deepgram") => Some("dg-server".into()),
+            (ServerKeyKind::Realtime, "openai") => Some("oa-server".into()),
+            _ => None,
+        })
+    }
+
+    fn provider_def(node_type: serde_json::Value, config: serde_json::Value) -> NodeDefinition {
+        let mut def = serde_json::json!({"id": "n", "type": "", "config": config});
+        for (k, v) in node_type.as_object().unwrap() {
+            def[k] = v.clone();
+        }
+        serde_json::from_value(def).expect("node definition")
+    }
+
+    /// A provider node without a key of its own used to send an EMPTY key; it now uses the
+    /// gateway's, as a `/ws` leg does. `${OWN}` resolves through the server config, and any
+    /// other configured key is left alone.
+    #[test]
+    fn provider_nodes_fall_back_to_the_servers_key_for_their_provider() {
+        let compiler = DAGCompiler::new().with_server_keys(server_keys());
+        let stt = serde_json::json!({"type": "stt_provider", "provider": "deepgram"});
+
+        let (config, key) = compiler.provider_key(
+            &provider_def(stt.clone(), serde_json::json!({})),
+            ServerKeyKind::Speech,
+            "deepgram",
+        );
+        assert_eq!(key.as_deref(), Some("dg-server"));
+        assert!(config.get("api_key").is_none());
+
+        let (config, key) = compiler.provider_key(
+            &provider_def(
+                stt.clone(),
+                serde_json::json!({"api_key": "${DEEPGRAM_API_KEY}"}),
+            ),
+            ServerKeyKind::Speech,
+            "deepgram",
+        );
+        assert_eq!(key.as_deref(), Some("dg-server"));
+        assert!(
+            config.get("api_key").is_none(),
+            "resolved by the server, not the environment"
+        );
+
+        let (config, key) = compiler.provider_key(
+            &provider_def(stt.clone(), serde_json::json!({"api_key": "client-own"})),
+            ServerKeyKind::Speech,
+            "deepgram",
+        );
+        assert_eq!(key, None);
+        assert_eq!(config["api_key"], "client-own");
+
+        let (_, key) = compiler.provider_key(
+            &provider_def(
+                serde_json::json!({"type": "realtime_provider", "provider": "openai"}),
+                serde_json::json!({}),
+            ),
+            ServerKeyKind::Realtime,
+            "openai",
+        );
+        assert_eq!(key.as_deref(), Some("oa-server"));
+
+        // Without server keys (Bud mode), nothing changes.
+        let (config, key) = DAGCompiler::new().provider_key(
+            &provider_def(stt, serde_json::json!({"api_key": "${DEEPGRAM_API_KEY}"})),
+            ServerKeyKind::Speech,
+            "deepgram",
+        );
+        assert_eq!(key, None);
+        assert_eq!(config["api_key"], "${DEEPGRAM_API_KEY}");
+    }
+
+    #[test]
+    fn a_client_node_may_name_the_variable_the_server_reads_its_providers_key_from() {
+        assert!(is_own_key_variable("deepgram", "DEEPGRAM_API_KEY"));
+        assert!(is_own_key_variable(
+            "microsoft-azure",
+            "AZURE_SPEECH_SUBSCRIPTION_KEY"
+        ));
+        assert!(is_own_key_variable("gnani", "GNANI_TOKEN"));
+        assert!(!is_own_key_variable("deepgram", "ANTHROPIC_API_KEY"));
+    }
     use crate::dag::definition::OutputDestination;
 
     fn create_simple_dag() -> DAGDefinition {

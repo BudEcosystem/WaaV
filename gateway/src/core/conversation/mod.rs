@@ -25,13 +25,17 @@
 //! It is **opt-in**: instantiated only when a `conversation` config block is
 //! present. Absent it, the existing STT/TTS-primitive behavior is unchanged.
 
+mod report;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex as SyncMutex;
+use report::TurnReport;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::core::agent::{AgentSignal, TurnStatus};
 use crate::core::llm::{LlmClient, LlmClientConfig, LlmError};
 use crate::core::stt::STTResult;
 use crate::core::voice_manager::{VoiceManager, VoiceManagerError};
@@ -42,6 +46,10 @@ pub enum ConversationOrchestratorError {
     /// The configured LLM `base_url` failed SSRF validation.
     #[error("conversation LLM base_url rejected: {0}")]
     InvalidLlmUrl(String),
+
+    /// The configured key may not be used for this LLM target (`core::credentials`).
+    #[error("conversation LLM credential rejected: {0}")]
+    InvalidCredential(String),
 
     /// The LLM call itself failed (surfaced from a turn).
     #[error("conversation LLM error: {0}")]
@@ -163,6 +171,10 @@ pub struct ConversationConfig {
     /// (or an explicit global `max_tokens` if larger intent), NEVER the fast
     /// tier's voice cap. The fast tier is unaffected.
     pub max_reasoning_tokens: Option<u32>,
+    /// The LLM request timeout in ms (`None` = `WAAV_LLM_TIMEOUT_MS`, else 60 s), clamped to
+    /// 1 s .. `WAAV_LLM_MAX_TIMEOUT_MS`. With `WAAV_LLM_STREAM_IDLE_TIMEOUT_MS` set, it bounds a
+    /// streamed reply's first token rather than the whole reply.
+    pub llm_timeout_ms: Option<u64>,
 }
 
 /// P2: default per-turn LLM re-inference ceiling. Matches the built-in tool-loop
@@ -224,6 +236,7 @@ impl Default for ConversationConfig {
             degradation_message: None,
             max_llm_calls_per_turn: DEFAULT_MAX_LLM_CALLS_PER_TURN,
             max_reasoning_tokens: None,
+            llm_timeout_ms: None,
         }
     }
 }
@@ -542,6 +555,7 @@ impl ConversationConfig {
             // X-G1: cap completion length for voice unless explicitly set.
             max_tokens: self.max_tokens.or(Some(VOICE_DEFAULT_MAX_TOKENS)),
             streaming: self.streaming,
+            timeout_ms: crate::core::llm::session_timeout_ms(self.llm_timeout_ms),
             max_history: self.max_history,
             provider_kind: self.provider_kind,
             // D1: send the floor-clamped value (an adaptive-only model can't
@@ -597,6 +611,9 @@ impl ConversationConfig {
 pub struct ConversationOrchestrator {
     session_id: String,
     llm: Arc<LlmClient>,
+    /// Set when the LLM leg runs keyless although the vendor key is configured (see
+    /// [`KeyAdvisory`]); the `/ws` handler sends it as a `config_warning`.
+    key_advisory: Option<KeyAdvisory>,
     voice_manager: Arc<VoiceManager>,
     config: Arc<ConversationConfig>,
     /// In-flight LLM turn token + its generation id.
@@ -637,14 +654,24 @@ pub struct ConversationOrchestrator {
     /// so a short anaphoric follow-up can stick to the reasoning thread for one
     /// turn (set unconditionally in `select_tier` on every two-tier turn).
     last_turn_was_reasoning: Arc<SyncMutex<bool>>,
+    /// Where each turn reports its lifecycle and spoken words (see [`report`]); `None` = nobody
+    /// listens (tests, direct embedding).
+    turn_signals: Arc<SyncMutex<Option<tokio::sync::mpsc::UnboundedSender<AgentSignal>>>>,
 }
 
 /// S1/S2: build the reasoning tier (sharing `base.histories`) when configured.
 fn build_reasoning_tier(
     base: &Arc<LlmClient>,
     config: &ConversationConfig,
-) -> Option<Arc<LlmClient>> {
-    let model = config.reasoning_model.clone()?;
+    keyed: bool,
+) -> Result<Option<Arc<LlmClient>>, ConversationOrchestratorError> {
+    let Some(model) = config.reasoning_model.clone() else {
+        // An inert reasoning_base_url is still client input: refuse an unsafe one early.
+        if keyed && let Some(rb) = &config.reasoning_base_url {
+            validate_llm_url(rb).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        }
+        return Ok(None);
+    };
     // The reasoning tier needs room to ACTUALLY think — independent of the fast
     // tier's voice max_tokens cap (256), which on Anthropic suppresses the
     // thinking block entirely (it needs budget ≥ 1024 < max_tokens). Default to a
@@ -654,19 +681,34 @@ fn build_reasoning_tier(
         .max_reasoning_tokens
         .or(config.max_tokens)
         .unwrap_or(REASONING_DEFAULT_MAX_TOKENS);
-    Some(Arc::new(
-        base.with_tier_overrides(
-            model,
-            config.reasoning_base_url.clone(),
-            config.reasoning_api_key.clone(),
-            config.reasoning_provider_kind,
-            // The reasoning tier wants to actually reason — let it (no forced Off).
-            config
-                .reasoning_effort
-                .or(Some(crate::core::llm::ReasoningEffort::Low)),
-            Some(reasoning_max_tokens),
-        ),
-    ))
+    let tier = base.with_tier_overrides(
+        model,
+        config.reasoning_base_url.clone(),
+        None, // keyed below, for ITS target
+        config.reasoning_provider_kind,
+        // The reasoning tier wants to actually reason — let it (no forced Off).
+        config
+            .reasoning_effort
+            .or(Some(crate::core::llm::ReasoningEffort::Low)),
+        Some(reasoning_max_tokens),
+    );
+    // The Bud gateway path keys every call with the session credential; a client-configured
+    // reasoning tier with its own key or host is keyed for ITS target (an inherited fast key
+    // never crosses to another origin — `with_tier_overrides`).
+    let needs_own_key = config.reasoning_api_key.is_some() || config.reasoning_base_url.is_some();
+    let tier = if !keyed || config.server_llm_endpoint || !needs_own_key {
+        tier
+    } else {
+        let target = config
+            .reasoning_base_url
+            .clone()
+            .unwrap_or_else(|| config.base_url.clone());
+        let key = client_key_for(&tier, config.reasoning_api_key.as_deref(), &target)?;
+        validate_llm_url_with_grants(&target, &key.private_grants)
+            .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        tier.with_client_key(key)
+    };
+    Ok(Some(Arc::new(tier)))
 }
 
 /// S3 (M6): may an async-tool result be VOLUNTEERED now? Only when the line is
@@ -750,43 +792,113 @@ pub fn turn_span(
     span
 }
 
-/// Build the LLM clients of a conversation: the fast tier and, when one is configured, the
-/// reasoning tier (which shares the fast tier's histories and registry).
+/// Build and key the client-configured LLM legs (fast tier + optional reasoning tier).
 ///
-/// Validates the LLM `base_url` for SSRF (resolve-then-validate, with the
-/// `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` test escape hatch) before building the
-/// client, since `base_url` is client-supplied. `functions`, when given, is
-/// advertised on every request of both tiers.
+/// Each leg is keyed ONCE, here, by `core::credentials`: the client's literal key, or an
+/// operator credential bound to the leg's host (`credential_ref` / `${NAME}`), or — with no
+/// key — the vendor's implicit key toward the vendor's own host only. Never an arbitrary env
+/// var, never an operator key toward a client-chosen host. (`${LOCAL_LLM_API_KEY}` used to be
+/// sent literally here while the DAG path expanded it; and an omitted key sent the operator's
+/// OPENAI_API_KEY to whatever base_url was given.)
 pub fn resolve_llm_legs(
     config: &ConversationConfig,
-    functions: Option<Arc<crate::core::llm::FunctionRegistry>>,
-) -> Result<(Arc<LlmClient>, Option<Arc<LlmClient>>), ConversationOrchestratorError> {
-    if !config.server_llm_endpoint {
-        validate_llm_url(&config.base_url).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
-    }
-    // S1/S2: the reasoning tier's base_url is ALSO client-supplied — validate
-    // it for SSRF before it is ever used for a request.
-    if let Some(rb) = &config.reasoning_base_url {
-        validate_llm_url(rb).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
-    }
+) -> Result<KeyedLegs, ConversationOrchestratorError> {
+    let base = LlmClient::new(config.to_client_config());
+    let mut key_advisory = None;
+    let llm = if config.server_llm_endpoint {
+        // The operator's in-cluster Bud gateway, keyed per call by the session credential.
+        base
+    } else {
+        let key = client_key_for(&base, config.api_key.as_deref(), &config.base_url)?;
+        validate_llm_url_with_grants(&config.base_url, &key.private_grants)
+            .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        key_advisory = key
+            .withheld
+            .as_deref()
+            .map(|name| withheld_key_advisory(name, &config.base_url));
+        base.with_client_key(key)
+    };
+    let llm = Arc::new(llm);
+    // S1/S2: the reasoning tier's base_url is ALSO client-supplied — it is validated for SSRF
+    // (with its own key's grants) before it is ever used for a request.
+    let reasoning_llm = build_reasoning_tier(&llm, config, true)?;
+    Ok(KeyedLegs {
+        llm,
+        reasoning_llm,
+        key_advisory,
+    })
+}
 
-    let llm = LlmClient::new(config.to_client_config());
-    let llm = Arc::new(match functions {
-        Some(registry) => llm.with_functions(registry),
-        None => llm,
-    });
-    let reasoning_llm = build_reasoning_tier(&llm, config);
-    Ok((llm, reasoning_llm))
+/// The LLM legs [`resolve_llm_legs`] built, and what the client should hear about their keys.
+pub struct KeyedLegs {
+    pub llm: Arc<LlmClient>,
+    pub reasoning_llm: Option<Arc<LlmClient>>,
+    pub key_advisory: Option<KeyAdvisory>,
+}
+
+/// The LLM leg runs keyless although the operator configured the vendor's key: its target is not
+/// one of that key's hosts (`core::credentials`). Sent to the client as `config_warning
+/// llm_key_not_sent`, and logged, so the server's 401 has an explanation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyAdvisory {
+    /// The withheld key's name (e.g. `OPENAI_API_KEY`), never its value.
+    pub credential: String,
+    /// The target's `host:port`.
+    pub host: String,
+}
+
+impl KeyAdvisory {
+    pub fn message(&self) -> String {
+        format!(
+            "{} is configured on this gateway but was not sent to {}: it is bound to other hosts. \
+             Declare a credential for this host (WAAV_CREDENTIALS_JSON) and name it with \
+             credential_ref, or send your own api_key",
+            self.credential, self.host
+        )
+    }
+}
+
+fn withheld_key_advisory(credential: &str, base_url: &str) -> KeyAdvisory {
+    let host = url::Url::parse(base_url)
+        .ok()
+        .and_then(|u| {
+            let host = u.host_str()?.to_string();
+            Some(match u.port_or_known_default() {
+                Some(p) => format!("{host}:{p}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| base_url.to_string());
+    let advisory = KeyAdvisory {
+        credential: credential.to_string(),
+        host,
+    };
+    warn!(credential = %advisory.credential, host = %advisory.host, "LLM leg runs without the operator key: the target is not one of its hosts");
+    advisory
+}
+
+/// The key decision for one client-configured LLM leg (`core::credentials`).
+fn client_key_for(
+    client: &LlmClient,
+    api_key: Option<&str>,
+    base_url: &str,
+) -> Result<crate::core::credentials::ClientKey, ConversationOrchestratorError> {
+    let default_env_key = crate::core::llm::LlmAdapter::default_env_key(
+        crate::core::llm::adapter::select_adapter(client.config()),
+    );
+    crate::core::credentials::global_credentials()
+        .resolve_client_key(api_key, None, base_url, default_env_key)
+        .map_err(|e| ConversationOrchestratorError::InvalidCredential(e.to_string()))
 }
 
 impl ConversationOrchestrator {
-    /// The key for the next LLM call: the session's live credential when it has one (FRD-023 RT6,
-    /// a Bud caller reaching budgateway), else the configured `api_key`.
+    /// The per-call key for the next LLM call: the session's live credential when it has one
+    /// (FRD-023 RT6, a Bud caller reaching budgateway). Otherwise `None`: the LLM client sends
+    /// the key `resolve_llm_legs` bound to it (literal or operator credential). Passing the raw
+    /// `config.api_key` here sent `${LOCAL_LLM_API_KEY}` verbatim — a per-call key is never
+    /// interpreted.
     fn llm_key(&self) -> Option<String> {
-        match &self.config.credential {
-            Some(credential) => Some(credential.current()),
-            None => self.config.api_key.clone(),
-        }
+        self.config.credential.as_ref().map(|c| c.current())
     }
 
     /// Create a new orchestrator for `session_id`.
@@ -799,11 +911,16 @@ impl ConversationOrchestrator {
         config: ConversationConfig,
         voice_manager: Arc<VoiceManager>,
     ) -> Result<Self, ConversationOrchestratorError> {
-        let (llm, reasoning_llm) = resolve_llm_legs(&config, None)?;
+        let KeyedLegs {
+            llm,
+            reasoning_llm,
+            key_advisory,
+        } = resolve_llm_legs(&config)?;
         Ok(Self {
             session_id: session_id.into(),
             llm,
             reasoning_llm,
+            key_advisory,
             last_turn_was_reasoning: Arc::new(SyncMutex::new(false)),
             voice_manager,
             config: Arc::new(config),
@@ -817,7 +934,13 @@ impl ConversationOrchestrator {
             masking_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             masking_handle: Arc::new(SyncMutex::new(None)),
             masking_phrase_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            turn_signals: Arc::new(SyncMutex::new(None)),
         })
+    }
+
+    /// Why the LLM leg runs without the configured vendor key, if it does.
+    pub fn key_advisory(&self) -> Option<&KeyAdvisory> {
+        self.key_advisory.as_ref()
     }
 
     /// Construct from a pre-built `LlmClient` (used in tests to inject a mock
@@ -829,11 +952,13 @@ impl ConversationOrchestrator {
         llm: Arc<LlmClient>,
         voice_manager: Arc<VoiceManager>,
     ) -> Self {
-        let reasoning_llm = build_reasoning_tier(&llm, &config);
+        // Test injector: the caller built (and keyed) the client itself.
+        let reasoning_llm = build_reasoning_tier(&llm, &config, false).ok().flatten();
         Self {
             session_id: session_id.into(),
             llm,
             reasoning_llm,
+            key_advisory: None,
             last_turn_was_reasoning: Arc::new(SyncMutex::new(false)),
             voice_manager,
             config: Arc::new(config),
@@ -847,6 +972,7 @@ impl ConversationOrchestrator {
             masking_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             masking_handle: Arc::new(SyncMutex::new(None)),
             masking_phrase_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            turn_signals: Arc::new(SyncMutex::new(None)),
         }
     }
 
@@ -918,6 +1044,7 @@ impl ConversationOrchestrator {
         allow_interruption: bool,
         token: &CancellationToken,
         spoke: bool,
+        report: &TurnReport,
     ) -> bool {
         // A real barge-in already cleared this turn — degrading would talk over
         // the caller. The epoch guard below is the final backstop.
@@ -982,10 +1109,13 @@ impl ConversationOrchestrator {
                         primary_is_reasoning,
                         "P1: primary LLM tier failed — degraded to the fallback tier"
                     );
-                    let _ = self
+                    if let Ok(true) = self
                         .voice_manager
                         .speak_if_epoch(&text, true, allow_interruption, epoch)
-                        .await;
+                        .await
+                    {
+                        report.spoke(&text);
+                    }
                     return true; // recovered on the fallback tier
                 }
                 Ok(other) => {
@@ -1015,10 +1145,13 @@ impl ConversationOrchestrator {
             .degradation_message
             .as_deref()
             .unwrap_or(DEFAULT_DEGRADATION_MESSAGE);
-        let _ = self
+        if let Ok(true) = self
             .voice_manager
             .speak_if_epoch(msg, true, allow_interruption, epoch)
-            .await;
+            .await
+        {
+            report.spoke(msg);
+        }
         false
     }
 
@@ -1144,10 +1277,23 @@ impl ConversationOrchestrator {
                     content
                 };
                 crate::core::metrics::bridge::record_async_tool("spoke");
-                let _ = self
+                let report = self.report_turn(id, None);
+                let status = match self
                     .voice_manager
                     .speak_if_epoch(&text, true, self.config.allow_interruption, epoch)
-                    .await;
+                    .await
+                {
+                    Ok(true) => {
+                        report.spoke(&text);
+                        TurnStatus::Completed
+                    }
+                    Ok(false) => TurnStatus::Cancelled,
+                    Err(e) => {
+                        warn!(session = %self.session_id, error = %e, "S3 follow-up speech failed");
+                        TurnStatus::Failed
+                    }
+                };
+                report.done(status, self.voice_manager.audio_out_ms());
             }
             Ok(_) => debug!(session = %self.session_id, "S3 follow-up produced no content"),
             Err(LlmError::Cancelled) => {
@@ -1277,17 +1423,32 @@ impl ConversationOrchestrator {
     /// whatever the executor runs next on that thread, which silently mis-attributes the very
     /// legs this exists to measure.
     pub async fn run_turn(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
+        self.run_turn_for(transcript, Some(transcript)).await
+    }
+
+    /// [`Self::run_turn`] for a prompt that is not the caller's words (`input: None`): the idle
+    /// check-in. `input` is what the turn reports as having started it.
+    async fn run_turn_for(
+        &self,
+        transcript: &str,
+        input: Option<&str>,
+    ) -> Result<(), ConversationOrchestratorError> {
         let span = turn_span(
             &self.session_id,
             transcript,
             self.config.attribution.as_ref(),
         );
-        tracing::Instrument::instrument(self.run_turn_inner(transcript), span).await
+        tracing::Instrument::instrument(self.run_turn_inner(transcript, input), span).await
     }
 
-    async fn run_turn_inner(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
+    async fn run_turn_inner(
+        &self,
+        transcript: &str,
+        input: Option<&str>,
+    ) -> Result<(), ConversationOrchestratorError> {
         let span = tracing::Span::current();
         let (id, token) = self.begin_turn();
+        let report = self.report_turn(id, input);
         span.record(crate::observability::voice_attrs::turn::TURN_INDEX, id);
         // S2: select the fast or reasoning tier for this turn (both share
         // history; the D3 filler masks the reasoning tier's latency).
@@ -1348,6 +1509,7 @@ impl ConversationOrchestrator {
                 let token_t = token.clone();
                 let latch = self.masking_fired.clone();
                 let session = self.session_id.clone();
+                let report_t = report.clone();
                 let handle = tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     // Re-check at fire time: not cancelled, no audio yet, not
@@ -1369,7 +1531,10 @@ impl ConversationOrchestrator {
                     // re-introduced the §4.4 failure). Echo cancellation, not a
                     // session-wide suppression window, handles the bot's own tail.
                     match vm.speak_if_epoch(&phrase, true, true, epoch).await {
-                        Ok(true) => debug!(session = %session, %phrase, "D3 masking filler spoken"),
+                        Ok(true) => {
+                            report_t.spoke(&phrase);
+                            debug!(session = %session, %phrase, "D3 masking filler spoken")
+                        }
                         Ok(false) => {
                             // Cleared before we could speak — undo the latch so a
                             // recovery line can still fire if content is empty.
@@ -1425,6 +1590,7 @@ impl ConversationOrchestrator {
             let spoke_pump = spoke.clone();
             let obs_pump = observers.clone();
             let strip_md = self.config.strip_markdown;
+            let report_pump = report.clone();
             let handle = tokio::spawn(async move {
                 let mut agg = crate::core::text::SentenceAggregator::default();
                 // Reasoning-model chain-of-thought (`<think>…</think>`) must NEVER
@@ -1441,6 +1607,7 @@ impl ConversationOrchestrator {
                     strip_markdown: bool,
                     spoke: &std::sync::atomic::AtomicBool,
                     obs: &Option<Arc<crate::core::observability::ObserverRegistry>>,
+                    report: &TurnReport,
                 ) -> bool {
                     // C-G4: strip markdown on the COMPLETE sentence (the
                     // aggregator's unit — per-token would tear ** pairs).
@@ -1463,7 +1630,10 @@ impl ConversationOrchestrator {
                         .speak_if_epoch(&text, true, allow_interruption, epoch)
                         .await
                     {
-                        Ok(true) => true,
+                        Ok(true) => {
+                            report.spoke(&text);
+                            true
+                        }
                         Ok(false) => {
                             // A barge-in cleared TTS since this turn started:
                             // the rest of this turn's sentences are stale.
@@ -1494,7 +1664,7 @@ impl ConversationOrchestrator {
                                     if token_for_cb.is_cancelled() {
                                         break 'pump;
                                     }
-                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await {
+                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump, &report_pump).await {
                                         break 'pump;
                                     }
                                 }
@@ -1508,13 +1678,13 @@ impl ConversationOrchestrator {
                                 if !think_tail.is_empty() {
                                     for sentence in agg.push_str(&think_tail) {
                                         if token_for_cb.is_cancelled() { break; }
-                                        let _ = speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await;
+                                        let _ = speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump, &report_pump).await;
                                     }
                                 }
                                 if !token_for_cb.is_cancelled()
                                     && let Some(tail) = agg.flush()
                                 {
-                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await;
+                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump, &report_pump).await;
                                 }
                                 break;
                             }
@@ -1544,6 +1714,8 @@ impl ConversationOrchestrator {
             0
         };
         let mut budget_exceeded = false;
+        // How the turn ended when that is not read off `outcome` and the token (see the report below).
+        let mut ended: Option<TurnStatus> = None;
         // Wraps BOTH completion branches: the budgeted reasoning path and the plain one. Timing
         // only one of them would leave the reasoning turns — the slow ones, the whole reason the
         // measurement is interesting — silently unmeasured.
@@ -1695,7 +1867,10 @@ impl ConversationOrchestrator {
                         .speak_if_epoch(&speak_text, true, allow_interruption, epoch)
                         .await
                     {
-                        Ok(true) => Ok(()),
+                        Ok(true) => {
+                            report.spoke(&speak_text);
+                            Ok(())
+                        }
                         Ok(false) => {
                             debug!(session = %self.session_id,
                                    "speak skipped: barge-in cleared since turn start");
@@ -1718,15 +1893,14 @@ impl ConversationOrchestrator {
                             .masking_fired
                             .load(std::sync::atomic::Ordering::Acquire)
                         {
-                            let _ = self
+                            let line = "Sorry, I didn't catch that — could you say it again?";
+                            if let Ok(true) = self
                                 .voice_manager
-                                .speak_if_epoch(
-                                    "Sorry, I didn't catch that — could you say it again?",
-                                    true,
-                                    allow_interruption,
-                                    epoch,
-                                )
-                                .await;
+                                .speak_if_epoch(line, true, allow_interruption, epoch)
+                                .await
+                            {
+                                report.spoke(line);
+                            }
                         }
                     }
                     Ok(())
@@ -1755,6 +1929,7 @@ impl ConversationOrchestrator {
                         "conversation",
                         "reasoning_stall_after_partial",
                     );
+                    ended = Some(TurnStatus::Incomplete);
                     debug!(
                         session = %self.session_id,
                         "A7: reasoner stalled after partial audio — committed partial, no restart"
@@ -1764,14 +1939,19 @@ impl ConversationOrchestrator {
                     // No audio yet (TTFA breach): degrade to the fast draft /
                     // canned apology rather than leaving the caller on a stuck
                     // reasoner. A deliberate budget cancel is never surfaced.
-                    self.speak_degraded(
-                        is_reasoning,
-                        epoch,
-                        allow_interruption,
-                        &token,
-                        spoke.load(std::sync::atomic::Ordering::Acquire),
-                    )
-                    .await;
+                    if !self
+                        .speak_degraded(
+                            is_reasoning,
+                            epoch,
+                            allow_interruption,
+                            &token,
+                            spoke.load(std::sync::atomic::Ordering::Acquire),
+                            &report,
+                        )
+                        .await
+                    {
+                        ended = Some(TurnStatus::Failed);
+                    }
                     Ok(())
                 }
             }
@@ -1810,6 +1990,7 @@ impl ConversationOrchestrator {
                         allow_interruption,
                         &token,
                         spoke.load(std::sync::atomic::Ordering::Acquire),
+                        &report,
                     )
                     .await
                 {
@@ -1824,6 +2005,16 @@ impl ConversationOrchestrator {
         // already fired or first audio aborted it; prevents a late stray filler).
         self.abort_masking();
         self.end_turn(id);
+        let status = if token.is_cancelled() {
+            TurnStatus::Cancelled
+        } else if let Some(status) = ended {
+            status
+        } else if outcome.is_err() {
+            TurnStatus::Failed
+        } else {
+            TurnStatus::Completed
+        };
+        report.done(status, self.voice_manager.audio_out_ms());
 
         // A-G5 (review wf_d43814c3 #4): the bot completed a turn that ran to
         // completion (not a barge-in cancel) — flip the greeting-guard latch
@@ -2004,6 +2195,33 @@ impl ConversationOrchestrator {
         self.handle_turn_events(&events).await;
     }
 
+    /// A typed user turn (`/ws` `agent_input`, a `/v1/realtime` typed message): it interrupts the
+    /// reply in progress and runs like a spoken one. Returns when the turn has run.
+    pub async fn take_typed_turn(&self, text: &str) {
+        if self
+            .fatal_stopped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        use crate::core::turn::TurnEvent;
+        self.handle_turn_events(&[
+            TurnEvent::Started {
+                turn_id: 0,
+                interrupt: true,
+            },
+            TurnEvent::Stopped {
+                turn_id: 0,
+                transcript: text.to_string(),
+            },
+        ])
+        .await;
+    }
+
     /// Act on turn-decision events (from a [`crate::core::turn::TurnController`]
     /// or the [`Self::on_stt_result`] compatibility derivation) — the SINGLE
     /// place that owns the eager/barge-in ordering: the speculation is taken
@@ -2062,6 +2280,9 @@ impl ConversationOrchestrator {
                 }
                 // MuteChanged lands with the mute strategies (A-G5).
                 TurnEvent::MuteChanged { .. } => {}
+                // A segmented caller turn closed with no input: nothing to answer. A barge-in it
+                // caused has already stopped the reply.
+                TurnEvent::Aborted { .. } => {}
             }
         }
         // A speculation taken for a batch whose Stopped carried no usable
@@ -2094,6 +2315,8 @@ impl ConversationOrchestrator {
                     // to the bot-busy probe), and epoch-gate each sentence so
                     // a barge-in mid-confirm stops the rest.
                     let (turn_id, _confirm_token) = self.begin_turn();
+                    let report = self.report_turn(turn_id, Some(transcript));
+                    let mut status = TurnStatus::Completed;
                     let epoch = self.voice_manager.clear_epoch();
                     self.llm
                         .commit_turn(&self.session_id, transcript, &content)
@@ -2120,20 +2343,23 @@ impl ConversationOrchestrator {
                             .speak_if_epoch(&sentence, true, self.config.allow_interruption, epoch)
                             .await
                         {
-                            Ok(true) => {}
+                            Ok(true) => report.spoke(&sentence),
                             Ok(false) => {
                                 debug!(session = %self.session_id,
                                        "eager reply truncated: barge-in cleared mid-confirm");
+                                status = TurnStatus::Cancelled;
                                 break;
                             }
                             Err(e) => {
                                 warn!(session = %self.session_id, error = %e,
                                       "speaking confirmed eager reply failed");
+                                status = TurnStatus::Failed;
                                 break;
                             }
                         }
                     }
                     self.end_turn(turn_id);
+                    report.done(status, self.voice_manager.audio_out_ms());
                     // A5: a confirmed eager reply ALWAYS ran on the FAST tier
                     // (committed via self.llm) but bypassed select_tier, so keep
                     // the reasoning-stickiness ledger honest — otherwise a prior
@@ -2199,6 +2425,21 @@ impl ConversationOrchestrator {
         }
     }
 
+    /// Send every turn's lifecycle and spoken words here (`/ws` `assistant_transcript` & co.).
+    pub fn set_turn_signals(&self, tx: tokio::sync::mpsc::UnboundedSender<AgentSignal>) {
+        *self.turn_signals.lock() = Some(tx);
+    }
+
+    /// Start reporting turn `id`; `input` is the caller's words that started it, if any.
+    fn report_turn(&self, id: u64, input: Option<&str>) -> TurnReport {
+        TurnReport::start(
+            self.turn_signals.lock().clone(),
+            id,
+            input,
+            self.voice_manager.audio_out_ms(),
+        )
+    }
+
     /// D-G3: install the fatal-error handler (invoked once per fatal).
     pub fn set_fatal_handler(&self, handler: Arc<dyn Fn(String) + Send + Sync>) {
         *self.fatal_handler.lock() = Some(handler);
@@ -2244,10 +2485,11 @@ impl ConversationOrchestrator {
                 }
                 debug!(session = %orch.session_id, "user idle; re-engaging");
                 if let Err(e) = orch
-                    .run_turn(
+                    .run_turn_for(
                         "[The user has been silent for a while. Briefly and \
                          naturally check in with them or offer help — one short \
                          sentence.]",
+                        None,
                     )
                     .await
                 {
@@ -2368,6 +2610,14 @@ fn is_auth_failure(message: &str) -> bool {
 /// so the in-process mock LLM in the conversation tests can target `127.0.0.1`.
 fn validate_llm_url(url: &str) -> Result<(), String> {
     crate::core::net::validate_url_for_ssrf(url, &["http", "https"])
+}
+
+/// [`validate_llm_url`] honouring a bound operator credential's port-scoped private grants.
+fn validate_llm_url_with_grants(
+    url: &str,
+    grants: &[crate::core::net::HostPort],
+) -> Result<(), String> {
+    crate::core::net::validate_url_for_ssrf_with_grants(url, &["http", "https"], grants)
 }
 
 #[cfg(test)]

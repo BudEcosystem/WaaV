@@ -1,0 +1,236 @@
+{
+  "provider_id": "reverie",
+  "provider": {
+    "aliases": [
+      "reverie-ai",
+      "reverie_ai",
+      "reverie-stt",
+      "reverieinc"
+    ],
+    "default_model": null,
+    "model_string": "sensitive",
+    "registered_in_gateway": true,
+    "notes": "Registered in the plugin registry as reverie with the aliases reverie-ai, reverie_ai, reverie-stt and reverieinc (gateway/src/plugin/builtin/mod.rs:1738-1741). Reverie has no model parameter, so default_model is null and the wildcard row is the only row. The gateway reads the session's model field as the customer's Reverie app id, which is why model_string is sensitive. Moving the app id into its own credential field is a precondition for any per-model row. The vendor offers a live WebSocket product next to its file product and publishes one language list shared by both, without stating coverage per product, but the gateway's streaming client cannot hold a call with more than one utterance as written, so the synchronous file product is recorded as a file transport; no release builds it, because the integration decisions place Reverie in no vendor wave. The only live contact with the vendor during the research was an unauthenticated request to the file endpoint, which returned HTTP 404 with the message 'REV-API-KEY header not found'. Nothing was transcribed, which is why the row says it was verified from documentation."
+  },
+  "rows": [
+    {
+      "id": "reverie:any",
+      "match": {
+        "provider": "reverie",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no request code for Reverie's synchronous file product (POST https://revapi.reverieinc.com/ with the header REV-APPNAME: stt_file).",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for the file product. The only number found, about 200 ms on an expired offer page, does not say what it measures."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 5,
+                "plan": "free",
+                "scope": "unknown",
+                "note": "The vendor's free tier allows up to 5 concurrent API connections or sessions. Whether file requests and sockets share that limit, whether it counts per account, and the paid-tier figure are not published."
+              }
+            ],
+            "assumed_plan": "free"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "ogg",
+              "opus"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart",
+            "headers": [
+              {
+                "name": "format",
+                "value": "16k_int16"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "src_lang",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "language_required": true,
+            "context_params": [],
+            "wire": "reverie_file_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/reverie/mod.rs:54-60; gateway/src/core/tts/reverie/provider.rs:152-159; gateway/src/core/stt/batch.rs:839-844",
+            "notes": "No code exists for this transport; two constants for it are declared and unused (mod.rs:54 and :60). The Reverie text-to-speech client already sends the same REV-API-KEY, REV-APP-ID and REV-APPNAME headers and is a pattern to copy. The request is multipart form data with the field audio_file, plus the headers src_lang (the language, required), domain (required) and format. The format value is a header, not a form field; 16k_int16 is the vendor's default and means 16 kHz signed 16-bit WAV. The response is one JSON object with text, display_text, a confidence between 0 and 1, success and cause. The adapter should treat success false, empty text or the cause 'audio too short' as a dropped segment, and should send logging false unless the customer opts in, because the vendor stores audio and transcripts when logging is on. The vendor's pages disagree on the request shape: the API reference and both official SDKs use POST / with the field audio_file, while two guide pages show POST /upload with the field file; the first is recorded. MP3 appears as a format value in one documentation example but is not in the format list, so it is not listed as accepted."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Only uploaded speech segments would be sent, at the same hourly price as the streaming product (pay-as-you-go INR 24.99 per hour, read with certificate checking off)."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "per_request",
+              "param": {
+                "name": "logging",
+                "value": "false",
+                "in": "header"
+              }
+            }
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 5,
+                "plan": "free",
+                "scope": "unknown",
+                "note": "The vendor's free tier allows up to 5 concurrent API connections or sessions. Whether file requests and sockets share that limit, whether it counts per account, and the paid-tier figure are not published."
+              }
+            ],
+            "assumed_plan": "free"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "opus"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "src_lang",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "language_required": true,
+            "context_params": [],
+            "wire": "reverie_stream_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "The existing WebSocket client cannot hold a call with more than one utterance. One of two things happens, depending on a detail of the vendor's replies that was read from the documentation and not checked against the live service. If the replies carry the confidence value as a number, as the vendor documents, the client declares that field as text, cannot parse any reply, and produces no transcript at all. If the replies do parse, the client treats the first final result as the end of the session, because it never sets the vendor's continuous flag, and every later audio frame fails with 'Not connected'.",
+            "code_ref": "gateway/src/core/stt/reverie/config.rs:364, 437-450; gateway/src/core/stt/reverie/client.rs:153-156, 522-525; gateway/src/core/stt/reverie/messages.rs:88-90, 113-128, 151-181; gateway/tests/mock_endpoint_e2e.rs:403-406",
+            "notes": "This is the client every Reverie session gets today. The two defects described under defect exclude each other: if result frames fail to parse the client emits nothing at all, and if they parse the call gets one utterance. Either way a call with several turns does not work. Also found by reading: vendor error frames are not recognised as errors (messages.rs:153-169); the client sends timeout=15 and silence=1 and stores both as whole seconds (config.rs:297-302) although the vendor documents them as fractional numbers; and vendor-side storage of audio is on by default (config.rs:240-244). The repository's own mock test documents the one-utterance behaviour. The repair the audit proposes is to send continuous=1 and timeout=180, accept the confidence as a number or as text, and reconnect when the vendor closes with the cause 'timeout'. Once repaired and checked against the live service this transport should be marked as working and moved ahead of the file upload, because it is the only one that gives text while the caller is still speaking."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "per_request",
+              "param": {
+                "name": "logging",
+                "value": "false",
+                "in": "query"
+              }
+            }
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": true,
+        "notes": "Describes the streaming transport, the one a session gets today; the file transport has its own block. The vendor prices both the file product and the streaming product per hour of audio (pay-as-you-go INR 24.99 per hour). The price was read from the vendor's pricing page with certificate checking turned off, because that site's certificate had expired, so it is lower trust. All call audio is sent on the socket, so silence is recorded as billed. The minimum billed duration and the rounding are not published. There is no Reverie entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.reverieinc.com/api-reference/speech-to-text-streaming.md",
+          "https://docs.reverieinc.com/api-reference/speech-to-text-file.md",
+          "https://docs.reverieinc.com/api-reference/speech-to-text-batch.md",
+          "https://docs.reverieinc.com/usage-guides/speech-to-text-file/key-features.md",
+          "https://docs.reverieinc.com/usage-guides/speech-to-text-streaming/key-features.md",
+          "https://docs.reverieinc.com/usage-guides/speech-to-text/supported-audio-formats.md",
+          "https://docs.reverieinc.com/usage-guides/speech-to-text/supported-languages.md",
+          "https://docs.reverieinc.com/usage-guides/speech-to-text/supported-domains.md",
+          "https://docs.reverieinc.com/analytics.md",
+          "https://pypi.org/pypi/reverie-sdk/json",
+          "https://registry.npmjs.org/@reverieit%2freverie-client",
+          "https://revup.reverieinc.com/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/reverie/config.rs:515-521",
+          "gateway/src/core/stt/reverie/config.rs:364",
+          "gateway/src/core/stt/reverie/config.rs:240-244",
+          "gateway/src/core/stt/reverie/config.rs:297-302",
+          "gateway/src/core/stt/reverie/client.rs:153-156",
+          "gateway/src/core/stt/reverie/client.rs:522-525",
+          "gateway/src/core/stt/reverie/messages.rs:88-90",
+          "gateway/src/core/stt/reverie/messages.rs:153-169",
+          "gateway/src/core/stt/reverie/mod.rs:54-60",
+          "gateway/src/core/tts/reverie/provider.rs:152-159",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/tests/mock_endpoint_e2e.rs:403-406"
+        ],
+        "unverified": [
+          "transports[0].limits.max_upload_bytes (not published)",
+          "transports[0].limits.max_audio_ms (300 s appears only in the official Python SDK docstring, and only for audio given by URL)",
+          "transports[0].limits.min_audio_ms (the vendor answers 'audio too short' for very short audio; the threshold is not published)",
+          "transports[0].limits.rates (concurrent_requests) and transports[1].limits.rates (concurrent_sessions) (5 is the documented free-tier figure; paid-tier concurrency, request-rate limits and whether the limit is per account are not published)",
+          "transports[0].limits.rates (requests) and transports[1].limits.rates (requests) (no request-rate limit is published)",
+          "transports[0].latency (no figure is published for the file product)",
+          "transports[0] request shape (POST / with audio_file, or POST /upload with file)",
+          "transports[1].limits.max_session_ms (the vendor's timeout parameter, default 15 s and maximum 180 s, may be a no-data timer or a cap on connection length)",
+          "transports[1].gateway_client.status (the confidence type mismatch is read from documentation; one live frame would settle it)",
+          "billing.min_billed_ms and transports[0].billing.min_billed_ms",
+          "billing.unit and transports[0].billing.unit (the price page was read with certificate checking off)",
+          "billing.bills_silence (the row's block describes the socket, which is sent all call audio; that silence is billed is inferred from the per-hour audio price, not stated)",
+          "whether the six code-mixed language codes such as hi_en work on either product",
+          "transports[1].latency (never measured and nothing is published for the streaming product)",
+          "transports[1] end-of-utterance delay (the vendor documents its silence parameter as a fractional number of seconds; the gateway can only send whole seconds and sends 1, and whether the vendor honours a smaller value is not confirmed)",
+          "transports[1].stream_audio (the vendor publishes one audio-format list for all its speech products; which formats the socket accepts was not tested)",
+          "transports[0].privacy and transports[1].privacy (the vendor documents logging=true as storing audio and keeping transcripts; that false stores nothing was not tested)"
+        ],
+        "notes": "Reverie's API has no model parameter: one recognition engine is selected by language and domain, and the product is selected by an appname value (stt_stream, stt_file or stt_batch). The wildcard is therefore the only Reverie row and the provider default. Because the provider's model string is marked sensitive, this row is the declared answer for every Reverie session, not a guess, so its confidence is 'documented'. The three appname values are not rows: the gateway reads the session's model field as the customer's Reverie app id (gateway/src/core/stt/reverie/config.rs:515-521), so a row keyed by an appname would never match a real session. File upload keeps first place from version 1, but no release builds it, so it is never chosen; the vendor's streaming product shares its language and domain lists with the file product (the vendor does not state coverage per product, and the two sources read list the same languages for both), so the order should be reversed once the client is repaired. The asynchronous stt_batch product (upload, then poll; the official SDK waits 5 s before its second poll) is not listed because it cannot serve a call. No segment profile is given: 16 kHz 16-bit WAV is the vendor's default format and no other default needs to change. The audit suggests an 8 s request timeout as a placeholder; that is the auditor's estimate. The language (src_lang) and the domain are required and there is no automatic language detection. Every Reverie session is handed to the existing WebSocket client, so the session starts and then either stops transcribing after the first utterance or never produces a transcript. The map keeps that client as the transport a session gets, marked known broken and reported in ready.stt, because the integration decisions report a broken native client instead of refusing it."
+      }
+    }
+  ]
+}

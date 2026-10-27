@@ -193,13 +193,16 @@ impl RealtimeProtocol for InworldProtocol {
             if cfg.fix("inworld_tool_response") {
                 session["providerData"] = serde_json::json!({ "auto_tool_response": false });
             }
-            // Fix `inworld_stt_default`: OpenAI's `whisper-1` (the gateway's default when the
-            // client names none) is unknown to Inworld, and "the rest of the `session.update`
-            // is not applied".
+            // Fix `inworld_stt_default`: OpenAI's default transcription model (the gateway's
+            // when the client names none) is unknown to Inworld, and "the rest of the
+            // `session.update` is not applied".
             if cfg.fix("inworld_stt_default")
                 && let Some(model) = session
                     .pointer_mut("/audio/input/transcription/model")
-                    .filter(|m| m.as_str() == Some("whisper-1"))
+                    .filter(|m| {
+                        m.as_str()
+                            .is_some_and(crate::core::realtime::is_openai_default_transcription)
+                    })
             {
                 *model = INWORLD_STT_MODEL.into();
             }
@@ -516,6 +519,15 @@ mod tests {
         assert_eq!(
             today["audio"]["input"]["transcription"]["model"],
             "whisper-1"
+        );
+        // Today's default (`gpt-transcribe`) is Inworld's model too, under the fix.
+        let mut current = on.clone();
+        current.input_audio_transcription = Some(crate::core::realtime::InputTranscriptionConfig {
+            model: crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL.into(),
+        });
+        assert_eq!(
+            session_json(&p, &current)["audio"]["input"]["transcription"]["model"],
+            INWORLD_STT_MODEL
         );
         // No voice named: none is sent (Inworld's default `Dennis`).
         let unnamed = RealtimeConfig { voice: None, ..on };

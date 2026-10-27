@@ -359,10 +359,66 @@ mod tests {
         // zh/cmn override
         assert_eq!(dg(CanonicalLanguage::CmnCn).native, "zh-CN");
         assert_eq!(dg(CanonicalLanguage::YueHk).native, "zh-HK");
-        // auto -> "multi"
-        let a = dg(CanonicalLanguage::Auto);
+        // auto -> "multi", on the models that take it
+        let a = to_provider_language(CanonicalLanguage::Auto, "deepgram", "nova-3");
         assert_eq!(a.native, "multi");
         assert!(!a.has_warnings());
+    }
+
+    /// Deepgram detects (`multi`) only on Nova-3 and Nova-2; every other model refuses the
+    /// handshake with a 400 (live: `model=base&language=multi`). There, auto is left out with a
+    /// warning and the model's own default applies.
+    #[test]
+    fn deepgram_detects_only_on_the_models_that_can() {
+        for model in ["nova-3", "nova-3-general", "nova-2", "Nova-2-General"] {
+            let m = to_provider_language(CanonicalLanguage::Auto, "deepgram", model);
+            assert_eq!(m.native, "multi", "{model}");
+            assert!(!m.omit && !m.has_warnings(), "{model}");
+        }
+        for model in [
+            "base",
+            "enhanced",
+            "nova",
+            "nova-3-medical",
+            "nova-2-phonecall",
+            "",
+            "whisper-large",
+        ] {
+            let m = to_provider_language(CanonicalLanguage::Auto, "deepgram", model);
+            assert!(m.omit, "{model}: auto must not reach Deepgram");
+            assert!(m.has_warnings(), "{model}: and the caller is told why");
+        }
+        // A named language is unaffected by the model.
+        assert_eq!(
+            to_provider_language(CanonicalLanguage::EnUs, "deepgram", "base").native,
+            "en-US"
+        );
+    }
+
+    /// Nothing chosen is not a choice of detection. Where the vendor can detect, an unset language
+    /// is left out, so the vendor's own default applies; it used to be sent as the vendor's auto
+    /// token, which is how an agent with no language reached Deepgram `base` as `multi`.
+    #[test]
+    fn an_unset_language_is_left_out_not_sent_as_detection() {
+        for (provider, model) in [
+            ("deepgram", "base"),
+            ("deepgram", "nova-3"),
+            ("elevenlabs", "scribe_v2_realtime"),
+            ("openai", ""),
+        ] {
+            for raw in ["", "  "] {
+                let m = crate::core::lang::map_language(raw, provider, model);
+                assert!(m.omit && m.native.is_empty(), "{provider}/{model}: {raw:?}");
+                assert!(
+                    !m.has_warnings(),
+                    "{provider}/{model}: unset is not worth a warning"
+                );
+            }
+        }
+        // A vendor that cannot detect keeps its default language for an unset one, as before.
+        let unset = crate::core::lang::map_language("", "cartesia", "");
+        let auto = to_provider_language(CanonicalLanguage::Auto, "cartesia", "");
+        assert_eq!((unset.native, unset.omit), (auto.native, auto.omit));
     }
 
     #[test]

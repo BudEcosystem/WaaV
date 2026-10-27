@@ -59,19 +59,19 @@ const ENDPOINT_ID: &str = "f0f0f0f0-0000-4000-8000-00000000ef05";
 const ALIAS: &str = "rt-perf";
 const VENDOR_MODEL: &str = "gpt-realtime-2.1";
 
-/// bud-auth's fixture ciphertext; the plaintext is its `PLAIN`.
-const TEST_CREDENTIAL: &str = include_str!("../../bud-auth/tests/fixtures/test_cred_encrypted.hex");
+#[path = "support/credential_keys.rs"]
+mod credential_keys;
+
+/// The test credential (run-time key, see `support/credential_keys.rs`).
+static TEST_CREDENTIAL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| credential_keys::credential_key().ciphertext.clone());
 
 /// 24 kHz mono PCM16 at 20 ms: 480 samples.
 const SAMPLES_PER_FRAME: usize = 24_000 / 50;
 const FRAME_INTERVAL: Duration = Duration::from_millis(20);
 
 fn test_pem() -> String {
-    std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../bud-auth/tests/fixtures/test_cred_private.pem"
-    ))
-    .expect("bud-auth's fixture key (git-ignored *.pem) must be present locally")
+    credential_keys::credential_key().pem.clone()
 }
 
 /// The loopback escape hatch, so the vendor on 127.0.0.1 passes SSRF validation.

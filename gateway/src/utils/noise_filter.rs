@@ -5,11 +5,11 @@ pub mod implementation {
     use ndarray::{Array2, ArrayView2};
     use std::sync::{
         Arc, LazyLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     };
     use std::time::Duration;
-    use tokio::sync::{Mutex, Notify, mpsc, oneshot};
-    use tracing::{error, info};
+    use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
+    use tracing::{error, info, warn};
 
     // Import SIMD-optimized operations
     use crate::utils::simd_ops;
@@ -69,30 +69,45 @@ pub mod implementation {
 
     // Type aliases for cleaner code
     type WorkerSender = mpsc::Sender<WorkerTask>;
-    type PoolSender = mpsc::Sender<WorkerSender>;
-    type PoolReceiver = Arc<Mutex<mpsc::Receiver<WorkerSender>>>;
-    type SenderPool = (PoolSender, PoolReceiver, Arc<AtomicUsize>, Arc<Notify>);
 
-    // The pool of senders to the worker threads, managed by a channel.
-    // This is the core of our thread-safe, async-friendly pool for the !Send models.
-    static SENDER_POOL: LazyLock<SenderPool> = LazyLock::new(|| {
-        // Use a pool size based on available CPU cores, with a minimum of 2.
-        let pool_size = num_cpus::get().max(2);
-        let (pool_tx, pool_rx) = mpsc::channel(pool_size);
-        let live_workers = Arc::new(AtomicUsize::new(0));
-        let worker_death = Arc::new(Notify::new());
-        let (init_tx, init_rx) = std::sync::mpsc::channel();
-        let mut launched = 0usize;
+    /// The pool of senders to the worker threads, managed by a channel: the core of a
+    /// thread-safe, async-friendly pool for the !Send models.
+    ///
+    /// It starts [`INITIAL_WORKERS`] workers and adds one (a thread holding its own DeepFilterNet
+    /// model) whenever a caller finds every worker busy, up to one per core. It used to start
+    /// one per core at the first LiveKit track — twenty models on a 20-core host, whatever the
+    /// load — with no way to say otherwise.
+    struct SenderPool {
+        pool_tx: mpsc::Sender<WorkerSender>,
+        pool_rx: Arc<Mutex<mpsc::Receiver<WorkerSender>>>,
+        live_workers: Arc<AtomicUsize>,
+        worker_death: Arc<Notify>,
+        /// Workers started (alive or not), for the ceiling.
+        started: AtomicUsize,
+        max_workers: usize,
+    }
 
-        for worker_index in 0..pool_size {
-            let pool_tx_clone = pool_tx.clone();
-            let init_tx_clone = init_tx.clone();
+    /// Workers started with the pool; the rest come on demand.
+    const INITIAL_WORKERS: usize = 2;
 
-            // Spawn a dedicated OS thread for each worker.
-            // This is crucial for pinning the !Send DfTract model to a single thread.
-            match std::thread::Builder::new()
-                .name(format!("waav-noise-filter-{worker_index}"))
-                .spawn(move || {
+    /// Start one worker thread; it adds itself to the pool (and to `live_workers`) once its
+    /// model is ready, and reports readiness on `ready` when given.
+    fn spawn_worker(
+        worker_index: usize,
+        pool_tx: mpsc::Sender<WorkerSender>,
+        live_workers: Arc<AtomicUsize>,
+        ready: Option<std::sync::mpsc::Sender<bool>>,
+    ) -> bool {
+        let report = move |ok: bool| {
+            if let Some(ready) = &ready {
+                let _ = ready.send(ok);
+            }
+        };
+        // Spawn a dedicated OS thread for each worker.
+        // This is crucial for pinning the !Send DfTract model to a single thread.
+        std::thread::Builder::new()
+            .name(format!("waav-noise-filter-{worker_index}"))
+            .spawn(move || {
                 let (worker_task_tx, mut worker_task_rx) = mpsc::channel::<WorkerTask>(1);
 
                 // Create the expensive DfTract model ONCE on this thread.
@@ -106,18 +121,19 @@ pub mod implementation {
                             error = %err,
                             "Failed to create DfTract model in noise-filter worker"
                         );
-                        let _ = init_tx_clone.send(false);
+                        report(false);
                         return;
                     }
                 };
 
                 // Provide this worker's sender to the pool only after the model is ready.
-                if pool_tx_clone.blocking_send(worker_task_tx).is_err() {
-                    let _ = init_tx_clone.send(false);
+                live_workers.fetch_add(1, Ordering::AcqRel);
+                if pool_tx.blocking_send(worker_task_tx).is_err() {
+                    live_workers.fetch_sub(1, Ordering::AcqRel);
+                    report(false);
                     return;
                 }
-                let _ = init_tx_clone.send(true);
-                drop(init_tx_clone);
+                report(true);
 
                 info!(
                     worker_index,
@@ -132,43 +148,89 @@ pub mod implementation {
                     // Send result back to the caller. Ignore error if caller hung up.
                     let _ = result_tx.send(result);
                 }
-                })
-            {
-                Ok(_) => launched += 1,
-                Err(err) => {
-                    error!(
-                        worker_index,
-                        error = %err,
-                        "Failed to spawn noise-filter worker thread"
-                    );
-                }
-            }
-        }
+            })
+            .inspect_err(|err| {
+                error!(
+                    worker_index,
+                    error = %err,
+                    "Failed to spawn noise-filter worker thread"
+                );
+            })
+            .is_ok()
+    }
 
+    static SENDER_POOL: LazyLock<SenderPool> = LazyLock::new(|| {
+        let max_workers = std::thread::available_parallelism()
+            .map_or(INITIAL_WORKERS, |n| n.get())
+            .max(INITIAL_WORKERS);
+        let (pool_tx, pool_rx) = mpsc::channel(max_workers);
+        let live_workers = Arc::new(AtomicUsize::new(0));
+        let (init_tx, init_rx) = std::sync::mpsc::channel();
+        let launched = (0..INITIAL_WORKERS)
+            .filter(|&i| {
+                spawn_worker(
+                    i,
+                    pool_tx.clone(),
+                    live_workers.clone(),
+                    Some(init_tx.clone()),
+                )
+            })
+            .count();
         drop(init_tx);
         let initialized = init_rx
             .into_iter()
             .take(launched)
             .filter(|ready| *ready)
             .count();
-        live_workers.store(initialized, Ordering::Release);
         if initialized == 0 {
             error!("Noise-filter worker pool initialized with no live workers");
-        } else if initialized < pool_size {
+        } else if initialized < INITIAL_WORKERS {
             error!(
                 initialized,
-                requested = pool_size,
+                requested = INITIAL_WORKERS,
                 "Noise-filter worker pool initialized with fewer workers than requested"
             );
         }
 
-        (
+        SenderPool {
             pool_tx,
-            Arc::new(Mutex::new(pool_rx)),
+            pool_rx: Arc::new(Mutex::new(pool_rx)),
             live_workers,
-            worker_death,
-        )
+            worker_death: Arc::new(Notify::new()),
+            started: AtomicUsize::new(INITIAL_WORKERS),
+            max_workers,
+        }
     });
+
+    /// Workers started so far and the ceiling, for tests.
+    #[cfg(test)]
+    pub(crate) fn pool_size_for_tests() -> (usize, usize) {
+        let pool = &*SENDER_POOL;
+        (pool.started.load(Ordering::Acquire), pool.max_workers)
+    }
+
+    /// Every worker is busy: start one more if the ceiling allows (it joins the pool when its
+    /// model is ready; the caller waits for whichever worker frees first).
+    fn grow_pool(pool: &SenderPool) {
+        let started = pool.started.fetch_add(1, Ordering::AcqRel);
+        if started >= pool.max_workers {
+            pool.started.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        info!(
+            workers = started + 1,
+            max = pool.max_workers,
+            "noise-filter pool growing"
+        );
+        if !spawn_worker(
+            started,
+            pool.pool_tx.clone(),
+            pool.live_workers.clone(),
+            None,
+        ) {
+            pool.started.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 
     fn mark_worker_dead(live_workers: &Arc<AtomicUsize>, worker_death: &Arc<Notify>) {
         let mut current = live_workers.load(Ordering::Acquire);
@@ -215,7 +277,13 @@ pub mod implementation {
     /// Asynchronously checks out a worker sender from the pool.
     /// It will wait efficiently if the pool is empty.
     async fn get_sender() -> Result<PooledWorkerSender, Box<dyn std::error::Error + Send + Sync>> {
-        let (pool_tx, pool_rx_mutex, live_workers, worker_death) = &*SENDER_POOL;
+        let pool = &*SENDER_POOL;
+        let (pool_tx, pool_rx_mutex, live_workers, worker_death) = (
+            &pool.pool_tx,
+            &pool.pool_rx,
+            &pool.live_workers,
+            &pool.worker_death,
+        );
         loop {
             if live_workers.load(Ordering::Acquire) == 0 {
                 return Err("Noise-filter worker pool has no live workers".into());
@@ -223,6 +291,11 @@ pub mod implementation {
 
             // Lock the mutex asynchronously. The guard is Send and can be held across an await.
             let mut pool_rx = pool_rx_mutex.lock().await;
+            // No worker free right now: the pool grows (up to one worker per core) and this
+            // caller takes whichever worker frees first.
+            if pool_rx.is_empty() {
+                grow_pool(pool);
+            }
             let Some(sender) = (tokio::select! {
                 maybe_sender = pool_rx.recv() => maybe_sender,
                 _ = worker_death.notified() => continue,
@@ -522,6 +595,215 @@ pub mod implementation {
             .map_err(|_| "Worker thread panicked or channel closed while processing.")?
     }
 
+    // ── One stream's denoiser: the `/ws` uplink (RCA 2e) ──────────────────────────────────
+    //
+    // `reduce_noise_async` treats each call as a clip of its own, which suits a recording and
+    // not a live stream: a chunk shorter than `SHORT_AUDIO_DURATION` (1 s) never reaches the
+    // model (`process_audio_chunk`), the model's state belongs to whichever pool worker took
+    // the chunk, and the audio reaches the 48 kHz model at the caller's rate. A `/ws` client
+    // sends 10-100 ms chunks, so a stream gets a model instance of its own, whose state follows
+    // that stream only; its audio is resampled to the model's rate, cut into the model's hops
+    // and resampled back.
+
+    /// The server's cap on streams holding a denoiser at once (each holds one DeepFilterNet
+    /// instance on a thread of its own). Default: the number of CPUs; `0` turns the `/ws`
+    /// denoiser off for the server.
+    pub const WS_NOISE_FILTER_MAX_STREAMS_ENV: &str = "WAAV_WS_NOISE_FILTER_MAX_STREAMS";
+
+    static STREAM_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+        let max = std::env::var(WS_NOISE_FILTER_MAX_STREAMS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(num_cpus::get);
+        Arc::new(Semaphore::new(max))
+    });
+
+    /// How long one chunk may take. A chunk that takes longer turns the denoiser off for the
+    /// rest of the stream: the speech-to-text must never fall behind the caller. (Widened in a
+    /// debug build, which runs tract unoptimized.)
+    const STREAM_CHUNK_DEADLINE: Duration = if cfg!(debug_assertions) {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(250)
+    };
+
+    type StreamResult = Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+    type StreamJob = (Bytes, oneshot::Sender<StreamResult>);
+
+    /// One audio stream's DeepFilterNet: a model instance on a thread of its own (the model is
+    /// `!Send`), fed the stream's chunks in order. Dropping it ends the thread and frees its
+    /// place under [`WS_NOISE_FILTER_MAX_STREAMS_ENV`].
+    pub struct StreamDenoiser {
+        jobs: mpsc::Sender<StreamJob>,
+        bypassed: AtomicBool,
+        sample_rate: u32,
+        /// [`WARMING`] until the stream's model is built, then [`READY`] or [`FAILED`].
+        state: Arc<AtomicU8>,
+    }
+
+    const WARMING: u8 = 0;
+    const READY: u8 = 1;
+    const FAILED: u8 = 2;
+
+    impl StreamDenoiser {
+        /// A denoiser for a mono PCM16 stream at `sample_rate`. Fails when the server's streams
+        /// are all in use; the caller then goes on unfiltered.
+        ///
+        /// It returns without waiting for the stream's model: building one takes about 0.8 s on a
+        /// GB10 core in a release build (seconds in a debug build), and the session's `ready` must
+        /// not wait on it. Chunks that arrive while it builds pass through unfiltered (usually the
+        /// caller's first second, before they speak); filtering starts with the first chunk after.
+        /// A model that fails to build is said once in the log and in
+        /// `waav_degraded_total{component="ws"}`, and the stream goes on unfiltered.
+        pub async fn open(
+            sample_rate: u32,
+        ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+            let permit = STREAM_PERMITS
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| "the server's noise-filter streams are all in use")?;
+            let (jobs, mut queued) = mpsc::channel::<StreamJob>(1);
+            let state = Arc::new(AtomicU8::new(WARMING));
+            let built = state.clone();
+            std::thread::Builder::new()
+                .name("waav-ws-denoise".to_string())
+                .spawn(move || {
+                    // The stream holds its place for as long as its thread runs.
+                    let _permit = permit;
+                    let df_params = &*MODEL_PARAMS;
+                    let mut model = match DfTract::new(df_params.clone(), &create_runtime_params())
+                    {
+                        Ok(model) => model,
+                        Err(err) => {
+                            error!(error = %err, "/ws noise filter: DeepFilterNet failed to load");
+                            built.store(FAILED, Ordering::Release);
+                            return;
+                        }
+                    };
+                    let mut stream = StreamState::new(sample_rate, model.sr as u32);
+                    built.store(READY, Ordering::Release);
+                    while let Some((pcm, result_tx)) = queued.blocking_recv() {
+                        let _ = result_tx.send(stream.push(&mut model, &pcm));
+                    }
+                })?;
+            Ok(Self {
+                jobs,
+                bypassed: AtomicBool::new(false),
+                sample_rate,
+                state,
+            })
+        }
+
+        /// Wait up to `limit` for the stream's model to finish building; `true` once it is ready.
+        pub async fn wait_ready(&self, limit: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + limit;
+            loop {
+                match self.state.load(Ordering::Acquire) {
+                    READY => return true,
+                    FAILED => return false,
+                    _ if tokio::time::Instant::now() >= deadline => return false,
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        }
+
+        /// Denoise the stream's next chunk (PCM16 LE mono at the stream's rate).
+        ///
+        /// `None`: send the chunk as it came. While the stream's model is still building that is
+        /// all it means; otherwise the denoiser is off for the rest of the stream, because it
+        /// failed or fell behind once (said once, in the log and in
+        /// `waav_degraded_total{component="ws"}`). `Some` holds the filtered audio, which may
+        /// be shorter or longer than the chunk, or empty: the model works in whole hops and the
+        /// resamplers in whole blocks, so up to one block of audio waits for the next chunk.
+        pub async fn process(&self, pcm: Bytes) -> Option<Vec<u8>> {
+            if self.bypassed.load(Ordering::Acquire) {
+                return None;
+            }
+            let reason = match self.state.load(Ordering::Acquire) {
+                // Still building: this chunk goes through as it came, and the denoiser stays on.
+                WARMING => return None,
+                FAILED => "noise_filter_unavailable",
+                _ => {
+                    let (result_tx, result_rx) = oneshot::channel();
+                    match self.jobs.try_send((pcm, result_tx)) {
+                        Ok(()) => {
+                            match tokio::time::timeout(STREAM_CHUNK_DEADLINE, result_rx).await {
+                                Ok(Ok(Ok(clean))) => return Some(clean),
+                                Ok(Ok(Err(err))) => {
+                                    error!(error = %err, "noise filter failed on a /ws chunk");
+                                    "noise_filter_failed"
+                                }
+                                Ok(Err(_)) => "noise_filter_gone",
+                                Err(_) => "noise_filter_behind",
+                            }
+                        }
+                        Err(_) => "noise_filter_behind",
+                    }
+                }
+            };
+            if !self.bypassed.swap(true, Ordering::AcqRel) {
+                warn!(
+                    reason,
+                    sample_rate = self.sample_rate,
+                    "/ws noise filter off for the rest of the stream; its audio goes on unfiltered"
+                );
+                crate::core::metrics::bridge::record_degraded("ws", reason);
+            }
+            None
+        }
+    }
+
+    /// A stream's audio on its way to the model's rate and back, and the samples short of a hop.
+    struct StreamState {
+        rate: u32,
+        model_rate: u32,
+        to_model: crate::core::audio::StreamResampler,
+        from_model: crate::core::audio::StreamResampler,
+        pending: Vec<f32>,
+    }
+
+    impl StreamState {
+        fn new(rate: u32, model_rate: u32) -> Self {
+            Self {
+                rate,
+                model_rate,
+                to_model: crate::core::audio::StreamResampler::new(),
+                from_model: crate::core::audio::StreamResampler::new(),
+                pending: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, df: &mut DfTract, pcm: &[u8]) -> StreamResult {
+            let wav = simd_ops::pcm_to_float_simd(pcm);
+            match self.to_model.resample(&wav, self.rate, self.model_rate) {
+                Some(at_model) => self.pending.extend_from_slice(&at_model),
+                None => self.pending.extend_from_slice(&wav),
+            }
+
+            let hop = df.hop_size;
+            let mut enhanced = Vec::with_capacity(self.pending.len());
+            let mut out = Array2::<f32>::zeros((1, hop));
+            let mut idx = 0;
+            while idx + hop <= self.pending.len() {
+                let frame = ArrayView2::from_shape((1, hop), &self.pending[idx..idx + hop])?;
+                df.process(frame, out.view_mut())?;
+                enhanced.extend(out.iter().copied());
+                idx += hop;
+            }
+            self.pending.drain(..idx);
+            if enhanced.iter().any(|s| !s.is_finite()) {
+                return Err("DeepFilterNet produced a non-finite sample".into());
+            }
+
+            let back = self
+                .from_model
+                .resample(&enhanced, self.model_rate, self.rate);
+            Ok(simd_ops::float_to_pcm_simd(
+                back.as_deref().unwrap_or(&enhanced),
+            ))
+        }
+    }
+
     #[cfg(test)]
     mod worker_pool_tests {
         use super::*;
@@ -572,6 +854,9 @@ pub mod stub {
 }
 
 #[cfg(feature = "noise-filter")]
+pub use implementation::{StreamDenoiser, WS_NOISE_FILTER_MAX_STREAMS_ENV};
+
+#[cfg(feature = "noise-filter")]
 pub async fn reduce_noise_async(
     pcm: bytes::Bytes,
     sample_rate: u32,
@@ -592,6 +877,7 @@ mod tests {
     use super::implementation::*;
     use super::reduce_noise_async;
     use bytes::Bytes;
+    use std::time::Duration;
 
     fn create_test_pcm(samples: usize) -> Vec<u8> {
         let mut pcm = Vec::with_capacity(samples * 2);
@@ -601,6 +887,29 @@ mod tests {
             pcm.extend_from_slice(&sample.to_le_bytes());
         }
         pcm
+    }
+
+    /// The pool starts small and grows when callers find every worker busy (it used to start
+    /// one DeepFilterNet model per core on the first track, whatever the load).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_pool_grows_under_concurrent_load_and_serves_everyone() {
+        let pcm = Bytes::from(create_test_pcm(16_000));
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let pcm = pcm.clone();
+                tokio::spawn(async move { reduce_noise_async(pcm, 16_000).await })
+            })
+            .collect();
+        for call in calls {
+            let out = call.await.unwrap().expect("every caller is served");
+            assert_eq!(out.len(), pcm.len());
+        }
+        let (started, max) = pool_size_for_tests();
+        assert!(started <= max, "{started} > {max}");
+        assert!(
+            started > 2 || max == 2,
+            "8 concurrent callers should grow a pool of 2 (started {started}, max {max})"
+        );
     }
 
     #[tokio::test]
@@ -686,6 +995,74 @@ mod tests {
         assert!((PCM_TO_FLOAT_SCALE - 1.0 / 32_768.0).abs() < f32::EPSILON);
         assert_eq!(FLOAT_TO_PCM_SCALE_POS, 32_767.0);
         assert_eq!(FLOAT_TO_PCM_SCALE_NEG, 32_768.0);
+    }
+
+    /// RCA 2e: a live stream's chunks reach the model. 2 s of noisy 16 kHz speech-band audio in
+    /// 20 ms chunks comes out about as long as it went in (less what waits for a whole block),
+    /// finite, and quieter. `reduce_noise_async` returns each such chunk unchanged.
+    #[tokio::test]
+    async fn stream_denoiser_filters_20ms_chunks() {
+        let denoiser = StreamDenoiser::open(16_000)
+            .await
+            .expect("the stream opens");
+        // Opening does not wait for the model: a chunk sent at once goes through as it came, and
+        // the denoiser stays on for the chunks after the model is built.
+        let early = Bytes::from(vec![1u8, 0, 2, 0, 3, 0, 4, 0]);
+        assert_eq!(
+            denoiser.process(early).await,
+            None,
+            "passes through while the model builds"
+        );
+        assert!(
+            denoiser.wait_ready(Duration::from_secs(300)).await,
+            "the stream's model builds"
+        );
+        let mut seed = 0x2545_f491_u32;
+        let mut noisy = Vec::with_capacity(64_000);
+        for i in 0..32_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let noise = (seed as f32 / u32::MAX as f32 - 0.5) * 0.6;
+            let tone = (i as f32 * 2.0 * std::f32::consts::PI * 300.0 / 16_000.0).sin() * 0.05;
+            noisy.extend_from_slice(&(((tone + noise) * 32_767.0) as i16).to_le_bytes());
+        }
+        let mut clean = Vec::with_capacity(noisy.len());
+        for chunk in noisy.chunks(640) {
+            let out = denoiser
+                .process(Bytes::copy_from_slice(chunk))
+                .await
+                .expect("the denoiser stays on");
+            clean.extend_from_slice(&out);
+        }
+        // At most one resampler block (20 ms each way) and one hop (10 ms) wait inside.
+        assert!(
+            clean.len() + 3 * 640 >= noisy.len(),
+            "{} of {}",
+            clean.len(),
+            noisy.len()
+        );
+        assert!(clean.len() <= noisy.len());
+        let rms = |pcm: &[u8]| {
+            let samples = pcm
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as f64);
+            (samples.map(|v| v * v).sum::<f64>() / (pcm.len() / 2).max(1) as f64).sqrt()
+        };
+        // Broadband noise is most of the input's energy; the model takes most of it away.
+        assert!(
+            rms(&clean) < 0.7 * rms(&noisy),
+            "the model left the noise: rms {} of {}",
+            rms(&clean),
+            rms(&noisy)
+        );
+
+        // RCA 2e: the clip path does not filter a chunk this short.
+        let chunk = Bytes::copy_from_slice(&noisy[..640]);
+        let passed = reduce_noise_async(chunk.clone(), 16_000).await.expect("ok");
+        assert_eq!(passed, chunk.to_vec());
     }
 
     #[tokio::test]

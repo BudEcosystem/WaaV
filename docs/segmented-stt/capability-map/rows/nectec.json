@@ -1,0 +1,399 @@
+{
+  "provider_id": "nectec",
+  "provider": {
+    "aliases": [
+      "aiforthai",
+      "ai4thai",
+      "partii",
+      "partii5",
+      "partii4",
+      "nectec-stt"
+    ],
+    "default_model": "partii4",
+    "model_string": "gateway_alias",
+    "registered_in_gateway": true,
+    "availability": {
+      "status": "evaluation_only",
+      "note": "Free for study; no commercial use; uploaded audio may be reused for research."
+    },
+    "notes": "AI for Thai (Partii) speech-to-text. Registry id and aliases: gateway/src/plugin/builtin/mod.rs:1809-1810; the standardized factory that live sessions use accepts nectec, aiforthai, ai4thai, partii, partii5 and partii4 (gateway/src/core/stt/standard.rs:444-446). The provider aliases partii4 and partii5 select the provider, not the engine. The vendor has no model parameter; partii4 and partii5 are gateway-defined ids mapped to URL paths, and the client's other spellings of them (config.rs:108-117) are model_aliases on their rows. default_model is partii4, which is NOT what the code does today. Today an empty or unknown model becomes partii5 (gateway/src/core/stt/nectec/config.rs:84-85, :234-238), whose vendor endpoint returns 404, so a default-configured session cannot transcribe. The fact-check requires that partii5 stop being the default, and partii4 is the only engine whose endpoint answers, so the map resolves an empty model to it and the client default must be changed in the same step: until it is, a push-to-talk session that names no model resolves to the partii4 row and keeps today's client, which dials partii5 and fails. The gateway's only client is an HTTP client that uploads after every 30 s of received audio, at hang-up or at a client commit (client.rs:510-545); it is not a transport. The vendor's public catalogue lists Partii as inactive. Thai only."
+  },
+  "rows": [
+    {
+      "id": "nectec:partii4",
+      "match": {
+        "provider": "nectec",
+        "model": "partii4",
+        "model_aliases": [
+          "partii-4",
+          "partii_4",
+          "4",
+          "v4",
+          "legacy"
+        ]
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for live calls exists (not implemented). The only NECTEC client uploads after 30 s of received audio, cut at an arbitrary byte, or at hang-up. Before enabling, a check with a real key must show that the endpoint transcribes and what a success reply looks like; no success response has ever been observed.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 1220,
+                "basis": "own_probe",
+                "source": "providers/nectec.md:199",
+                "measured_on": "2026-10-03",
+                "conditions": "A 1 s upload rejected for want of a valid key (quota error, no transcription): TLS setup, upload and a quota check, 616 ms of it upstream."
+              }
+            ],
+            "notes": "No latency is published for the API. NECTEC's 2022 product page (https://www.nectec.or.th/en/research/ainrg/stu.html) states 'Real-time-factor: 1.5x' for Partii 4.0 without saying whether that is faster or slower than real time. The only timed request was rejected before transcription."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 384,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The response header X-RateLimit-Limit-Minute seen on 2026-10-03 without a key. Whether it applies per key, per address or per route is unknown; the per-user quotas per minute, day and month and a system-wide per-second cap are shown only after login."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart",
+            "vendor_params": [
+              {
+                "name": "outputlevel",
+                "value": "--uttlevel",
+                "in": "form"
+              },
+              {
+                "name": "outputformat",
+                "value": "--txt",
+                "in": "form"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "nectec_partii4_multipart",
+            "limit_headers": {
+              "limit_requests": "X-RateLimit-Limit-Minute"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/nectec/client.rs:213-309 (existing Partii4 request code); gateway/src/core/stt/nectec/config.rs:46, :345-355; gateway/src/core/stt/nectec/client.rs:510-545 (buffering)",
+            "notes": "The request code to lift out is NectecStt::process_partii4, a private method that builds, sends and parses in one step: POST https://api.aiforthai.in.th/partii-webapi, header Apikey, multipart fields wavfile, outputlevel and outputformat. It has never produced a transcript against the vendor, and the repository's mock test covers the other engine (gateway/tests/mock_endpoint_e2e.rs:1537-1568 uses partii5 and the gateway's own assumed reply). Defects to fix when extracting: the reply type declares status as an integer (config.rs:353-354) while the live service sends the string 'False' on errors, so a success carrying a string status would fail to parse and lose every transcript (inferred; no success body has been seen); a missing or invalid key is answered with HTTP 429 and a monthly-quota message, which the client reports as rate limiting (client.rs:277) and the circuit breaker counts as an ordinary failure; the vendor echoes the API key inside the error body, which the client logs and returns to the caller (client.rs:267-283), and the same body would be sent to a valid key that has used up its monthly allowance, so a real key can reach the logs and the WebSocket client (inferred by the fact-check); confidence is a constant 0.9 (client.rs:377); the error callback is never invoked; the request timeout is 60 s (config.rs:49). Do not retry a 429 within a turn. The audio must be 16 kHz mono PCM16 WAV; the client's own validation rejects other session rates only on one construction path (config.rs:283-309)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "request_timeout_ms": 15000,
+            "rationale": "One upload in flight instead of two (inferred): a free shared service with per-user limits per minute, day and month and a system-wide per-second cap, where throttling and a bad key both come back as HTTP 429, so bursts should be avoided. The 15 s timeout is a placeholder: nothing is published and the vendor's 'real-time factor 1.5x' may mean slower than real time, in which case the timeout must grow with segment length. The maximum segment stays at 25 s, but unlike Whisper's soft window the vendor's stated 30 s and 1 MB are hard limits on the whole padded upload (25 s plus padding is 25.9 s and about 829 kB), and the segment must be resampled to 16 kHz mono because no other format is accepted."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/nectec/client.rs:510-545 (send_audio only buffers; an upload happens after 30 s of received audio, at hang-up or at a client commit)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "NECTEC Partii transcribes uploaded files only; the vendor offers no streaming interface for this use. This gateway does not yet split a live call into utterances for it, so for a voice agent that decides when the caller has finished speaking no transcript would arrive in time to answer. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Free service with quotas that count calls per user per minute, per day and per month, plus a system-wide per-second cap; the numbers are shown only after login and may change without notice. Commercial use is prohibited; commercial terms are by contact with the vendor. No entry for this provider exists in gateway/src/config/pricing.rs (checked 2026-10-03), so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/AIforThai/aiforthai/main/aift/speech/stt/partii4.py",
+          "https://demo-service.aiforthai.in.th/assets/partii-BaUGZFO8.js",
+          "https://aiforthai.in.th/api/v1/main/content/faq",
+          "https://aiforthai.in.th/api/v1/main/user-agreement",
+          "https://aiforthai.in.th/api/v1/main/service?page=1&limit=100",
+          "https://www.nectec.or.th/en/research/ainrg/stu.html",
+          "https://pypi.org/pypi/aift/json",
+          "https://api.aiforthai.in.th/partii-webapi"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/nectec/client.rs:213-309",
+          "gateway/src/core/stt/nectec/config.rs:46",
+          "gateway/src/core/stt/nectec/config.rs:345-355",
+          "gateway/src/core/stt/nectec/client.rs:510-545",
+          "gateway/src/core/stt/nectec/config.rs:108-117",
+          "gateway/src/core/stt/nectec/config.rs:145-173",
+          "gateway/src/core/stt/nectec/client.rs:221-230"
+        ],
+        "unverified": [
+          "whether the endpoint transcribes at all for a valid key (only a quota error to a caller without a key was observed)",
+          "the success reply of the endpoint for any output option, and what it returns for silence or noise",
+          "lifecycle.status (the vendor's public service catalogue lists Partii as inactive with no endpoint; whether that is retirement or an unfinished portal migration is unknown)",
+          "transports[0].limits.max_upload_bytes and max_audio_ms (stated on the vendor's demo page; whether the API enforces them, and how it rejects a longer file, is unknown)",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) and rates (concurrent_requests) (a response header X-RateLimit-Limit-Minute: 384 was observed without a key; whether it applies per key, per address or per route is unknown, and the per-user quotas are behind the login)",
+          "transports[0].latency",
+          "billing.unit (quotas count calls, but the monthly-quota message prints fractions)",
+          "billing.min_billed_ms (the service is free; no billing rule is documented)",
+          "whether 8 kHz WAV is accepted",
+          "transports[0].segment_profile (one upload in flight and the 15 s timeout are the audit's provisional choices)",
+          "transports[0].upload.vendor_params (outputlevel and outputformat are what the gateway and the vendor's SDK send; no success reply has been seen for either)",
+          "transports[0].dialect.limit_headers (seen only on a reply to a caller without a key)"
+        ],
+        "notes": "'partii4' is a gateway-defined id (an SDK module name the gateway adopted). The vendor API has no model parameter; the engine is chosen by URL path, and this id selects /partii-webapi (config.rs:92-97). The vendor documents no streaming interface for third parties, and the file interface answers in the same request, so segmentation is the only way to use it on a call. The route answered on 2026-10-03, but only with a quota error. Thai only; no language hint, no prompt and no confidence are known. A live web demo over Socket.IO and a licensed gRPC product exist, but neither is an offered interface and the terms forbid scripted access to them. Vendor terms make this provider evaluation-only (provider availability): besides the provider note, the service may stop without notice and scripted access outside the provided channels is forbidden. This is the engine the map resolves an empty model to (provider default_model); the client itself still defaults to partii5."
+      }
+    },
+    {
+      "id": "nectec:partii5",
+      "match": {
+        "provider": "nectec",
+        "model": "partii5",
+        "model_aliases": [
+          "partii-5",
+          "partii_5",
+          "5",
+          "v5"
+        ]
+      },
+      "lifecycle": {
+        "status": "retired",
+        "replacement": [
+          "partii4"
+        ]
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/nectec/config.rs:43 (the partii5 endpoint, which answers 404); gateway/src/core/stt/nectec/client.rs:486 (the hang-up upload error is discarded)",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_model_retired",
+          "text": "The vendor no longer serves this engine: its endpoint answers 'not found' to every caller tested. Use partii4 and set the agent's turn detection to manual, or choose a streaming model from another provider."
+        }
+      },
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Free service with quotas that count calls per user per minute, per day and per month, plus a system-wide per-second cap; the numbers are shown only after login and may change without notice. Commercial use is prohibited; commercial terms are by contact with the vendor. No entry for this provider exists in gateway/src/config/pricing.rs (checked 2026-10-03), so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "probed",
+        "verified_on": "2026-10-03",
+        "verified_by": "live_probe",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.aiforthai.in.th/partii5-poc",
+          "https://raw.githubusercontent.com/AIforThai/aiforthai/main/aift/speech/stt/partii5.py",
+          "https://aiforthai.in.th/api/v1/main/service?page=1&limit=100",
+          "https://pypi.org/pypi/aift/json"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/nectec/config.rs:43",
+          "gateway/src/core/stt/nectec/config.rs:84-85",
+          "gateway/src/core/stt/nectec/config.rs:234-238",
+          "gateway/src/core/stt/http_resilience.rs:132-135",
+          "gateway/src/core/stt/nectec/client.rs:486"
+        ],
+        "probe_ref": "verify/group-10.md",
+        "unverified": [
+          "whether a caller with a valid key also gets 404 (inferred yes)",
+          "lifecycle.status (recorded as retired: the endpoint answers 404 to every caller tested and the vendor's catalogue lists Partii as inactive, but no retirement was announced and no date is known)",
+          "whether a newer endpoint replaced this one"
+        ],
+        "notes": "The vendor endpoint for this engine (POST https://api.aiforthai.in.th/partii5-poc) returned HTTP 404 from the vendor's origin server on 2026-10-03, with no key and with a bogus key, to both the audit and the fact-check. The vendor's gateway forwards the route without checking the key, so a valid key is expected to get the same 404 (inferred; not tried with a real key). 'partii5' is a gateway-defined id that selects the URL path /partii5-poc (config.rs:43, :92-97). The vendor's SDK 1.3.2 still posts there. The circuit breaker ignores HTTP 404 (gateway/src/core/stt/http_resilience.rs:132-135) and the hang-up upload error is discarded (client.rs:486), so today the failure is silent. The fact-check requires that this stop being the gateway default. provider.default_model in this file is already partii4; the client constant (config.rs:84-85) and its handling of unknown strings (config.rs:234-238) must be changed to match. Vendor terms make this provider evaluation-only (provider availability): besides the provider note, the service may stop without notice and scripted access outside the provided channels is forbidden."
+      }
+    },
+    {
+      "id": "nectec:any",
+      "match": {
+        "provider": "nectec",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for live calls exists (not implemented). The only NECTEC client uploads after 30 s of received audio, cut at an arbitrary byte, or at hang-up. Before enabling, a check with a real key must show that the endpoint transcribes and what a success reply looks like; no success response has ever been observed.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 1220,
+                "basis": "own_probe",
+                "source": "providers/nectec.md:199",
+                "measured_on": "2026-10-03",
+                "conditions": "A 1 s upload rejected for want of a valid key (quota error, no transcription): TLS setup, upload and a quota check, 616 ms of it upstream."
+              }
+            ],
+            "notes": "No latency is published for the API. NECTEC's 2022 product page (https://www.nectec.or.th/en/research/ainrg/stu.html) states 'Real-time-factor: 1.5x' for Partii 4.0 without saying whether that is faster or slower than real time. The only timed request was rejected before transcription."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 384,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The response header X-RateLimit-Limit-Minute seen on 2026-10-03 without a key. Whether it applies per key, per address or per route is unknown; the per-user quotas per minute, day and month and a system-wide per-second cap are shown only after login."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart",
+            "vendor_params": [
+              {
+                "name": "outputlevel",
+                "value": "--uttlevel",
+                "in": "form"
+              },
+              {
+                "name": "outputformat",
+                "value": "--txt",
+                "in": "form"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "nectec_partii4_multipart",
+            "limit_headers": {
+              "limit_requests": "X-RateLimit-Limit-Minute"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/nectec/client.rs:213-309 (existing Partii4 request code); gateway/src/core/stt/nectec/config.rs:46, :345-355; gateway/src/core/stt/nectec/client.rs:510-545 (buffering)",
+            "notes": "Assumed: an unknown model string is served by the Partii4 endpoint, the only one that answers. Today the client instead turns every unknown string into partii5 (config.rs:234-238), whose endpoint returns 404; the new adapter must either reject unknown ids or send them to /partii-webapi as assumed here. See the partii4 row for the request shape and the defects of the existing code."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "request_timeout_ms": 15000,
+            "rationale": "One upload in flight instead of two (inferred): a free shared service with per-user limits per minute, day and month and a system-wide per-second cap, where throttling and a bad key both come back as HTTP 429, so bursts should be avoided. The 15 s timeout is a placeholder: nothing is published and the vendor's 'real-time factor 1.5x' may mean slower than real time, in which case the timeout must grow with segment length. The maximum segment stays at 25 s, but unlike Whisper's soft window the vendor's stated 30 s and 1 MB are hard limits on the whole padded upload (25 s plus padding is 25.9 s and about 829 kB), and the segment must be resampled to 16 kHz mono because no other format is accepted."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/nectec/config.rs:234-238 (an unknown model string becomes partii5), :43 (the partii5 endpoint, which answers 404)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This model name is not one the gateway knows for NECTEC; today such a name is sent to an engine the vendor no longer serves, so no transcript would be produced. Choose partii4 and set the agent's turn detection to manual, or choose a streaming model from another provider."
+        }
+      },
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Free service with quotas that count calls per user per minute, per day and per month, plus a system-wide per-second cap; the numbers are shown only after login and may change without notice. Commercial use is prohibited; commercial terms are by contact with the vendor. No entry for this provider exists in gateway/src/config/pricing.rs (checked 2026-10-03), so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/AIforThai/aiforthai/main/aift/speech/stt/partii4.py",
+          "https://demo-service.aiforthai.in.th/assets/partii-BaUGZFO8.js"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/nectec/client.rs:213-309",
+          "gateway/src/core/stt/nectec/config.rs:46",
+          "gateway/src/core/stt/nectec/config.rs:345-355",
+          "gateway/src/core/stt/nectec/client.rs:510-545",
+          "gateway/src/core/stt/nectec/config.rs:108-117",
+          "gateway/src/core/stt/nectec/config.rs:145-173",
+          "gateway/src/core/stt/nectec/client.rs:221-230",
+          "gateway/src/core/stt/nectec/config.rs:234-238",
+          "gateway/src/core/stt/nectec/config.rs:43"
+        ],
+        "unverified": [
+          "whether the endpoint transcribes at all for a valid key (only a quota error to a caller without a key was observed)",
+          "the success reply of the endpoint for any output option, and what it returns for silence or noise",
+          "lifecycle.status (the vendor's public service catalogue lists Partii as inactive with no endpoint; whether that is retirement or an unfinished portal migration is unknown)",
+          "transports[0].limits.max_upload_bytes and max_audio_ms (stated on the vendor's demo page; whether the API enforces them, and how it rejects a longer file, is unknown)",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) and rates (concurrent_requests) (a response header X-RateLimit-Limit-Minute: 384 was observed without a key; whether it applies per key, per address or per route is unknown, and the per-user quotas are behind the login)",
+          "transports[0].latency",
+          "billing.unit (quotas count calls, but the monthly-quota message prints fractions)",
+          "billing.min_billed_ms (the service is free; no billing rule is documented)",
+          "whether 8 kHz WAV is accepted",
+          "transports[0].segment_profile (one upload in flight and the 15 s timeout are the audit's provisional choices)",
+          "transports[0].upload.vendor_params (outputlevel and outputformat are what the gateway and the vendor's SDK send; no success reply has been seen for either)",
+          "transports[0].dialect.limit_headers (seen only on a reply to a caller without a key)"
+        ],
+        "notes": "Provider default. The vendor offers only a synchronous file interface, so the default is file upload. The vendor has no model parameter, so an unknown string names no vendor product; this row treats it like partii4. Vendor terms make this provider evaluation-only (provider availability): besides the provider note, the service may stop without notice and scripted access outside the provided channels is forbidden."
+      }
+    }
+  ]
+}

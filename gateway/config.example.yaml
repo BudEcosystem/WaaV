@@ -92,7 +92,8 @@ providers:
   # 150+ voices across 35+ languages, 20+ speaking styles
   # 12 regional endpoints for data residency and latency optimization
   # Get from Murf dashboard: https://murf.ai/api/docs
-  murf_api_key: ""                               # ENV: MURF_API_KEY
+  # Environment only: set MURF_API_KEY. The provider reads it itself; this file has no
+  # `murf_api_key` key (one would be reported as unknown and ignored).
 
   # WellSaid Labs API key (used for TTS)
   # TTS: HTTP streaming with premium AI voices, 10x faster than real-time
@@ -100,7 +101,8 @@ providers:
   # 200+ voice avatars across multiple styles (Narration, Promo, Conversational)
   # SOC2 certified, GDPR compliant, EU AI Act-ready
   # Get from WellSaid dashboard: https://wellsaid.io
-  wellsaid_api_key: ""                           # ENV: WELLSAID_API_KEY
+  # Environment only: set WELLSAID_API_KEY. The provider reads it itself; this file has no
+  # `wellsaid_api_key` key (one would be reported as unknown and ignored).
 
   # Resemble AI API key (used for TTS)
   # TTS: HTTP streaming with voice cloning and 149+ languages
@@ -108,7 +110,8 @@ providers:
   # Features: Voice cloning (10s rapid, 10min professional), Speech-to-Speech, Deepfake detection
   # Supports paralinguistic tags [cough], [laugh] with Turbo model
   # Get from Resemble AI dashboard: https://app.resemble.ai
-  resemble_api_key: ""                           # ENV: RESEMBLE_API_KEY
+  # Environment only: set RESEMBLE_API_KEY. The provider reads it itself; this file has no
+  # `resemble_api_key` key (one would be reported as unknown and ignored).
 
   # Speechify API key (used for TTS)
   # TTS: HTTP streaming with 50+ languages and 1000+ voices
@@ -116,7 +119,8 @@ providers:
   # Features: Voice cloning from 10-30s audio, SSML support, loudness normalization
   # Pricing: $10/1M characters, 50K free tier
   # Get from Speechify console: https://console.sws.speechify.com
-  speechify_api_key: ""                          # ENV: SPEECHIFY_API_KEY
+  # Environment only: set SPEECHIFY_API_KEY. The provider reads it itself; this file has no
+  # `speechify_api_key` key (one would be reported as unknown and ignored).
 
   # Unreal Speech API key (used for TTS)
   # TTS: HTTP streaming with ultra-low latency (~300ms TTFA)
@@ -124,7 +128,8 @@ providers:
   # Features: Speed control (-1.0 to 1.0), Pitch control (0.5 to 1.5), Bitrate (16k-320k)
   # Pricing: Free tier (250K chars/mo), $49-$4999/mo paid plans, 11x cheaper than ElevenLabs
   # Get from Unreal Speech dashboard: https://unrealspeech.com
-  unrealspeech_api_key: ""                       # ENV: UNREALSPEECH_API_KEY
+  # Environment only: set UNREALSPEECH_API_KEY. The provider reads it itself; this file has no
+  # `unrealspeech_api_key` key (one would be reported as unknown and ignored).
 
   # Speechmatics API key (used for STT and TTS)
   # STT: Real-time WebSocket streaming with 55+ languages
@@ -287,6 +292,7 @@ auth:
   # Legacy single-secret alias (ignored when api_secrets is non-empty):
   # api_secret: "sk_test_legacy_123456"       # ENV: AUTH_API_SECRET (AUTH_API_SECRET_ID optional)
   timeout_seconds: 5                          # ENV: AUTH_TIMEOUT_SECONDS
+  # Query-string credentials (`?token=`) are env-only: AUTH_QUERY_TOKEN=allow (default) or deny.
 
 # SIP configuration (optional)
 # Used for SIP trunk integration and webhook forwarding

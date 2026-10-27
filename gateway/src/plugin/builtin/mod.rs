@@ -107,7 +107,12 @@ fn openai_stt_metadata() -> ProviderMetadata {
     ProviderMetadata::stt("openai", "OpenAI Whisper")
         .with_description("OpenAI Whisper API for speech recognition")
         .with_features(["word-timestamps", "translation"])
-        .with_models(["whisper-1"])
+        .with_models([
+            "gpt-transcribe",
+            "gpt-4o-transcribe",
+            "gpt-4o-mini-transcribe",
+            "whisper-1",
+        ])
 }
 
 fn assemblyai_stt_metadata() -> ProviderMetadata {

@@ -117,6 +117,42 @@ impl DAGDefinition {
         })
     }
 
+    /// Give every `tts_provider` node that no edge reads an `audio_output` to the session, so a
+    /// graph that ends in speech (`stt → llm → tts`) is heard. A `tts_provider` returns its audio
+    /// as its result; only an output node delivers to the client, so without this the audio of
+    /// such a graph was synthesized and dropped. Returns the ids of the nodes added.
+    pub fn route_unread_speech(&mut self) -> Vec<String> {
+        let read: std::collections::HashSet<&str> =
+            self.edges.iter().map(|edge| edge.from.as_str()).collect();
+        let unread: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.node_type, NodeType::TtsProvider { .. }))
+            .filter(|node| !read.contains(node.id.as_str()))
+            .map(|node| node.id.clone())
+            .collect();
+        let mut added = Vec::with_capacity(unread.len());
+        for tts in unread {
+            let mut id = format!("{tts}__audio_output");
+            while self.nodes.iter().any(|node| node.id == id) {
+                id.push('_');
+            }
+            let destination = OutputDestination::WebSocket;
+            self.nodes.push(NodeDefinition::new(
+                &id,
+                NodeType::AudioOutput { destination },
+            ));
+            self.edges.push(EdgeDefinition::new(&tts, &id));
+            // The output node is where the run now ends.
+            match self.exit_nodes.iter_mut().find(|exit| **exit == tts) {
+                Some(exit) => *exit = id.clone(),
+                None => self.exit_nodes.push(id.clone()),
+            }
+            added.push(id);
+        }
+        added
+    }
+
     /// Add a node to the DAG
     pub fn add_node(&mut self, node: NodeDefinition) -> &mut Self {
         self.nodes.push(node);
@@ -472,7 +508,11 @@ pub struct DAGConfig {
 }
 
 /// Definition for a single node in the DAG
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (below): a node carries client-supplied credentials (`api_key`,
+/// `headers`, `config.api_key`) as plain strings, and a derived `Debug` printed them into
+/// `waav_gateway::dag` debug logs.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NodeDefinition {
     /// Unique node identifier within this DAG
     pub id: String,
@@ -506,6 +546,29 @@ pub struct NodeDefinition {
 
 fn default_max_retries() -> u32 {
     3
+}
+
+impl std::fmt::Debug for NodeDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::observability::trace_redact::redacted_debug("NodeDefinition", self, f)
+    }
+}
+
+impl std::fmt::Debug for NodeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::observability::trace_redact::redacted_debug("NodeType", self, f)
+    }
+}
+
+impl NodeType {
+    /// The wire `type` tag (`llm_endpoint`, `stt_provider`, …): what a log line should name.
+    /// Never prints a field value.
+    pub fn type_tag(&self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
 }
 
 impl NodeDefinition {
@@ -545,7 +608,9 @@ impl NodeDefinition {
 ///   type: stt_provider
 ///   provider: deepgram
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (below) and redacts credentials; use [`NodeType::type_tag`] in logs.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeType {
     /// Audio input from WebSocket/LiveKit
@@ -1132,5 +1197,47 @@ exit_nodes:
         dag.exit_nodes = vec!["node1".to_string()];
         let errors = dag.validate_structure().unwrap_err();
         assert!(errors.iter().any(|e| e.contains("empty ID")));
+    }
+
+    /// `stt → llm → tts` with no output node: the speech gets an `audio_output` (and the run
+    /// ends there); a graph that already routes its speech is left alone.
+    #[test]
+    fn unread_speech_is_routed_to_the_session() {
+        let tts = || NodeType::TtsProvider {
+            provider: "openai".to_string(),
+            voice_id: None,
+            model: None,
+        };
+        let mut dag = DAGDefinition::new("t", "T");
+        dag.add_node(NodeDefinition::new("in", NodeType::TextInput));
+        dag.add_node(NodeDefinition::new("tts", tts()));
+        dag.edges.push(EdgeDefinition::new("in", "tts"));
+        dag.entry_node = "in".to_string();
+        dag.exit_nodes = vec!["tts".to_string()];
+
+        assert_eq!(
+            dag.route_unread_speech(),
+            vec!["tts__audio_output".to_string()]
+        );
+        assert_eq!(dag.exit_nodes, vec!["tts__audio_output".to_string()]);
+        assert!(
+            dag.edges
+                .iter()
+                .any(|e| e.from == "tts" && e.to == "tts__audio_output")
+        );
+        assert!(dag.validate_structure().is_ok());
+        // Idempotent: the speech is read now.
+        assert!(dag.route_unread_speech().is_empty());
+
+        let mut routed = DAGDefinition::new("t", "T");
+        routed.add_node(NodeDefinition::new("tts", tts()));
+        routed.add_node(NodeDefinition::new(
+            "out",
+            NodeType::AudioOutput {
+                destination: OutputDestination::WebSocket,
+            },
+        ));
+        routed.edges.push(EdgeDefinition::new("tts", "out"));
+        assert!(routed.route_unread_speech().is_empty());
     }
 }

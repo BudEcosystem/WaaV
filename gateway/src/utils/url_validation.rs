@@ -33,105 +33,20 @@ pub enum UrlValidationError {
     RawIpNotAllowed,
 }
 
-/// Checks if an IPv4 address is private/internal
-///
-/// Private addresses include:
-/// - Loopback (127.0.0.0/8)
-/// - Private (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-/// - Link-local (169.254.0.0/16)
-/// - Broadcast (255.255.255.255)
-/// - Documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
-/// - Unspecified (0.0.0.0)
-/// - Shared (100.64.0.0/10 - CGNAT)
+/// Checks if an IPv4 address is private/internal (the shared rule: see [`is_private_ip`]).
 pub fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
-    // Loopback (127.0.0.0/8)
-    if ip.is_loopback() {
-        return true;
-    }
-    // Private (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-    if ip.is_private() {
-        return true;
-    }
-    // Link-local (169.254.0.0/16)
-    if ip.is_link_local() {
-        return true;
-    }
-    // Broadcast (255.255.255.255)
-    if ip.is_broadcast() {
-        return true;
-    }
-    // Unspecified (0.0.0.0)
-    if ip.is_unspecified() {
-        return true;
-    }
-    // Documentation addresses (TEST-NET-1, TEST-NET-2, TEST-NET-3)
-    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-    if ip.is_documentation() {
-        return true;
-    }
-    // Shared address space (CGNAT) 100.64.0.0/10
-    let octets = ip.octets();
-    if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
-        return true;
-    }
-    // Reserved for benchmarking 198.18.0.0/15
-    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
-        return true;
-    }
-    false
+    is_private_ip(&IpAddr::V4(*ip))
 }
 
-/// Checks if an IPv6 address is private/internal
-///
-/// Private addresses include:
-/// - Loopback (::1)
-/// - Unspecified (::)
-/// - Link-local (fe80::/10)
-/// - Unique local (fc00::/7)
-/// - Documentation (2001:db8::/32)
-/// - IPv4-mapped private addresses
+/// Checks if an IPv6 address is private/internal (the shared rule: see [`is_private_ip`]).
 pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
-    // Loopback (::1)
-    if ip.is_loopback() {
-        return true;
-    }
-    // Unspecified (::)
-    if ip.is_unspecified() {
-        return true;
-    }
-    // Check segments for various private ranges
-    let segments = ip.segments();
-
-    // Link-local (fe80::/10) - first 10 bits are 1111111010
-    if segments[0] & 0xFFC0 == 0xFE80 {
-        return true;
-    }
-
-    // Unique local address (fc00::/7) - first 7 bits are 1111110
-    if segments[0] & 0xFE00 == 0xFC00 {
-        return true;
-    }
-
-    // Documentation (2001:db8::/32)
-    if segments[0] == 0x2001 && segments[1] == 0x0DB8 {
-        return true;
-    }
-
-    // IPv4-mapped IPv6 addresses (::ffff:0:0/96)
-    // Check if it maps to a private IPv4
-    if let Some(ipv4) = ip.to_ipv4_mapped() {
-        return is_private_ipv4(&ipv4);
-    }
-
-    false
+    is_private_ip(&IpAddr::V6(*ip))
 }
 
-/// Checks if an IP address is private/internal
+/// Checks if an IP address is private/internal: not on the public internet by the one rule WaaV
+/// uses everywhere (`waav_segmented_stt::net::is_public_ip`).
 pub fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ipv4) => is_private_ipv4(ipv4),
-        IpAddr::V6(ipv6) => is_private_ipv6(ipv6),
-    }
+    !waav_segmented_stt::net::is_public_ip(ip)
 }
 
 /// Validates a webhook URL for SSRF protection

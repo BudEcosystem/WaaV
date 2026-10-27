@@ -429,7 +429,9 @@ mod interaction;
 pub mod messages;
 pub mod processor;
 mod realtime_voice;
+pub mod segmented_session;
 pub mod state;
+pub mod stt_contract;
 
 #[cfg(test)]
 mod tests;

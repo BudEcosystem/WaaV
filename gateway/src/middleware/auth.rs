@@ -1,4 +1,4 @@
-use crate::auth::{Auth, filter_headers, match_api_secret_id};
+use crate::auth::{Auth, filter_headers};
 use crate::errors::auth_error::AuthError;
 use crate::state::AppState;
 use axum::{
@@ -10,18 +10,59 @@ use axum::{
 use http_body_util::BodyExt;
 use std::sync::Arc;
 
+/// Env var: `allow` (default) or `deny` `?token=` credentials. Query strings land in proxy and
+/// access logs and in browser history, so an operator may refuse them; browsers then authenticate
+/// a WebSocket with the `openai-insecure-api-key.<key>` subprotocol (or `/ws` first-message auth).
+pub const QUERY_TOKEN_ENV: &str = "AUTH_QUERY_TOKEN";
+
+/// `allow` / `deny`; anything else is refused at parse (the caller fails closed).
+pub fn parse_query_token_policy(value: Option<&str>) -> Result<bool, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(false),
+        Some(v) if v.is_empty() || v == "allow" => Ok(false),
+        Some(v) if v == "deny" => Ok(true),
+        Some(v) => Err(format!(
+            "{QUERY_TOKEN_ENV} must be allow or deny, got '{v}'"
+        )),
+    }
+}
+
+/// Whether `?token=` is refused (`AUTH_QUERY_TOKEN=deny`). Read once; a malformed value refuses
+/// (a security switch an operator set must not silently mean "allow").
+fn query_tokens_denied() -> bool {
+    static DENIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DENIED.get_or_init(|| {
+        parse_query_token_policy(std::env::var(QUERY_TOKEN_ENV).ok().as_deref()).unwrap_or_else(
+            |e| {
+                tracing::error!(error = %e, "refusing query-string credentials (fail closed)");
+                true
+            },
+        )
+    })
+}
+
 /// Extract authentication token from request
 ///
-/// Supports multiple token sources for browser/WebSocket compatibility:
-/// 1. Authorization header: `Authorization: Bearer <token>` (preferred)
-/// 2. Query parameter: `?token=<token>` (for WebSocket connections)
-///
-/// # Arguments
-/// * `request` - The incoming HTTP request
-///
-/// # Returns
-/// * `Result<String, AuthError>` - The extracted token or an error
+/// Token sources, in order:
+/// 1. `Authorization: Bearer <token>` (preferred)
+/// 2. the `openai-insecure-api-key.<token>` WebSocket subprotocol — what a browser can send on a
+///    WebSocket (it cannot set headers), the convention OpenAI's realtime clients use
+/// 3. `?token=<token>`, unless `AUTH_QUERY_TOKEN=deny` (then any `token` query parameter is
+///    refused, even beside a header)
 fn extract_token(request: &Request) -> Result<String, AuthError> {
+    extract_token_with(request, query_tokens_denied())
+}
+
+fn extract_token_with(request: &Request, query_denied: bool) -> Result<String, AuthError> {
+    let query_token = request.uri().query().and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "token")
+            .map(|(_, value)| value.to_string())
+    });
+    if query_denied && query_token.is_some() {
+        return Err(AuthError::QueryTokenRefused);
+    }
+
     // Try Authorization header first (preferred method)
     if let Some(auth_header) = request.headers().get("authorization") {
         let auth_str = auth_header
@@ -35,18 +76,49 @@ fn extract_token(request: &Request) -> Result<String, AuthError> {
         return Err(AuthError::InvalidAuthHeader);
     }
 
+    // A browser WebSocket: the key rides a subprotocol (`realtime, openai-insecure-api-key.<k>`).
+    if let Some(token) =
+        crate::handlers::openai_realtime::handshake::offered_subprotocols(request.headers())
+            .iter()
+            .find_map(|p| {
+                p.strip_prefix(crate::handlers::openai_realtime::handshake::KEY_SUBPROTOCOL_PREFIX)
+                    .filter(|k| !k.trim().is_empty())
+                    .map(str::to_string)
+            })
+    {
+        tracing::debug!("Token extracted from the WebSocket subprotocol");
+        return Ok(token);
+    }
+
     // Try query parameter (for WebSocket browser connections)
-    if let Some(query) = request.uri().query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            if key == "token" {
-                tracing::debug!("Token extracted from query parameter");
-                return Ok(value.to_string());
-            }
-        }
+    if let Some(token) = query_token {
+        tracing::debug!("Token extracted from query parameter");
+        return Ok(token);
     }
 
     // No token found
     Err(AuthError::MissingAuthHeader)
+}
+
+/// Whether a request's body is JSON for the auth responder: no `Content-Type` (the historical
+/// default: such a body is parsed as JSON, and refused when it is not), or a JSON media type
+/// (`application/json`, `application/*+json`).
+fn declares_json_body(headers: &axum::http::HeaderMap) -> bool {
+    match headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        None => true,
+        Some(ct) => {
+            let essence = ct
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            essence == "application/json" || essence.ends_with("+json")
+        }
+    }
 }
 
 fn parse_auth_request_body(body_bytes: &[u8]) -> Result<serde_json::Value, AuthError> {
@@ -135,8 +207,10 @@ async fn authenticate_request(
         Ok(t) => t,
         Err(e) => {
             // For WebSocket connections, allow deferred auth (first-message auth)
-            // This enables browser clients to authenticate after connection
-            if request_path == "/ws" {
+            // This enables browser clients to authenticate after connection. Only when NO
+            // credential was offered: a malformed `Authorization` header or a refused `?token=`
+            // used to fall through to an unauthenticated pending session instead of a 401.
+            if request_path == "/ws" && matches!(e, AuthError::MissingAuthHeader) {
                 tracing::info!(
                     path = %request_path,
                     "WebSocket connection without token, enabling first-message auth"
@@ -214,32 +288,47 @@ async fn authenticate_request(
         };
     }
 
-    // Check authentication mode and validate accordingly
-    // Priority: API secret mode first (simpler), then JWT mode
-    if state.config.has_api_secret_auth() {
-        // API Secret authentication mode - constant-time comparison
-        if let Some(secret_id) = match_api_secret_id(&token, &state.config.auth_api_secrets) {
-            tracing::info!(
-                method = %request_method,
-                path = %request_path,
-                auth_id = %secret_id,
-                "API secret authentication successful"
-            );
-            request.extensions_mut().insert(Auth::new(secret_id));
-            return Ok(next.run(request).await);
-        } else {
-            tracing::warn!(
-                method = %request_method,
-                path = %request_path,
-                "API secret authentication failed: token mismatch"
-            );
-            return Err(AuthError::Unauthorized("Invalid API secret".to_string()));
-        }
+    // Standalone authenticators, in the order `AUTH_MODE` sets (default `chain`): an API secret
+    // first, then — for any bearer that is not one — the external auth responder. A secret
+    // mismatch used to answer 401 here even with AUTH_SERVICE_URL configured, so the responder
+    // was never called (the documented "both methods can coexist" did not).
+    let try_responder = state.auth_policy.responder_active(&state.config);
+
+    // Without a responder, or for a body that is not JSON (a multipart upload to
+    // /v1/audio/transcriptions, raw audio), the shared standalone authenticator: the responder
+    // judges the bearer by the request's method, path and headers — Content-Type and
+    // Content-Length among them — and the body streams to the handler unread. A non-JSON body used
+    // to be parsed as JSON for the responder and refused with 400 before the responder was asked,
+    // so no transcription upload could pass a responder; and a large body was buffered whole
+    // before anyone had authenticated. The handlers that parse JSON refuse another content type
+    // themselves, so the responder and the handler cannot disagree about what was sent.
+    if !try_responder || !declares_json_body(request.headers()) {
+        let auth = crate::auth::standalone::authenticate_bearer(
+            &state,
+            &token,
+            request.headers(),
+            &request_path,
+            &request_method,
+        )
+        .await?;
+        request.extensions_mut().insert(auth);
+        return Ok(next.run(request).await);
+    }
+
+    // A JSON body: an API secret first, then the responder, which sees the parsed body.
+    if let Some(auth) = crate::auth::standalone::secret_auth(&state, &token) {
+        tracing::info!(
+            method = %request_method,
+            path = %request_path,
+            auth_id = ?auth.id,
+            "API secret authentication successful"
+        );
+        request.extensions_mut().insert(auth);
+        return Ok(next.run(request).await);
     }
 
     // JWT authentication mode - validate with external auth service
-    if state.config.has_jwt_auth() {
-        // Get the auth client from state
+    {
         let auth_client = state
             .auth_client
             .as_ref()
@@ -301,11 +390,6 @@ async fn authenticate_request(
                 Err(e)
             }
         }
-    } else {
-        // No authentication method configured
-        Err(AuthError::ConfigError(
-            "Authentication required but no auth method configured".to_string(),
-        ))
     }
 }
 
@@ -348,6 +432,90 @@ mod tests {
             parsed,
             serde_json::json!({"text": "Hello", "metadata": {"x": 1}})
         );
+    }
+
+    fn request(uri: &str, headers: &[(&str, &str)]) -> Request {
+        let mut b = Request::builder().uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn a_browser_websocket_authenticates_with_the_key_subprotocol() {
+        let r = request(
+            "/realtime",
+            &[(
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.sk-browser",
+            )],
+        );
+        assert_eq!(extract_token_with(&r, false).unwrap(), "sk-browser");
+        // The header still wins; an empty subprotocol key is no key.
+        let r = request(
+            "/ws",
+            &[
+                ("authorization", "Bearer sk-header"),
+                (
+                    "sec-websocket-protocol",
+                    "openai-insecure-api-key.sk-browser",
+                ),
+            ],
+        );
+        assert_eq!(extract_token_with(&r, false).unwrap(), "sk-header");
+        let r = request(
+            "/ws",
+            &[(
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.",
+            )],
+        );
+        assert!(matches!(
+            extract_token_with(&r, false),
+            Err(AuthError::MissingAuthHeader)
+        ));
+    }
+
+    #[test]
+    fn a_query_token_is_accepted_by_default_and_refused_when_denied() {
+        let r = request("/ws?token=sk-query", &[]);
+        assert_eq!(extract_token_with(&r, false).unwrap(), "sk-query");
+        assert!(matches!(
+            extract_token_with(&r, true),
+            Err(AuthError::QueryTokenRefused)
+        ));
+        // Refused even beside a valid header: the key already landed in a log.
+        let r = request(
+            "/ws?token=sk-query",
+            &[("authorization", "Bearer sk-header")],
+        );
+        assert!(matches!(
+            extract_token_with(&r, true),
+            Err(AuthError::QueryTokenRefused)
+        ));
+        assert_eq!(parse_query_token_policy(Some(" DENY ")), Ok(true));
+        assert_eq!(parse_query_token_policy(None), Ok(false));
+        assert!(parse_query_token_policy(Some("no")).is_err());
+    }
+
+    #[test]
+    fn only_a_json_or_untyped_body_is_parsed_for_the_responder() {
+        use axum::http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
+        let with = |ct: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
+            h
+        };
+        assert!(declares_json_body(&HeaderMap::new()));
+        assert!(declares_json_body(&with("application/json")));
+        assert!(declares_json_body(&with("Application/JSON; charset=utf-8")));
+        assert!(declares_json_body(&with("application/merge-patch+json")));
+        assert!(!declares_json_body(&with(
+            "multipart/form-data; boundary=x"
+        )));
+        assert!(!declares_json_body(&with("audio/wav")));
+        assert!(!declares_json_body(&with("application/octet-stream")));
     }
 
     #[test]

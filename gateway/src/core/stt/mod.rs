@@ -9,6 +9,8 @@ mod base;
 pub mod batch;
 pub mod bhashini;
 pub mod cartesia;
+/// A deployment's data region and retention, carried to every vendor client (Release 5).
+pub mod data_settings;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod fpt_ai;
@@ -32,6 +34,10 @@ pub mod revai;
 pub mod reverie;
 pub mod sarvam;
 pub mod sberdevices;
+/// Segmented speech-to-text: live calls on models that accept only a finished file.
+pub mod segmented;
+/// Speech events, admission, flush outcomes and facts a gateway-endpointed provider reports.
+pub mod speech_activity;
 pub mod speechmatics;
 /// Standardized capability-rich STT config (W1 keystone, additive).
 pub mod standard;

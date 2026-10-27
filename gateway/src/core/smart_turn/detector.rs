@@ -421,16 +421,8 @@ impl SmartTurnDetector {
             anyhow::bail!("Configured model path does not exist: {:?}", path);
         }
 
-        // Check standard locations
-        let possible_paths: [PathBuf; 3] = [
-            PathBuf::from("models/smart_turn.onnx"),
-            PathBuf::from("./smart_turn.onnx"),
-            dirs::cache_dir()
-                .unwrap_or_default()
-                .join("waav")
-                .join("models")
-                .join("smart_turn.onnx"),
-        ];
+        // Check standard locations (the image bakes the model under `$CACHE_PATH/models`).
+        let possible_paths = crate::core::model_dir::model_candidates("smart_turn.onnx");
 
         for path in &possible_paths {
             if path.exists() {
@@ -443,10 +435,7 @@ impl SmartTurnDetector {
         let model_url = smart_turn_model_download_url(config.model_url.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let cache_dir: PathBuf = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("waav")
-            .join("models");
+        let cache_dir: PathBuf = crate::core::model_dir::model_cache_dir();
 
         tokio::fs::create_dir_all(&cache_dir)
             .await
@@ -708,11 +697,9 @@ impl SmartTurnDetector {
     /// the session-teardown budget in the WS handler: if a wedged inference holds
     /// this lock past the budget, teardown warns and proceeds, and the inference
     /// thread runs to natural completion (detached) rather than hanging the
-    /// session. Inference stays inline (not `spawn_blocking`) on purpose — it is a
-    /// ~12 ms hot-path step and the offload overhead would cost more than it saves.
+    /// session. The inference runs on the blocking pool ([`run_session`]): inline it held an
+    /// async worker for its ~12 ms, which under load delayed every other socket on that worker.
     async fn run_inference(&mut self, input_data: &[f32]) -> Result<f32> {
-        let mut session = self.session.lock().await;
-
         let max_frames = self.config.max_frames;
         let n_mels = self.config.n_mels;
 
@@ -732,66 +719,23 @@ impl SmartTurnDetector {
             }
         }
 
-        // Create input tensor: shape [1, n_mels, max_frames] = [1, 80, 800]
-        // This matches the Smart Turn v3 model's expected input format
-        //
-        // Note: Clone is required here because ort::Tensor::from_array requires owned data.
-        // The ort crate only implements OwnedTensorArrayData for (shape, Box<[T]>), (shape, Vec<T>),
-        // and owned ArrayBase - not for ArrayView. This costs ~256KB per inference.
-        //
-        // We still benefit from pre-allocation because:
-        // 1. The transpose operation reuses transpose_buffer (no allocation there)
-        // 2. The clone is from a contiguous buffer (cache-friendly)
-        // 3. Alternative APIs (spawn_blocking + raw pointers) have higher overhead
-        let input_tensor = ort::value::Tensor::from_array((
-            [1usize, n_mels, max_frames],
-            self.transpose_buffer.clone().into_boxed_slice(),
-        ))?;
-
-        // Run inference
-        let outputs = session.run(ort::inputs![
-            self.input_name.as_str() => input_tensor
-        ])?;
-
-        // Extract output
-        let output_tensor = outputs
-            .get(self.output_name.as_str())
-            .context("Missing output from model")?;
-
-        let (_shape, data) = output_tensor
-            .try_extract_tensor::<f32>()
-            .context("Failed to extract output tensor")?;
-
-        if data.is_empty() {
-            warn!("Model returned empty output, using fallback");
-            return Ok(0.0);
-        }
-
-        // Get the probability value
-        // Smart Turn v3 model outputs a single logit value that needs sigmoid
-        // to convert to a probability in [0, 1]
-        let probability = if data.len() == 1 {
-            // Single logit output - always apply sigmoid
-            // The model outputs logits (raw values), not probabilities
-            let logit = data[0];
-            1.0 / (1.0 + (-logit).exp())
-        } else if data.len() == 2 {
-            // Binary classification logits - apply softmax
-            let continue_logit = data[0];
-            let end_logit = data[1];
-            let max_logit = continue_logit.max(end_logit);
-            let exp_continue = (continue_logit - max_logit).exp();
-            let exp_end = (end_logit - max_logit).exp();
-            exp_end / (exp_continue + exp_end)
-        } else {
-            // Unexpected output format - return error instead of risking panic
-            anyhow::bail!(
-                "Unexpected model output size: {} (expected 1 or 2 values)",
-                data.len()
-            );
-        };
-
-        Ok(probability)
+        // ort::Tensor::from_array needs owned data, so the transposed frames are copied (~256 KB)
+        // into the blocking task, which owns them and the session lock for the call.
+        let frames = self.transpose_buffer.clone().into_boxed_slice();
+        let input_name = self.input_name.clone();
+        let output_name = self.output_name.clone();
+        let session = Arc::clone(&self.session).lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            run_session(
+                session,
+                input_name,
+                output_name,
+                [1usize, n_mels, max_frames],
+                frames,
+            )
+        })
+        .await
+        .context("Smart-Turn inference task failed")?
     }
 
     /// Predicts from a flattened mel spectrogram array.
@@ -1027,6 +971,65 @@ impl SmartTurnDetectorBuilder {
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// One Smart-Turn inference, on a blocking-pool thread: the ~12 ms ONNX call used to run inline
+/// on an async worker, so under load (16 talking sessions on 20 cores) it stalled every socket
+/// that worker served — Gaia measured a 319 ms p50 against the 15 ms target. `spawn_blocking`
+/// costs tens of microseconds.
+fn run_session(
+    mut session: tokio::sync::OwnedMutexGuard<Session>,
+    input_name: String,
+    output_name: String,
+    shape: [usize; 3],
+    frames: Box<[f32]>,
+) -> Result<f32> {
+    let input_tensor = ort::value::Tensor::from_array((shape, frames))?;
+
+    // Run inference
+    let outputs = session.run(ort::inputs![
+        input_name.as_str() => input_tensor
+    ])?;
+
+    // Extract output
+    let output_tensor = outputs
+        .get(output_name.as_str())
+        .context("Missing output from model")?;
+
+    let (_shape, data) = output_tensor
+        .try_extract_tensor::<f32>()
+        .context("Failed to extract output tensor")?;
+
+    if data.is_empty() {
+        warn!("Model returned empty output, using fallback");
+        return Ok(0.0);
+    }
+
+    // Get the probability value
+    // Smart Turn v3 model outputs a single logit value that needs sigmoid
+    // to convert to a probability in [0, 1]
+    let probability = if data.len() == 1 {
+        // Single logit output - always apply sigmoid
+        // The model outputs logits (raw values), not probabilities
+        let logit = data[0];
+        1.0 / (1.0 + (-logit).exp())
+    } else if data.len() == 2 {
+        // Binary classification logits - apply softmax
+        let continue_logit = data[0];
+        let end_logit = data[1];
+        let max_logit = continue_logit.max(end_logit);
+        let exp_continue = (continue_logit - max_logit).exp();
+        let exp_end = (end_logit - max_logit).exp();
+        exp_end / (exp_continue + exp_end)
+    } else {
+        // Unexpected output format - return error instead of risking panic
+        anyhow::bail!(
+            "Unexpected model output size: {} (expected 1 or 2 values)",
+            data.len()
+        );
+    };
+
+    Ok(probability)
+}
 
 #[cfg(test)]
 mod tests {

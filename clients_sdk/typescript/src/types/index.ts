@@ -6,6 +6,7 @@
 export type {
   STTConfig,
   TTSConfig,
+  TranscriptionMode,
   Pronunciation,
   LiveKitConfig,
   SessionConfig,
@@ -66,6 +67,11 @@ export type {
   TTSPlaybackCompleteMessage,
   ErrorMessage,
   SIPTransferErrorMessage,
+  ReadyStt,
+  SttNotice,
+  VadEventKind,
+  VadEventMessage,
+  SttWarningMessage,
   OutgoingMessage,
 } from './messages.js';
 export {

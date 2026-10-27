@@ -662,6 +662,15 @@ impl TTSProvider {
                     return;
                 }
 
+                // WaaV Infer marks a reply its length bound cut off: the audio is real but the end of the
+                // text was never spoken. Surface it instead of passing a short reply off as complete.
+                if engine_truncated_reply(response.headers()) {
+                    let provider = request_builder.get_config().provider.clone();
+                    warn!(%provider, "TTS reply truncated by the inference engine's length bound: the end of the text was not spoken");
+                    metrics::counter!("waav_gateway_tts_truncated_total", "provider" => provider)
+                        .increment(1);
+                }
+
                 let response_content_type = response
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
@@ -1682,6 +1691,15 @@ pub(crate) fn classify_tts_status(
     }
 }
 
+/// Whether an inference server flagged this speech reply as cut off at its length bound (`x-waav-truncated:
+/// true`, WaaV Infer's REST twin of its `truncated` stream terminal).
+fn engine_truncated_reply(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("x-waav-truncated")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1916,5 +1934,15 @@ mod tests {
             classify_tts_status("x", s(503), "down".into(), None),
             TTSError::ProviderError(_)
         ));
+    }
+
+    #[test]
+    fn engine_truncated_reply_reads_the_infer_header() {
+        let mut h = reqwest::header::HeaderMap::new();
+        assert!(!engine_truncated_reply(&h), "no header: a complete reply");
+        h.insert("x-waav-truncated", "true".parse().unwrap());
+        assert!(engine_truncated_reply(&h));
+        h.insert("x-waav-truncated", "false".parse().unwrap());
+        assert!(!engine_truncated_reply(&h));
     }
 }

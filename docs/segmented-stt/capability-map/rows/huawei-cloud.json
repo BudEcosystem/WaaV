@@ -1,0 +1,3191 @@
+{
+  "provider_id": "huawei-cloud",
+  "provider": {
+    "aliases": [
+      "huawei_cloud",
+      "huaweicloud",
+      "huawei",
+      "华为云",
+      "华为",
+      "sis",
+      "huawei-sis"
+    ],
+    "default_model": "chinese_16k_general",
+    "model_string": "wire_model",
+    "key_normalisation": {
+      "region_suffix_separator": "@"
+    },
+    "registered_in_gateway": true,
+    "native_model_handling": "substituted",
+    "notes": "Registered at gateway/src/plugin/builtin/mod.rs:1784; dispatched at gateway/src/core/stt/standard.rs:430-432. MODEL KEY: the model id is Huawei's 'property' string, which encodes language, sample rate and domain; there is no separate model or language parameter. An empty model resolves to chinese_16k_general (gateway/src/core/stt/huawei_cloud/config.rs:40, fallback at :230). The gateway accepts a region suffix on the model, for example chinese_16k_general@cn-north-4 (config.rs:777-783; key_normalisation), and an unrecognised region silently becomes cn-north-4 (config.rs:779). REGIONS: region limits of the short-audio interface are region constraints on the file transports; those of the real-time socket stay in each row's provenance notes. Documented SIS hosts are sis-ext.cn-north-4, sis-ext.cn-east-3, sis-ext.ap-southeast-3 and sis-ext.me-east-1. The gateway's region list (config.rs:75-91) has ap-southeast-1 and ap-southeast-2, which the vendor does not list for SIS, and lacks me-east-1. STREAMING CLIENT (adapter native, known_broken; read from code, vendor documentation and DNS, never run against the vendor; all paths under gateway/src/core/stt/huawei_cloud/): (1) China regions dial sis.{region}.myhuaweicloud.com (config.rs:25, :128-134); that host is absent from DNS for cn-north-4 and cn-east-3, so the socket cannot connect there, and the Bangkok region in the gateway's list has no SIS host at all. (2) The parser expects resp_type STARTED and ENDED, a top-level 'result' and an integer error_code (messages.rs:219-260); the vendor sends START, EVENT, RESULT with segments[].result, and string codes such as SIS.0002, so a real result yields no transcript and a real error fails to parse. (3) Only the one-sentence mode /rasr/short-stream is reachable (config.rs:387-388; nothing sets the mode); it has a one-minute limit and no vendor end-of-speech detection, and END is sent only at shutdown (client.rs:158-163). A call needs /rasr/continue-stream (5 hours, vendor end-of-speech detection). (4) Unknown model ids become chinese_16k_general (config.rs:230), and STTConfig.language and sample_rate are never read (config.rs:762-798). (5) Model aliases written with a hyphen can never match: from_str replaces '-' with '_' before it compares (config.rs:213), but the arms still spell zh-cn, zh-yue, zh-sichuan and zh-minnan (config.rs:214-224), so 'zh-yue' becomes Mandarin. The repository mock (gateway/tests/mock_endpoint_e2e.rs:1628, :1652) uses the same undocumented schema, so its passing test covers none of this. PER-UTTERANCE SOCKET (adapter planned_commit, which no release builds; inferred from the documentation): the one-sentence mode ignores vad_head, vad_tail and max_seconds and returns the final result shortly after the client's END, which makes it a per-utterance primitive the gateway's own detector can drive. Whether one WebSocket may carry several START and END cycles is unverified, so plan for a connection per utterance. An idle socket is closed with SIS.0304. FILE UPLOAD (adapter regional_rest, not implemented): recognize_short_audio (client.rs:705-770) builds the documented JSON request but has no caller, returns text only (dropping score and word_info, client.rs:766-769), and belongs to a client mode that buffers without limit and never flushes (client.rs:891-894). Its URL comes from get_short_asr_url (config.rs:680-687), which shares the dead China host. MAX_SHORT_AUDIO_DURATION_SECS is 30 (config.rs:52) while the vendor limit is one minute. Each client instance logs in with a password; a process-wide token cache is needed. Treat SIS.0312 (concurrency exceeded) as back-pressure. The '4 MB' limit is recorded with the decimal reading, the lower one. STATE TODAY: the streaming client is the native transport, enabled from Release 0, groundwork and honest refusal, and reported as known broken in ready.stt rather than refused (integration decisions, section 15); each native transport carries its defect. The file transport (regional_rest) is enabled from Release 5, wider vendor coverage and hardening, and only after a live probe with a real key (decisions section 12). Until then a model the gateway has no working path for is refused or warned as its when_unusable says. Segmentation is required for chinese_16k_travel, english_16k_common and english_8k_common; the last is a model the vendor no longer maintains and is marked legacy. The gateway's speech-to-text feature table has no huawei-cloud row, and config/pricing.rs has no Huawei entries, so rows carry no pricing_key."
+  },
+  "rows": [
+    {
+      "id": "huawei-cloud:chinese_16k_general",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "chinese_16k_general"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published. Only the audio of each utterance is sent on this transport."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not published on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0094.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "transports[0].billing and transports[2].billing (unit and bills_silence: billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)",
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Mandarin; the gateway default. Real-time and short-audio in cn-north-4 and cn-east-3 and on the international site. The short-audio API accepts 8 kHz or 16 kHz audio for it."
+      }
+    },
+    {
+      "id": "huawei-cloud:sichuan_16k_common",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "sichuan_16k_common"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published. Only the audio of each utterance is sent on this transport."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "cn-north-4"
+              ],
+              "note": "The vendor's China-site short-audio table lists this model for cn-north-4 only, and the international short-audio page does not list it."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. The client also cannot select this model: it silently replaces the id with chinese_16k_general. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. This property string is not in the client's model list (config.rs:196-209); from_str falls back to chinese_16k_general (config.rs:230)."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not published on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "transports[0].billing and transports[2].billing (unit and bills_silence: billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)",
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Sichuanese; cn-north-4 only. The gateway's model list has the undocumented sichuan_16k_general instead."
+      }
+    },
+    {
+      "id": "huawei-cloud:cantonese_16k_common",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "cantonese_16k_common"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published. Only the audio of each utterance is sent on this transport."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "cn-north-4"
+              ],
+              "note": "The vendor's China-site short-audio table lists this model for cn-north-4 only, and the international short-audio page does not list it."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. The client also cannot select this model: it silently replaces the id with chinese_16k_general. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. This property string is not in the client's model list (config.rs:196-209); from_str falls back to chinese_16k_general (config.rs:230)."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not published on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "transports[0].billing and transports[2].billing (unit and bills_silence: billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)",
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Cantonese; cn-north-4 only. The gateway's model list has the undocumented cantonese_16k_general instead."
+      }
+    },
+    {
+      "id": "huawei-cloud:shanghai_16k_common",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "shanghai_16k_common"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published. Only the audio of each utterance is sent on this transport."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "cn-north-4"
+              ],
+              "note": "The vendor's China-site short-audio table lists this model for cn-north-4 only, and the international short-audio page does not list it."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. The client also cannot select this model: it silently replaces the id with chinese_16k_general. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. This property string is not in the client's model list (config.rs:196-209); from_str falls back to chinese_16k_general (config.rs:230)."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not published on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "transports[0].billing and transports[2].billing (unit and bills_silence: billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)",
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Shanghainese; cn-north-4 only."
+      }
+    },
+    {
+      "id": "huawei-cloud:chinese_16k_common",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "chinese_16k_common"
+      },
+      "lifecycle": {
+        "status": "legacy"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published. Only the audio of each utterance is sent on this transport."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "cn-north-4",
+                "cn-east-3"
+              ],
+              "note": "China site only: the international short-audio page does not list this model."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not published on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "transports[0].billing and transports[2].billing (unit and bills_silence: billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)",
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)",
+          "lifecycle.status (the real-time page calls this a legacy model and recommends chinese_16k_general, with no date; the short-audio page still lists it without that remark)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Mandarin. The real-time page calls it a legacy model and recommends chinese_16k_general; the short-audio page lists it as current. Regions are not stated. No retirement date is published, so the row is marked legacy without dates."
+      }
+    },
+    {
+      "id": "huawei-cloud:chinese_8k_common",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "chinese_8k_common"
+      },
+      "lifecycle": {
+        "status": "legacy"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published. Only the audio of each utterance is sent on this transport."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "cn-north-4",
+                "cn-east-3"
+              ],
+              "note": "China site only: the international short-audio page does not list this model."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 8000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. 8 kHz models are also rejected at configuration time when the encoding is the usual linear16. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. With encoding linear16 the format is pcm16k16bit (config.rs:342) and validate() rejects an 8 kHz model for the rate mismatch (config.rs:626-635)."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not published on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "transports[0].billing and transports[2].billing (unit and bills_silence: billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)",
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)",
+          "lifecycle.status (the real-time page calls this a legacy model and recommends chinese_16k_general, with no date; the short-audio page still lists it without that remark)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. 8 kHz Mandarin. The real-time page calls it a legacy model; the short-audio page lists it. Regions are not stated. Segments are uploaded at 8 kHz because the audio rate must match the property. No retirement date is published, so the row is marked legacy without dates."
+      }
+    },
+    {
+      "id": "huawei-cloud:arabic_16k_general",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "arabic_16k_general"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published. Only the audio of each utterance is sent on this transport."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist. The short-audio API lists this model on the international site only, so the transport cannot serve a China-site region.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "except",
+              "values": [
+                "cn-north-4",
+                "cn-east-3"
+              ],
+              "note": "The China-site short-audio table does not list this model; the international short-audio page does."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. The client also cannot select this model: it silently replaces the id with chinese_16k_general. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. This property string is not in the client's model list (config.rs:196-209); from_str falls back to chinese_16k_general (config.rs:230)."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not published on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "transports[0].billing and transports[2].billing (unit and bills_silence: billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)",
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)",
+          "what the service does when digit_norm is sent for a model that does not support it"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Arabic. Real-time in cn-north-4 and on the international site. The short-audio API lists it on the international site only, so the file transport is not available to China-site regions. The model does not support add_punc, digit_norm or hot words; the existing client sends digit_norm 'yes' by default (gateway/src/core/stt/huawei_cloud/config.rs:509)."
+      }
+    },
+    {
+      "id": "huawei-cloud:chinese_8k_general",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "chinese_8k_general"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. 8 kHz models are also rejected at configuration time when the encoding is the usual linear16. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. With encoding linear16 the format is pcm16k16bit (config.rs:342) and validate() rejects an 8 kHz model for the rate mismatch (config.rs:626-635)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0030.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "billing.unit and billing.bills_silence (billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. 8 kHz Mandarin telephony. Real-time in cn-north-4, cn-east-3 and on the international site. Not on the short-audio list; the only file API that serves it is the asynchronous job. The short-audio API does not list this model, so no segmented fallback exists; until the streaming client is repaired the model has no usable live path."
+      }
+    },
+    {
+      "id": "huawei-cloud:english_16k_general",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "english_16k_general"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. The client also cannot select this model: it silently replaces the id with chinese_16k_general. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. This property string is not in the client's model list (config.rs:196-209); from_str falls back to chinese_16k_general (config.rs:230)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0030.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "billing.unit and billing.bills_silence (billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)",
+          "what the service does when digit_norm is sent for a model that does not support it"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. English. Real-time only: cn-north-4 on the China site, and the international site. It does not support digit_norm, which the existing client sends by default (gateway/src/core/stt/huawei_cloud/config.rs:509). A deployment pinned to cn-east-3 that wants English has only the file model english_16k_common. The short-audio API does not list this model, so no segmented fallback exists; until the streaming client is repaired the model has no usable live path."
+      }
+    },
+    {
+      "id": "huawei-cloud:arabic_8k_general",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "arabic_8k_general"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. The client also cannot select this model: it silently replaces the id with chinese_16k_general. 8 kHz models are also rejected at configuration time when the encoding is the usual linear16. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. This property string is not in the client's model list (config.rs:196-209); from_str falls back to chinese_16k_general (config.rs:230). With encoding linear16 the format is pcm16k16bit (config.rs:342) and validate() rejects an 8 kHz model for the rate mismatch (config.rs:626-635)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "billing.unit and billing.bills_silence (billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. 8 kHz Arabic; real-time in cn-north-4 only. The short-audio API does not list this model, so no segmented fallback exists; until the streaming client is repaired the model has no usable live path."
+      }
+    },
+    {
+      "id": "huawei-cloud:chinese_16k_court",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "chinese_16k_court"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. The client also cannot select this model: it silently replaces the id with chinese_16k_general. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. This property string is not in the client's model list (config.rs:196-209); from_str falls back to chinese_16k_general (config.rs:230)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "billing.unit and billing.bills_silence (billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Mandarin, court domain; real-time in cn-north-4 only. The short-audio API does not list this model, so no segmented fallback exists; until the streaming client is repaired the model has no usable live path."
+      }
+    },
+    {
+      "id": "huawei-cloud:chinese_16k_it",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "chinese_16k_it"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. The client also cannot select this model: it silently replaces the id with chinese_16k_general. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. This property string is not in the client's model list (config.rs:196-209); from_str falls back to chinese_16k_general (config.rs:230)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway would open a one-sentence session (/rasr/short-stream) per utterance, stream the audio while the caller speaks, and send END when its own detector reports end of speech.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor says only that the final result follows the last audio after a very short delay."
+          },
+          "limits": {
+            "max_audio_ms": 60000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_short_stream"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A design note inferred from the vendor documentation, not a tested path; details are in the provider notes. It needs the same host and response-schema repairs as the streaming client."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0026.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0027.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0036.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_sessions) of both socket transports (not published)",
+          "billing.unit and billing.bills_silence (billed by audio duration; granularity and price not published)",
+          "whether one WebSocket may carry several START and END cycles (matters for the per-utterance transport)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Mandarin, IT domain; real-time in cn-north-4 only. The short-audio API does not list this model, so no segmented fallback exists; until the streaming client is repaired the model has no usable live path."
+      }
+    },
+    {
+      "id": "huawei-cloud:chinese_16k_travel",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "chinese_16k_travel"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "cn-north-4",
+                "cn-east-3"
+              ],
+              "note": "The vendor lists cn-north-4 and cn-east-3 ('区域支持cn-east-3和cn-north-4'); the international short-audio page does not list this model."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25, :77-78, :128-134 (China regions, cn-north-4 by default, dial sis.{region}.myhuaweicloud.com, which does not exist in DNS); :212-232 (an id the client does not know becomes chinese_16k_general at :230)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This Huawei model is offered only on the vendor's short-audio file interface, not on its real-time socket. This gateway cannot serve it during a call yet. Choose a Huawei real-time model such as chinese_16k_general, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)",
+          "price per short-audio call"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. File-only model: on the short-audio property table and absent from the real-time property table. It needs segmentation. Noise-optimised 16 kHz Mandarin; short-audio in cn-north-4 and cn-east-3. Today the gateway silently replaces the id with chinese_16k_general (gateway/src/core/stt/huawei_cloud/config.rs:230)."
+      }
+    },
+    {
+      "id": "huawei-cloud:english_16k_common",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "english_16k_common"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "except",
+              "values": [
+                "cn-north-4"
+              ],
+              "note": "On the China site the vendor offers this model in cn-east-3 only ('区域仅支持cn-east-3'); the international short-audio page also lists it."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25, :77-78, :128-134 (China regions, cn-north-4 by default, dial sis.{region}.myhuaweicloud.com, which does not exist in DNS); :212-232 (an id the client does not know becomes chinese_16k_general at :230)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This Huawei English model is offered only on the vendor's short-audio file interface, not on its real-time socket. This gateway cannot serve it during a call yet. Choose the real-time English model english_16k_general, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)",
+          "price per short-audio call"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. File-only model: on the short-audio property table and absent from the real-time property table. It needs segmentation. English, 8 kHz or 16 kHz audio. On the China site it is offered in cn-east-3 only; it is also on the international site. It does not support digit_norm. Today the gateway silently replaces the id with chinese_16k_general (gateway/src/core/stt/huawei_cloud/config.rs:230)."
+      }
+    },
+    {
+      "id": "huawei-cloud:english_8k_common",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "english_8k_common"
+      },
+      "lifecycle": {
+        "status": "legacy",
+        "replacement": [
+          "english_16k_common"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 8000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25, :77-78, :128-134 (China regions, cn-north-4 by default, dial sis.{region}.myhuaweicloud.com, which does not exist in DNS); :212-232 (an id the client does not know becomes chinese_16k_general at :230)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This older Huawei English model is offered only on the vendor's short-audio file interface, and the vendor no longer maintains it. This gateway cannot serve it during a call yet. Choose the real-time English model english_16k_general instead."
+        }
+      },
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Short-audio: per successful call whatever the length; failed calls are not billed. The price per call is not on a page the audit could read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0094.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/intl/en-us/api-sis/sis_03_0004.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0045.html",
+          "https://support.huaweicloud.com/productdesc-sis/sis_01_0020.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "limits.rates (concurrent_requests), limits.rates (requests) and limits.min_audio_ms of the file transport (not published)",
+          "latency of the short-audio API, and segment_profile.request_timeout_ms (starting value, not measured)",
+          "price per short-audio call",
+          "lifecycle (the vendor calls the model old and no longer maintained and recommends english_16k_common, but publishes no deprecation or shutdown date)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. File-only model: on the short-audio property table and absent from the real-time property table. It needs segmentation. 8 kHz English, listed on the China-site and the international short-audio pages. The vendor calls it an old model that will no longer be maintained and recommends english_16k_common, so the row is marked legacy with that replacement. The vendor publishes no deprecation or shutdown date, so the row carries none. Segments are uploaded at 8 kHz. Today the gateway silently replaces the id with chinese_16k_general (gateway/src/core/stt/huawei_cloud/config.rs:230)."
+      }
+    },
+    {
+      "id": "huawei-cloud:chinese_16k_conversation",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "chinese_16k_conversation"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25, :77-78, :128-134 (China regions, cn-north-4 by default, dial sis.{region}.myhuaweicloud.com, which does not exist in DNS); :212-232 (an id the client does not know becomes chinese_16k_general at :230)",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "The only API that serves this model is the flash file API, which is synchronous but reads the audio only from a Huawei OBS bucket, so the gateway would have to write every utterance to object storage first. The model is on neither the real-time nor the short-audio property table."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call, so billing was not researched."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0090.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783"
+        ],
+        "unverified": [
+          "billing.unit"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Listed only for the flash file API (cn-north-4 and cn-east-3)."
+      }
+    },
+    {
+      "id": "huawei-cloud:chinese_16k_media",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "chinese_16k_media"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25, :77-78, :128-134 (China regions, cn-north-4 by default, dial sis.{region}.myhuaweicloud.com, which does not exist in DNS); :212-232 (an id the client does not know becomes chinese_16k_general at :230)",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "The only API that serves this model is the asynchronous transcription job (submit, then poll); the vendor's reference time for audio under 10 minutes is up to 2 minutes. The model is on neither the real-time nor the short-audio property table."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call, so billing was not researched."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0092.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783"
+        ],
+        "unverified": [
+          "billing.unit",
+          "the full list of job-only property strings (the audit names this one and says there are others)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Listed only for the asynchronous transcription job API (cn-north-4 and cn-east-3)."
+      }
+    },
+    {
+      "id": "huawei-cloud:sichuan_8k_common",
+      "match": {
+        "provider": "huawei-cloud",
+        "model": "sichuan_8k_common"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25, :77-78, :128-134 (China regions, cn-north-4 by default, dial sis.{region}.myhuaweicloud.com, which does not exist in DNS); :212-232 (an id the client does not know becomes chinese_16k_general at :230)",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "The only API that serves this model is the asynchronous transcription job (submit, then poll); the vendor's reference time for audio under 10 minutes is up to 2 minutes. The model is on neither the real-time nor the short-audio property table."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not usable on a live call, so billing was not researched."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://support.huaweicloud.com/api-sis/sis_03_0092.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0030.html",
+          "https://support.huaweicloud.com/api-sis/sis_03_0094.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783"
+        ],
+        "unverified": [
+          "billing.unit",
+          "the full list of job-only property strings (the audit names this one and says there are others)"
+        ],
+        "notes": "Row key: Huawei's 'property' string; the vendor has no separate model parameter. Listed only for the asynchronous transcription job API (cn-north-4 and cn-east-3)."
+      }
+    },
+    {
+      "id": "huawei-cloud:any",
+      "match": {
+        "provider": "huawei-cloud",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Huawei. The short-audio request code that exists has no caller, and the URL it builds for China regions uses a host that does not exist. The short-audio API serves only some models, so the vendor may reject an unknown model id.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no latency figure for the short-audio API."
+          },
+          "limits": {
+            "max_upload_bytes": 4000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "mp3",
+              "aac",
+              "flac",
+              "m4a",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "audio_format",
+                "value": "wav",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_sis_short_audio"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/client.rs:705-770; gateway/src/core/stt/huawei_cloud/messages.rs:368-440; gateway/src/core/stt/huawei_cloud/config.rs:680-687",
+            "notes": "JSON body with Base64 audio. recognize_short_audio (client.rs:705-770) builds the documented request but has no caller and returns text only; details are in the provider notes. The 4 MB limit is measured after Base64, so the one-minute limit binds first. flac, m4a, ogg and webm are accepted only with audio_format=auto."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 5000,
+            "rationale": "5000 ms is the audit's starting value, not a measurement; no latency is published and the client's 30 second HTTP timeout cannot be used for a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 18000000,
+            "idle_timeout_ms": 20000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "vocabulary_id",
+                "note": "A hot-word table created beforehand through the vendor's hot-word interface. Not supported on the international site."
+              }
+            ],
+            "wire": "huawei_rasr_continue_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the client dials a host that does not exist for China regions, expects a response schema the vendor does not send, and can only reach the one-minute one-sentence mode. A model id the client does not know is silently replaced by chinese_16k_general. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/huawei_cloud/config.rs:25,128-134,212-232,387-388; gateway/src/core/stt/huawei_cloud/messages.rs:219-260; gateway/src/core/stt/huawei_cloud/client.rs:158-163",
+            "notes": "The defect list with line references is in the provider notes. This row describes the continuous mode (/rasr/continue-stream) the repaired client should use. from_str falls back to chinese_16k_general for any id it does not know (config.rs:230)."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time: by audio duration; the metering granularity and the price are not published."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "Unknown model: short-audio bills per successful call; failed calls are not billed."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [],
+        "code_refs": [
+          "gateway/src/core/stt/huawei_cloud/config.rs:25",
+          "gateway/src/core/stt/huawei_cloud/config.rs:77-78",
+          "gateway/src/core/stt/huawei_cloud/config.rs:128-134",
+          "gateway/src/core/stt/huawei_cloud/config.rs:212-232",
+          "gateway/src/core/stt/huawei_cloud/config.rs:777-783",
+          "gateway/src/core/stt/huawei_cloud/client.rs:705-714"
+        ],
+        "unverified": [
+          "every field: this row is a guess for a model id the map has never seen",
+          "whether the service accepts the six _general dialect and minority-language property strings on any API (the gateway sends them on the socket today)"
+        ],
+        "notes": "Fail-slow default: Huawei has a planned file-upload adapter, so an unknown model id is assumed to need file upload. Six property strings in the gateway's model list are in neither vendor property table and land here: cantonese_16k_general, sichuan_16k_general, minnan_16k_general, mongolian_16k_general, tibetan_16k_general and uyghur_16k_general. The gateway sends these six verbatim on the socket today (gateway/src/core/stt/huawei_cloud/config.rs:196-209) and its plugin metadata advertises them (gateway/src/plugin/builtin/mod.rs:484-494). The short-audio property table does not list them either, so file upload is a guess the vendor will probably reject; confirm each string against the live service and give it an exact row, or remove it from the gateway's model list and metadata."
+      }
+    }
+  ]
+}

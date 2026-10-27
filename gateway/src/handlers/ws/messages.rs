@@ -268,7 +268,8 @@ pub enum IncomingMessage {
         /// Milliseconds of the reply's audio the client actually played.
         audio_end_ms: u64,
     },
-    /// Voice-agent sessions (spec 025): a typed user turn — no speech, the same agent turn.
+    /// A typed user turn — no speech, the same turn — on a voice-agent (spec 025) or
+    /// conversation session. It interrupts the reply in progress.
     #[serde(rename = "agent_input")]
     AgentInput {
         /// What the user typed.
@@ -431,7 +432,15 @@ pub enum OutgoingMessage {
         /// interaction mode; `protocol_version` is then `1.1`.
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
-        interaction: Option<serde_json::Value>,
+        interaction: Option<Box<serde_json::Value>>,
+        /// What speech-to-text this session got: streaming, segmented (the gateway cuts the
+        /// caller's audio at pauses and uploads each utterance) or buffered, the kind of interim
+        /// results, who decides where an utterance ends, the expected latency and its basis, and
+        /// notices. The fields are defined in `docs/segmented-stt/customer-contract-reference.md`.
+        /// Absent when the rollout switch does not cover the session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+        stt: Option<Box<serde_json::Value>>,
     },
     #[serde(rename = "stt_result")]
     STTResult {
@@ -486,6 +495,67 @@ pub enum OutgoingMessage {
         /// Error message
         message: String,
     },
+    /// An `error` with a stable code. Same `type` as [`Self::Error`]; an uncoded error keeps its
+    /// exact bytes. `recoverable: true` means the socket is still usable (a refusal made before
+    /// the session id is stored accepts a corrected `config`).
+    #[serde(rename = "error")]
+    CodedError {
+        message: String,
+        code: String,
+        recoverable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+        details: Option<serde_json::Value>,
+    },
+    /// Detector-timed speech events (segmented sessions) and the gateway's turn decisions.
+    /// `event`: `speech_start`, `speech_end`, `turn_start`, `turn_end`, `turn_closed`.
+    #[serde(rename = "vad_event")]
+    VadEvent {
+        event: String,
+        turn_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audio_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sustained_ms: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        discarded: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        had_transcript: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// A speech-to-text problem that does not end the call (a lost segment, dropped audio). Never
+    /// sent as `error`, which deployed widgets treat as a disconnect.
+    #[serde(rename = "stt_warning")]
+    SttWarning {
+        code: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+        detail: Option<serde_json::Value>,
+    },
+    /// A turn of the session's DAG failed. It is an `error` (a client that reads only `message`
+    /// sees it as before) that also names the node: the turn is abandoned, the session stays up
+    /// and the next utterance runs the graph again.
+    #[serde(rename = "error")]
+    DagError {
+        /// Human-readable error, naming the node.
+        message: String,
+        /// `dag_node_failed`, `dag_node_timeout` (a node ran past its timeout) or
+        /// `dag_turn_timeout` (the turn ran past `dag_config.timeout_ms`).
+        #[cfg_attr(feature = "openapi", schema(example = "dag_node_timeout"))]
+        code: String,
+        /// The DAG's `id`.
+        dag_id: String,
+        /// The node that failed, when one did.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(example = "tts"))]
+        node_id: Option<String>,
+        /// The failed node's type (`tts_provider`, `llm_endpoint`, ...).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(example = "tts_provider"))]
+        node_type: Option<String>,
+    },
     /// Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
     ///
     /// Sent at config time when a setting is sub-optimal but the session still
@@ -531,7 +601,9 @@ pub enum OutgoingMessage {
     /// Client must send an `auth` message before any other commands.
     #[serde(rename = "auth_required")]
     AuthRequired,
-    /// Voice agent (spec 025): an agent turn began (`kind`: `agent` or `greeting`).
+    /// A reply began: a voice-agent turn (spec 025; `kind` `agent`, `greeting` or `notice`) or a
+    /// conversation-loop turn (`kind` `agent`; `input` absent for the idle check-in and async-tool
+    /// follow-ups).
     #[serde(rename = "agent_response_started")]
     AgentResponseStarted {
         turn_index: u64,
@@ -546,7 +618,8 @@ pub enum OutgoingMessage {
         turn_index: u64,
         response_id: String,
     },
-    /// Voice agent: the agent's words, as they are spoken (or shown, in text mode).
+    /// The reply's words as they are handed to speech (or shown, in a voice agent's text mode).
+    /// Voice-agent and conversation sessions; their concatenation is what the caller heard.
     #[serde(rename = "assistant_transcript")]
     AssistantTranscript { turn_index: u64, delta: String },
     /// Voice agent: a server-side tool's progress (`in_progress`, `completed`, `failed`).
@@ -577,7 +650,8 @@ pub enum OutgoingMessage {
         #[cfg_attr(feature = "openapi", schema(value_type = Object))]
         output: serde_json::Value,
     },
-    /// Voice agent: the turn ended (`completed`, `cancelled`, `failed`, `incomplete`).
+    /// The reply ended (`completed`, `cancelled`, `failed`, `incomplete`). Voice-agent and
+    /// conversation sessions.
     #[serde(rename = "agent_response_done")]
     AgentResponseDone {
         turn_index: u64,
@@ -591,7 +665,8 @@ pub enum OutgoingMessage {
         /// What the caller heard (or was shown).
         transcript: String,
     },
-    /// Voice agent: the reply was cut off; the agent's history keeps `spoken`.
+    /// The reply was cut off by the caller; `spoken` is what had been sent to speech and
+    /// `audio_end_ms` the reply's audio delivered by then. Voice-agent and conversation sessions.
     #[serde(rename = "agent_truncated")]
     AgentTruncated {
         turn_index: u64,
@@ -924,6 +999,7 @@ mod tests {
     fn test_ready_message_serialization_full() {
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "test-stream-123".to_string(),
             livekit_room_name: Some("room-456".to_string()),
             livekit_url: Some("ws://localhost:7880".to_string()),
@@ -948,6 +1024,7 @@ mod tests {
         // assert it on connect (plan W-K1 / exit E9).
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "proto-stream".to_string(),
             livekit_room_name: None,
             livekit_url: None,
@@ -971,6 +1048,7 @@ mod tests {
     fn test_ready_message_serialization_minimal() {
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "minimal-stream".to_string(),
             livekit_room_name: None,
             livekit_url: None,
@@ -998,6 +1076,7 @@ mod tests {
 
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: uuid.clone(),
             livekit_room_name: None,
             livekit_url: None,
@@ -1018,6 +1097,7 @@ mod tests {
     fn test_ready_message_stream_id_position() {
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "first-field".to_string(),
             livekit_room_name: Some("room".to_string()),
             livekit_url: None,
@@ -1048,6 +1128,7 @@ mod tests {
         // SDK can detect a downgrade; absent fields mean default linear16 (no new wire surface).
         let with_opus = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "codec-stream".to_string(),
             livekit_room_name: None,
             livekit_url: None,
@@ -1068,6 +1149,7 @@ mod tests {
         // Default session (no codec requested) omits both fields entirely.
         let default = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "default-stream".to_string(),
             livekit_room_name: None,
             livekit_url: None,
@@ -1348,12 +1430,16 @@ mod tests {
             audio_in_codec: None,
             audio_out_codec: None,
             interaction,
+            stt: None,
         };
         assert_eq!(
             serde_json::to_string(&ready(None)).unwrap(),
             r#"{"type":"ready","protocol_version":"1.0","stream_id":"s"}"#
         );
-        let on = serde_json::to_value(ready(Some(serde_json::json!({ "enabled": true })))).unwrap();
+        let on = serde_json::to_value(ready(Some(Box::new(
+            serde_json::json!({ "enabled": true }),
+        ))))
+        .unwrap();
         assert_eq!(on["interaction"]["enabled"], true);
     }
 

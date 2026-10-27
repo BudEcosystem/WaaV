@@ -447,7 +447,7 @@ mod message_tests {
     fn test_segment_confidence() {
         let segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "Test".to_string(),
@@ -466,7 +466,7 @@ mod message_tests {
     fn test_segment_confidence_default() {
         let segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "Test".to_string(),
@@ -485,7 +485,7 @@ mod message_tests {
     fn test_segment_is_speech() {
         let speech_segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "Hello".to_string(),
@@ -499,7 +499,7 @@ mod message_tests {
 
         let silence_segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "".to_string(),
@@ -543,6 +543,7 @@ mod message_tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(verbose.text(), "World");
 
@@ -559,6 +560,7 @@ mod message_tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(verbose.language(), Some("fr"));
 
@@ -578,6 +580,7 @@ mod message_tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(verbose.duration(), Some(5.5));
 
@@ -586,62 +589,6 @@ mod message_tests {
             x_groq: None,
         });
         assert_eq!(simple.duration(), None);
-    }
-}
-
-// =============================================================================
-// WAV Tests
-// =============================================================================
-
-mod wav_tests {
-    use super::messages::wav;
-
-    #[test]
-    fn test_wav_header_size() {
-        assert_eq!(wav::HEADER_SIZE, 44);
-    }
-
-    #[test]
-    fn test_wav_creation_header() {
-        let pcm_data = vec![0u8; 100];
-        let wav_file = wav::create_wav(&pcm_data, 16000, 1);
-
-        // Check RIFF header
-        assert_eq!(&wav_file[0..4], b"RIFF");
-        assert_eq!(&wav_file[8..12], b"WAVE");
-        assert_eq!(&wav_file[12..16], b"fmt ");
-        assert_eq!(&wav_file[36..40], b"data");
-    }
-
-    #[test]
-    fn test_wav_creation_size() {
-        let pcm_data = vec![0u8; 100];
-        let wav_file = wav::create_wav(&pcm_data, 16000, 1);
-
-        assert_eq!(wav_file.len(), wav::HEADER_SIZE + pcm_data.len());
-    }
-
-    #[test]
-    fn test_wav_creation_stereo() {
-        let pcm_data = vec![0u8; 200];
-        let wav_file = wav::create_wav(&pcm_data, 44100, 2);
-
-        // Check channels (bytes 22-23)
-        let channels = u16::from_le_bytes([wav_file[22], wav_file[23]]);
-        assert_eq!(channels, 2);
-
-        // Check sample rate (bytes 24-27)
-        let sample_rate =
-            u32::from_le_bytes([wav_file[24], wav_file[25], wav_file[26], wav_file[27]]);
-        assert_eq!(sample_rate, 44100);
-    }
-
-    #[test]
-    fn test_wav_creation_empty() {
-        let pcm_data = vec![];
-        let wav_file = wav::create_wav(&pcm_data, 16000, 1);
-
-        assert_eq!(wav_file.len(), wav::HEADER_SIZE);
     }
 }
 
@@ -873,24 +820,19 @@ mod client_tests {
 
     #[test]
     fn test_client_is_retryable_error() {
-        // Retryable errors
-        assert!(GroqSTT::is_retryable_error(&STTError::NetworkError(
-            "timeout".to_string()
-        )));
-        assert!(GroqSTT::is_retryable_error(&STTError::ProviderError(
-            "429 rate limit".to_string()
-        )));
-        assert!(GroqSTT::is_retryable_error(&STTError::ProviderError(
-            "503 Service Unavailable".to_string()
-        )));
-
-        // Non-retryable errors
-        assert!(!GroqSTT::is_retryable_error(
-            &STTError::AuthenticationFailed("invalid key".to_string())
+        // Retryable: a network failure, and transient statuses.
+        assert!(GroqSTT::is_retryable(
+            &STTError::NetworkError("timeout".to_string()),
+            None
         ));
-        assert!(!GroqSTT::is_retryable_error(&STTError::ConfigurationError(
-            "invalid config".to_string()
-        )));
+        for status in [408, 429, 498, 500, 502, 503, 504] {
+            assert!(GroqSTT::retryable_status(status), "{status}");
+        }
+
+        // Not retryable: the caller's or the account's to fix.
+        for status in [400, 401, 403, 404, 413, 422] {
+            assert!(!GroqSTT::retryable_status(status), "{status}");
+        }
     }
 
     #[test]
@@ -1060,7 +1002,12 @@ mod rate_limit_tests {
     fn test_rate_limit_parse_duration_string_invalid() {
         assert!(RateLimitInfo::parse_duration_string("invalid").is_none());
         assert!(RateLimitInfo::parse_duration_string("").is_none());
-        assert!(RateLimitInfo::parse_duration_string("5h").is_none()); // hours not supported
+        assert_eq!(RateLimitInfo::parse_duration_string("1h"), Some(3_600_000));
+        // The form Groq sends in x-ratelimit-reset-requests.
+        assert_eq!(
+            RateLimitInfo::parse_duration_string("2m59.56s"),
+            Some(179_560)
+        );
     }
 
     #[test]
@@ -1104,62 +1051,6 @@ mod rate_limit_tests {
         assert!(info.remaining_requests.is_none());
         assert!(info.remaining_tokens.is_none());
         assert!(info.retry_after_ms.is_none());
-    }
-}
-
-// =============================================================================
-// WAV Validation Tests
-// =============================================================================
-
-mod wav_validation_tests {
-    use super::messages::wav::{WavError, try_create_wav};
-
-    #[test]
-    fn test_wav_zero_sample_rate() {
-        let pcm_data = vec![0u8; 100];
-        let result = try_create_wav(&pcm_data, 0, 1);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), WavError::ZeroSampleRate);
-    }
-
-    #[test]
-    fn test_wav_zero_channels() {
-        let pcm_data = vec![0u8; 100];
-        let result = try_create_wav(&pcm_data, 16000, 0);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), WavError::ZeroChannels);
-    }
-
-    #[test]
-    fn test_wav_valid_params() {
-        let pcm_data = vec![0u8; 100];
-        let result = try_create_wav(&pcm_data, 16000, 1);
-        assert!(result.is_ok());
-        let wav = result.unwrap();
-        assert_eq!(wav.len(), 44 + 100); // header + data
-    }
-
-    #[test]
-    fn test_wav_error_display() {
-        assert_eq!(
-            WavError::ZeroSampleRate.to_string(),
-            "Sample rate cannot be zero"
-        );
-        assert_eq!(
-            WavError::ZeroChannels.to_string(),
-            "Number of channels cannot be zero"
-        );
-        assert_eq!(
-            WavError::DataTooLarge.to_string(),
-            "PCM data exceeds maximum WAV file size (4GB)"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "Invalid WAV parameters")]
-    fn test_wav_create_panics_on_zero_sample_rate() {
-        let pcm_data = vec![0u8; 100];
-        let _ = super::messages::wav::create_wav(&pcm_data, 0, 1);
     }
 }
 
@@ -1445,7 +1336,7 @@ mod confidence_tests {
             segments: vec![
                 Segment {
                     id: 0,
-                    seek: 0,
+                    seek: Some(0),
                     start: 0.0,
                     end: 1.0, // 1 second
                     text: "Short".to_string(),
@@ -1457,7 +1348,7 @@ mod confidence_tests {
                 },
                 Segment {
                     id: 1,
-                    seek: 0,
+                    seek: Some(0),
                     start: 1.0,
                     end: 4.0, // 3 seconds
                     text: "Longer segment".to_string(),
@@ -1470,6 +1361,7 @@ mod confidence_tests {
             ],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
 
         let confidence = verbose.confidence();
@@ -1497,6 +1389,7 @@ mod confidence_tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
 
         // Should return DEFAULT_UNKNOWN_CONFIDENCE when no segments
@@ -1513,7 +1406,7 @@ mod confidence_tests {
             segments: vec![
                 Segment {
                     id: 0,
-                    seek: 0,
+                    seek: Some(0),
                     start: 0.0,
                     end: 0.0, // Zero duration
                     text: "A".to_string(),
@@ -1525,7 +1418,7 @@ mod confidence_tests {
                 },
                 Segment {
                     id: 1,
-                    seek: 0,
+                    seek: Some(0),
                     start: 0.0,
                     end: 0.0, // Zero duration
                     text: "B".to_string(),
@@ -1538,6 +1431,7 @@ mod confidence_tests {
             ],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
 
         // Should fallback to simple average
@@ -1773,6 +1667,34 @@ mod resilience_tests {
         stt
     }
 
+    /// Addendum B5: a flush that fails at `audio_end` is reported, and its audio is not uploaded
+    /// again with the next turn's (the buffer used to be kept "for recovery" that nothing did).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_flush_does_not_carry_its_audio_into_the_next_turn() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/openai/v1/audio/transcriptions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#)
+            .create_async()
+            .await;
+        let reg = ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(
+            format!("{}/openai/v1/audio/transcriptions", server.url()),
+            &reg,
+        );
+        stt.connect().await.unwrap();
+        stt.send_audio(Bytes::from(vec![7u8; 6400])).await.unwrap();
+        assert!(stt.buffer_len() > 0);
+        assert!(stt.disconnect().await.is_err(), "the failure is reported");
+        assert_eq!(
+            stt.buffer_len(),
+            0,
+            "the lost turn's audio must not join the next turn's"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn breaker_ignores_a_callers_upstream_4xx() {
         // Uniformity gate: the provider feeds the SAME shared per-provider breaker the registry
@@ -1863,7 +1785,7 @@ mod resilience_tests {
             other => panic!("expected typed ConnectionFailed refusal, got {other:?}"),
         }
         assert!(
-            !GroqSTT::is_retryable_error(&STTError::ConnectionFailed("x".into())),
+            !GroqSTT::is_retryable(&STTError::ConnectionFailed("x".into()), None),
             "the refusal must not feed Groq's retry loop"
         );
         mock.assert_async().await; // zero upstream hits

@@ -19,6 +19,10 @@ use crate::{
 ///
 /// `None`, empty strings, and whitespace-only strings mean "fall back to server
 /// config"; non-empty values are trimmed before being forwarded to providers.
+/// The longest synthesis request a session may ask for (`tts_config.request_timeout`, or an
+/// alias's `tts.request_timeout_secs`): the LLM leg's default ceiling (`WAAV_LLM_MAX_TIMEOUT_MS`).
+pub const MAX_TTS_REQUEST_TIMEOUT_SECS: u64 = 300;
+
 pub(crate) fn client_api_key(api_key: Option<&str>) -> Option<String> {
     api_key
         .map(str::trim)
@@ -94,6 +98,8 @@ pub fn default_agent_stt_config() -> STTWebSocketConfig {
         extras: Default::default(),
         translation: None,
         turn_detection: None,
+        transcription_mode: None,
+        noise_suppression: None,
     }
 }
 
@@ -144,9 +150,19 @@ pub struct ConversationWebSocketConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
 
-    /// API key (literal or `${ENV_VAR}`); falls back to `OPENAI_API_KEY`.
+    /// Your own API key, sent as is. `${NAME}` is the legacy spelling of `credential_ref: NAME`
+    /// (an operator credential, see below) — the gateway never reads an arbitrary environment
+    /// variable for a client. Omitted: the vendor's key configured on the gateway is used only
+    /// toward that vendor's own host (`OPENAI_API_KEY` → `api.openai.com`); any other host gets
+    /// no key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+
+    /// Name of an operator credential (`WAAV_CREDENTIALS_FILE`) to authenticate with. It is sent
+    /// only if `base_url` is one of the credential's hosts; otherwise the config is refused.
+    /// Takes precedence over `api_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 
     /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,6 +278,11 @@ pub struct ConversationWebSocketConfig {
     /// S1/S2: reasoning-tier API key (literal or `${ENV_VAR}`; defaults to `api_key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_api_key: Option<String>,
+
+    /// Operator credential for the reasoning tier (bound to `reasoning_base_url`, or `base_url`
+    /// when that is unset). Takes precedence over `reasoning_api_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_credential_ref: Option<String>,
     /// S1/S2: reasoning-tier vendor wire format (defaults to `provider_kind`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "openai"))]
@@ -295,6 +316,14 @@ pub struct ConversationWebSocketConfig {
     #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = 2048))]
     pub max_reasoning_tokens: Option<u32>,
+    /// LLM request timeout in ms. Omit for the server default (`WAAV_LLM_TIMEOUT_MS`, else
+    /// 60000); clamped to 1000 .. `WAAV_LLM_MAX_TIMEOUT_MS` (default 300000). Raise it for a
+    /// self-hosted model that loads on its first request. With the server's
+    /// `WAAV_LLM_STREAM_IDLE_TIMEOUT_MS` set, it bounds the first token of a streamed reply,
+    /// not the whole reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = 120000))]
+    pub llm_timeout_ms: Option<u64>,
 }
 
 fn default_strip_markdown() -> bool {
@@ -313,6 +342,14 @@ fn default_conversation_allow_interruption() -> bool {
     true
 }
 
+/// `credential_ref` (as its `${NAME}` reference) when set, else the client's `api_key`.
+fn credential_reference(credential_ref: Option<&str>, api_key: Option<&str>) -> Option<String> {
+    match credential_ref.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(name) => Some(format!("${{{name}}}")),
+        None => api_key.map(str::to_owned),
+    }
+}
+
 impl ConversationWebSocketConfig {
     /// Convert into the core `ConversationConfig`.
     pub fn to_conversation_config(&self) -> crate::core::conversation::ConversationConfig {
@@ -320,7 +357,9 @@ impl ConversationWebSocketConfig {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             system_prompt: self.system_prompt.clone(),
-            api_key: self.api_key.clone(),
+            // A credential NAME travels as its `${NAME}` reference; `core::credentials` resolves
+            // it against the operator's registry and the target host (never the raw env var).
+            api_key: credential_reference(self.credential_ref.as_deref(), self.api_key.as_deref()),
             server_llm_endpoint: false,
             credential: None,
             attribution: None,
@@ -342,7 +381,10 @@ impl ConversationWebSocketConfig {
             latency_filler_phrases: self.latency_filler_phrases.clone(),
             reasoning_model: self.reasoning_model.clone(),
             reasoning_base_url: self.reasoning_base_url.clone(),
-            reasoning_api_key: self.reasoning_api_key.clone(),
+            reasoning_api_key: credential_reference(
+                self.reasoning_credential_ref.as_deref(),
+                self.reasoning_api_key.as_deref(),
+            ),
             reasoning_provider_kind: self.reasoning_provider_kind,
             reasoning_route: self.reasoning_route,
             reasoning_budget_ms: self
@@ -357,6 +399,7 @@ impl ConversationWebSocketConfig {
                 .map(|n| n.max(1))
                 .unwrap_or(crate::core::conversation::DEFAULT_MAX_LLM_CALLS_PER_TURN),
             max_reasoning_tokens: self.max_reasoning_tokens,
+            llm_timeout_ms: self.llm_timeout_ms,
         }
     }
 }
@@ -446,6 +489,22 @@ pub struct STTWebSocketConfig {
     /// degrades LOUDLY (warn + waav_degraded_total) to timer fallback.
     #[serde(default)]
     pub turn_detection: Option<TurnDetectionWsConfig>,
+    /// The kind of speech-to-text the client wants: `auto` (the default: whatever the model
+    /// supports), `streaming` (refuse a model that cannot stream) or `segmented` (the gateway cuts
+    /// the audio at pauses and uploads each utterance, even for a model that streams). A plain
+    /// session on a model whose today client buffers until `audio_end` moves to the segmented
+    /// engine only when it asks for `segmented`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription_mode: Option<String>,
+
+    /// WaaV's own denoiser (DeepFilterNet) on this session's uplink, ahead of the VAD / turn
+    /// models and the STT provider — the same `noise_suppression` a Bud deployment's `stt`
+    /// settings carry for REST transcription, which is the default here. Off unless asked for:
+    /// it costs CPU per session and adds ~30 ms. Mono `linear16` (or gateway-decoded opus)
+    /// only. A build without the `noise-filter` feature, or a server with no stream to give,
+    /// says so in a `config_warning` and goes on unfiltered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_suppression: Option<bool>,
 }
 
 /// Per-session ML turn-detection knobs (provider-agnostic).
@@ -765,7 +824,12 @@ impl TTSWebSocketConfig {
             audio_format: self.audio_format.clone().or(defaults.audio_format),
             sample_rate: self.sample_rate.or(defaults.sample_rate),
             connection_timeout: self.connection_timeout.or(defaults.connection_timeout),
-            request_timeout: self.request_timeout.or(defaults.request_timeout),
+            // A client's (or an alias's) value is clamped: unbounded, a session could hold a
+            // synthesis request (and its pooled connection) for as long as it liked.
+            request_timeout: self
+                .request_timeout
+                .map(|secs| secs.clamp(1, MAX_TTS_REQUEST_TIMEOUT_SECS))
+                .or(defaults.request_timeout),
             pronunciations: self.pronunciations.clone(),
             request_pool_size: defaults.request_pool_size,
             emotion_config,
@@ -1129,8 +1193,10 @@ mod config_tests {
             features: Default::default(),
             extras: Default::default(),
             turn_detection: None,
+            transcription_mode: None,
             translation: None,
             audio_in_codec: None,
+            noise_suppression: None,
         }
     }
 
@@ -1156,9 +1222,18 @@ mod config_tests {
 
     #[test]
     fn p2_stt_auto_becomes_provider_default_or_native_token() {
-        // Deepgram "auto" → the native "multi" code-switch token.
-        let dg = stt_ws("deepgram", "auto", "");
+        // Deepgram "auto" → the native "multi" code-switch token, where the model takes it.
+        let dg = stt_ws("deepgram", "auto", "nova-3");
         assert_eq!(dg.to_stt_config("k".into()).language, "multi");
+
+        // Deepgram `base` cannot detect: an unset language is left out (live: `language=multi`
+        // failed the handshake with a 400), and an explicit auto is too, with a warning.
+        let unset = stt_ws("deepgram", "", "base");
+        assert_eq!(unset.to_stt_config("k".into()).language, "");
+        assert!(!unset.language_mapping().has_warnings());
+        let auto = stt_ws("deepgram", "auto", "base");
+        assert_eq!(auto.to_stt_config("k".into()).language, "");
+        assert!(auto.language_mapping().has_warnings());
 
         // A provider with no auto token + auto request → empty string (provider falls back to its
         // own default), and a warning is recorded in the mapping.

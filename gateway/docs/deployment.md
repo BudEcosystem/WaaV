@@ -82,6 +82,7 @@ Add the relevant variables before starting the container. The most common ones a
 | `LIVEKIT_URL` | Server-to-server WebSocket URL (internal). | `ws://livekit:7880` |
 | `LIVEKIT_PUBLIC_URL` | URL clients should dial (returned via APIs). | `https://rtc.yourdomain.com` |
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Credentials used to mint LiveKit tokens in `/livekit/token` and during WebSocket LiveKit bring-up. | `lk_key` / `lk_secret` |
+| `WAAV_LIVEKIT_ICE_IPS` | Keep WaaV's LiveKit media sockets (ICE candidates) on addresses in these CIDR prefixes. Unset: every interface, plus loopback when `LIVEKIT_URL` is loopback. See section 7. | `127.0.0.1/32` |
 | `RECORDING_S3_*` | Bucket configuration for LiveKit recordings (bucket, region, endpoint, access key, secret key). | `recordings`, `us-east-1`, etc. |
 
 Set `AUTH_REQUIRED` plus either `AUTH_API_SECRETS_JSON` (preferred) or `AUTH_SERVICE_URL`/`AUTH_SIGNING_KEY_PATH` only if you follow the separate authentication guide. Legacy `AUTH_API_SECRET` is still supported with optional `AUTH_API_SECRET_ID`.
@@ -91,6 +92,11 @@ Minimal multi-secret example:
 ```bash
 AUTH_API_SECRETS_JSON='[{"id":"default","secret":"sk_test_default_123"}]'
 ```
+
+Your vendor keys are sent only to their vendors' hosts, and to hosts you approve. To approve other
+hosts (a proxy, a local OpenAI-compatible server), use `WAAV_CREDENTIALS_JSON` /
+`WAAV_CREDENTIALS_FILE` and `WAAV_PRIVATE_EGRESS_ALLOWLIST`. `WAAV_CLIENT_ENDPOINTS=deny` stops
+clients from choosing endpoints at all. See [Egress and operator credentials](egress-and-credentials.md).
 
 ## 4. Local Docker Run
 
@@ -248,6 +254,20 @@ Store `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `LIVEKIT_API_KEY`, `LIVEKIT_API_
      ```
    - Receive `ready` with `livekit_room_name`, `livekit_url`, and the WaaV Gateway participant metadata.
    - For each human participant, request a token via `POST /livekit/token` and join the LiveKit room directly.
+4. **Media sockets (ICE)**: WaaV's participant opens its WebRTC media sockets on the host's
+   interfaces. By default that's every interface (the LAN, each Docker bridge, VPNs, IPv6), plus
+   loopback when `LIVEKIT_URL` points at loopback. To keep them on chosen addresses, set
+   `WAAV_LIVEKIT_ICE_IPS` to CIDR prefixes. Any interface whose address is in one of them is used;
+   no other is.
+   - A single machine with everything on loopback: `WAAV_LIVEKIT_ICE_IPS=127.0.0.1/32`. LiveKit
+     must offer loopback candidates too: `rtc.node_ip: 127.0.0.1`,
+     `rtc.ips.includes: [127.0.0.1/32]` and `rtc.enable_loopback_candidate: true`.
+   - A LAN deployment that shouldn't use Docker bridges or VPNs: the LAN prefix, for example
+     `192.168.1.0/24`.
+
+   A malformed value gathers no candidates at all (it fails closed), so LiveKit calls fail
+   rather than quietly using every interface. `waav-gateway check` reports it. The setting is
+   process-wide, because WebRTC's network stack is.
 
 ## 8. Configuration Variations
 
@@ -279,7 +299,59 @@ Store `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `LIVEKIT_API_KEY`, `LIVEKIT_API_
   docker build -t waav-gateway:minimal --build-arg CARGO_BUILD_FEATURES="--no-default-features" .
   ```
 
-## 9. Verification Checklist
+## 9. Checking a Configuration
+
+`waav-gateway check -c config.yaml [--env-file .env]` runs the start-up checks without starting the
+server, loading models or dialling anything. It checks:
+
+- the env file and the config file, including **unknown keys** (a typo such as `securty:` would
+  otherwise be ignored and the defaults used);
+- operator credentials and DAG templates;
+- the auth, metrics and segmented speech-to-text settings.
+
+Each problem is printed, and the exit status is 1 when there is one. When the server itself
+starts, an unknown key is logged as a warning rather than refused, so existing files keep starting.
+
+## 10. Probes and the Operator Listener
+
+| Path | Answers | Notes |
+|---|---|---|
+| `/livez` | process up | never touches an upstream |
+| `/ready` | Bud control plane hydrated; `503 draining` after SIGTERM | the Bud chart's probe |
+| `/readyz` | provider credentials present and reachable | `503` names the unready provider |
+| `/metrics` | Prometheus | see `WAAV_METRICS_TOKEN` / `WAAV_METRICS_PUBLIC` |
+
+How `/readyz` probes:
+
+- It probes the address each provider's traffic actually goes to. For the openai providers that
+  is `OPENAI_BASE_URL` when it is set. `WAAV_READINESS_PROBE_<PROVIDER>=host:port` overrides it.
+- One evaluation answers every request for 10 seconds, and simultaneous requests share it, so
+  polling `/readyz` does not multiply outbound connections.
+- `WAAV_READINESS_SKIP_NETWORK=1` checks credentials only.
+
+`WAAV_METRICS_ADDR=host:port` opens an operator listener on an address your ingress does not
+route to. It serves `/metrics`, `/livez`, `/ready` and `/readyz`. With it set, the public `/readyz`
+returns its verdict without the per-provider breakdown, which would otherwise tell anyone which
+vendor credentials the gateway holds. The full breakdown stays on the operator listener. All
+probes remain on the public port, so existing liveness and readiness probes keep working.
+
+### A Unix socket for local callers
+
+`WAAV_UNIX_SOCKET=/run/waav/waav.sock` also serves the whole API on a Unix socket, for callers on the
+same host that address services by path. How it behaves:
+
+- **Auth.** It is required exactly as on TCP.
+- **No rate limiter.** Every caller on the socket would share one bucket.
+- **Connection cap.** The per-peer connection cap counts all socket callers as one peer.
+- **Permissions.** The socket is created `0660`; its file permissions decide who may connect.
+- **Stale files.** A socket left by a crashed run is reused. Anything else at the path is
+  refused, never deleted. The socket is removed on a graceful stop.
+
+```sh
+curl --unix-socket /run/waav/waav.sock -H "Authorization: Bearer $KEY" http://localhost/voices
+```
+
+## 11. Verification Checklist
 
 1. `curl http://<waav-gateway-host>:3001/` returns `{ "status": "OK" }`.
 2. `GET /voices` succeeds (requires provider keys).

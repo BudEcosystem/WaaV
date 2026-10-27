@@ -1,0 +1,346 @@
+{
+  "provider_id": "fpt-ai",
+  "provider": {
+    "aliases": [
+      "fpt_ai",
+      "fptai",
+      "fpt",
+      "fpt-stt",
+      "fpt_ai-stt"
+    ],
+    "default_model": "general",
+    "model_string": "gateway_alias",
+    "registered_in_gateway": true,
+    "notes": "Legacy FPT.AI Speech on api.fpt.ai. 'general' is the engine segment of the vendor URL path (/hmi/asr/general); it resolves an empty model to the documented row instead of the provider default. Registry id and aliases: gateway/src/plugin/builtin/mod.rs:1799-1800; the standardized factory that live sessions use accepts fpt-ai, fpt_ai, fptai and fpt (gateway/src/core/stt/standard.rs:423-425). The gateway's only client is a request-and-response HTTP client that buffers the whole call and uploads at hang-up, at a client commit (audio_end disconnects the client, which flushes: gateway/src/core/voice_manager/manager.rs:1648-1672, gateway/src/core/stt/fpt_ai/client.rs:345-349) or after 9.6 MB; it is not a transport. The server has no API-key mapping for this provider (gateway/src/config/mod.rs:679). FPT AI Marketplace (mkp-api.fptcloud.com, OpenAI-compatible) is a separate host this client does not reach; it listed no speech-to-text model on 2026-10-03 and has no row here. If a model is relisted there, serve it as an OpenAI-compatible deployment."
+  },
+  "rows": [
+    {
+      "id": "fpt-ai:general",
+      "match": {
+        "provider": "fpt-ai",
+        "model": "general"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for live calls exists (not implemented). The only FPT client buffers the whole call and uploads at hang-up or after 9.6 MB (300 s at 16 kHz), so a call gets no transcript while it is in progress. Before enabling, a probe with a real key must confirm that the vendor accepts WAV at all.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 570,
+                "basis": "own_probe",
+                "source": "providers/fpt-ai.md:209",
+                "measured_on": "2026-10-03",
+                "conditions": "Unauthenticated request rejected with HTTP 401 before any decoding, cold connection (fastest of the audit's cold probes): network and TLS only."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 810,
+                "basis": "own_probe",
+                "source": "providers/fpt-ai.md:209",
+                "measured_on": "2026-10-03",
+                "conditions": "As above, slowest of the audit's cold probes."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 210,
+                "basis": "own_probe",
+                "source": "providers/fpt-ai.md:209",
+                "measured_on": "2026-10-03",
+                "conditions": "Unauthenticated request rejected before decoding, on a reused HTTP/2 connection."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 530,
+                "basis": "own_probe",
+                "source": "verify/group-10.md:63",
+                "measured_on": "2026-10-03",
+                "conditions": "The fact-check's request with no key, rejected with HTTP 401 before decoding."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 780,
+                "basis": "own_probe",
+                "source": "verify/group-10.md:63",
+                "measured_on": "2026-10-03",
+                "conditions": "The fact-check's request with a bogus key, rejected with HTTP 401 before decoding."
+              }
+            ],
+            "notes": "The vendor publishes no latency. Every timed request was rejected before decoding, so the figures are a network floor, not transcription time. Measure with a real key before the transport is enabled."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "no_speech_flag"
+          ],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "fpt_raw_body"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/fpt_ai/client.rs:89-190 (request and response code to extract); gateway/src/core/stt/fpt_ai/client.rs:372-407 (buffering); gateway/src/core/stt/fpt_ai/config.rs:23",
+            "notes": "The request code to lift out is FptStt::process_audio, a private method tied to the session buffer: POST https://api.fpt.ai/hmi/asr/general, header api_key, the WAV file as the raw body with Content-Type audio/wav (client.rs:120-126); JSON reply with status 0 success, 1 no voice, 2 cancelled, 9 system busy, and hypotheses[].utterance. It has only been run against a mock the repository wrote (gateway/tests/mock_endpoint_e2e.rs:1006-1029), never against the vendor. Defects to fix when extracting: confidence is a constant 0.9 (client.rs:219); the stored error callback is never invoked and the hang-up upload error is discarded (client.rs:347-349); the vendor's status 9 is read after the HTTP status was already reported to the circuit breaker, so a busy vendor that answers HTTP 200 never trips it (client.rs:132-133 against :164-178); the vendor's reason text is dropped; the request timeout is 60 s (config.rs:26). The vendor's status 1 (no voice) is the only signal usable for dropping a segment; it is recorded as quality_signals no_speech_flag."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_segment_ms": 15000,
+            "request_timeout_ms": 8000,
+            "rationale": "Provisional and inferred, not a vendor fact. The 25 s default exists for Whisper's 30 s window, which does not apply here; the vendor documents no maximum and describes the engine as built for basic command sentences, and a synchronous decode takes longer as audio gets longer. Split at the last pause before 15 s and raise it only after a probe with a real key shows longer segments are accepted and accurate. Uploads in flight stay at the default of two; drop to one for the session after any status 9 (system busy), the vendor's only back-pressure signal. The 8 s request timeout is the audit's conversational budget, not a measurement: the vendor publishes no response time, and the client's own 60 s (config.rs:26) is useless for a turn. Replace it with the measured 99th percentile plus a margin after the first probe with a real key."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/fpt_ai/client.rs:372-407 (send_audio only buffers; the upload happens at hang-up, at a client commit or after 9.6 MB)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "FPT.AI speech-to-text transcribes uploaded files only; the vendor offers no streaming interface. This gateway does not yet split a live call into utterances for it, so for a voice agent that decides when the caller has finished speaking no transcript would arrive until the call ends. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Prepaid packages of minutes priced in Vietnamese dong (2,000, 5,000 or 10,000 minutes; 60 trial minutes a year). How a short request is rounded against the minute quota is not documented. No entry for this provider exists in gateway/src/config/pricing.rs (checked 2026-10-03), so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.fpt.ai/docs/en/speech/api/speech-to-text/",
+          "https://docs.fpt.ai/docs/en/speech/documentation/speech-to-text/",
+          "https://docs.fpt.ai/docs/en/speech/tutorials/speech-to-text/",
+          "https://docs.fpt.ai/docs/en/speech/documentation/stt-pricing/",
+          "https://docs.fpt.ai/docs/en/console/documentation/console/",
+          "https://docs.fpt.ai/sitemap.xml",
+          "https://beei.org/index.php/EEI/article/download/2620/1820"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/fpt_ai/client.rs:89-190",
+          "gateway/src/core/stt/fpt_ai/client.rs:372-407",
+          "gateway/src/core/stt/fpt_ai/config.rs:23",
+          "gateway/src/core/stt/fpt_ai/client.rs:345-349",
+          "gateway/src/core/stt/fpt_ai/config.rs:78-106"
+        ],
+        "unverified": [
+          "transports[0].upload.accepted and upload.preferred (the vendor says only 'Audio file'; WAV is what the gateway sends and was never confirmed at the vendor; a 2020 paper by FPT University authors says the modules do not process non-MP3 files)",
+          "transports[0].limits.max_upload_bytes",
+          "transports[0].limits.max_audio_ms (the gateway's 5-minute constant has no vendor source)",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) and rates (concurrent_requests) (none published)",
+          "transports[0].latency (only an unauthenticated round trip was timed)",
+          "billing.min_billed_ms",
+          "supported language (Vietnamese only rests on the 2020 third-party paper, not on the vendor API page)",
+          "the HTTP status that accompanies JSON status 9 and status 2",
+          "transports[0].segment_profile.max_segment_ms and request_timeout_ms (the audit's budgets, not vendor limits or measurements)",
+          "whether a streaming interface exists behind the vendor's enterprise voicebot contracts (nothing public was found; the 'file upload only' statement rests on the public documentation and its sitemap)",
+          "transports[0].quality_signals (no_speech_flag is the vendor's documented status 1, 'No voice'; never observed in a live reply)",
+          "transports[0].latency.measurements (rejected requests only; no transcription was timed)"
+        ],
+        "notes": "The vendor API has no model parameter. 'general' is the engine segment of the vendor URL path /hmi/asr/general, fixed in the gateway (config.rs:23); it identifies the product in this map and is never sent as a parameter. The vendor documents one interface, a synchronous file POST, and no streaming interface, so segmentation is the only way to use this provider on a call. There is no language, prompt or format parameter, and the reply has no confidence, timestamps or language. An unauthenticated probe confirmed the endpoint is live (HTTP 401); nothing was transcribed. Reuse one HTTP/2 connection, which saved about 0.35 to 0.6 s per request in the probe. The WebSocket uplink decodes Opus to PCM16 before the client; mu-law frames would be wrapped as PCM16 and must be converted first."
+      }
+    },
+    {
+      "id": "fpt-ai:any",
+      "match": {
+        "provider": "fpt-ai",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for live calls exists (not implemented). The only FPT client buffers the whole call and uploads at hang-up or after 9.6 MB (300 s at 16 kHz), so a call gets no transcript while it is in progress. Before enabling, a probe with a real key must confirm that the vendor accepts WAV at all.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 570,
+                "basis": "own_probe",
+                "source": "providers/fpt-ai.md:209",
+                "measured_on": "2026-10-03",
+                "conditions": "Unauthenticated request rejected with HTTP 401 before any decoding, cold connection (fastest of the audit's cold probes): network and TLS only."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 810,
+                "basis": "own_probe",
+                "source": "providers/fpt-ai.md:209",
+                "measured_on": "2026-10-03",
+                "conditions": "As above, slowest of the audit's cold probes."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 210,
+                "basis": "own_probe",
+                "source": "providers/fpt-ai.md:209",
+                "measured_on": "2026-10-03",
+                "conditions": "Unauthenticated request rejected before decoding, on a reused HTTP/2 connection."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 530,
+                "basis": "own_probe",
+                "source": "verify/group-10.md:63",
+                "measured_on": "2026-10-03",
+                "conditions": "The fact-check's request with no key, rejected with HTTP 401 before decoding."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 780,
+                "basis": "own_probe",
+                "source": "verify/group-10.md:63",
+                "measured_on": "2026-10-03",
+                "conditions": "The fact-check's request with a bogus key, rejected with HTTP 401 before decoding."
+              }
+            ],
+            "notes": "The vendor publishes no latency. Every timed request was rejected before decoding, so the figures are a network floor, not transcription time. Measure with a real key before the transport is enabled."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "no_speech_flag"
+          ],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "fpt_raw_body"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/fpt_ai/client.rs:89-190 (request and response code to extract); gateway/src/core/stt/fpt_ai/client.rs:372-407 (buffering); gateway/src/core/stt/fpt_ai/config.rs:23",
+            "notes": "The request code to lift out is FptStt::process_audio, a private method tied to the session buffer: POST https://api.fpt.ai/hmi/asr/general, header api_key, the WAV file as the raw body with Content-Type audio/wav (client.rs:120-126); JSON reply with status 0 success, 1 no voice, 2 cancelled, 9 system busy, and hypotheses[].utterance. It has only been run against a mock the repository wrote (gateway/tests/mock_endpoint_e2e.rs:1006-1029), never against the vendor. Defects to fix when extracting: confidence is a constant 0.9 (client.rs:219); the stored error callback is never invoked and the hang-up upload error is discarded (client.rs:347-349); the vendor's status 9 is read after the HTTP status was already reported to the circuit breaker, so a busy vendor that answers HTTP 200 never trips it (client.rs:132-133 against :164-178); the vendor's reason text is dropped; the request timeout is 60 s (config.rs:26). The vendor's status 1 (no voice) is the only signal usable for dropping a segment; it is recorded as quality_signals no_speech_flag."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_segment_ms": 15000,
+            "request_timeout_ms": 8000,
+            "rationale": "Provisional and inferred, not a vendor fact. The 25 s default exists for Whisper's 30 s window, which does not apply here; the vendor documents no maximum and describes the engine as built for basic command sentences, and a synchronous decode takes longer as audio gets longer. Split at the last pause before 15 s and raise it only after a probe with a real key shows longer segments are accepted and accurate. Uploads in flight stay at the default of two; drop to one for the session after any status 9 (system busy), the vendor's only back-pressure signal. The 8 s request timeout is the audit's conversational budget, not a measurement: the vendor publishes no response time, and the client's own 60 s (config.rs:26) is useless for a turn. Replace it with the measured 99th percentile plus a margin after the first probe with a real key."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/fpt_ai/client.rs:372-407 (send_audio only buffers; the upload happens at hang-up, at a client commit or after 9.6 MB)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "FPT.AI speech-to-text transcribes uploaded files only; the vendor offers no streaming interface. This gateway does not yet split a live call into utterances for it, so for a voice agent that decides when the caller has finished speaking no transcript would arrive until the call ends. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Prepaid packages of minutes priced in Vietnamese dong (2,000, 5,000 or 10,000 minutes; 60 trial minutes a year). How a short request is rounded against the minute quota is not documented. No entry for this provider exists in gateway/src/config/pricing.rs (checked 2026-10-03), so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.fpt.ai/docs/en/speech/api/speech-to-text/"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/fpt_ai/client.rs:89-190",
+          "gateway/src/core/stt/fpt_ai/client.rs:372-407",
+          "gateway/src/core/stt/fpt_ai/config.rs:23",
+          "gateway/src/core/stt/fpt_ai/client.rs:345-349",
+          "gateway/src/core/stt/fpt_ai/config.rs:78-106"
+        ],
+        "unverified": [
+          "transports[0].upload.accepted and upload.preferred (the vendor says only 'Audio file'; WAV is what the gateway sends and was never confirmed at the vendor; a 2020 paper by FPT University authors says the modules do not process non-MP3 files)",
+          "transports[0].limits.max_upload_bytes",
+          "transports[0].limits.max_audio_ms (the gateway's 5-minute constant has no vendor source)",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].limits.rates (requests) and rates (concurrent_requests) (none published)",
+          "transports[0].latency (only an unauthenticated round trip was timed)",
+          "billing.min_billed_ms",
+          "supported language (Vietnamese only rests on the 2020 third-party paper, not on the vendor API page)",
+          "the HTTP status that accompanies JSON status 9 and status 2",
+          "transports[0].segment_profile.max_segment_ms and request_timeout_ms (the audit's budgets, not vendor limits or measurements)",
+          "whether a streaming interface exists behind the vendor's enterprise voicebot contracts (nothing public was found; the 'file upload only' statement rests on the public documentation and its sitemap)",
+          "transports[0].quality_signals (no_speech_flag is the vendor's documented status 1, 'No voice'; never observed in a live reply)",
+          "transports[0].latency.measurements (rejected requests only; no transcription was timed)"
+        ],
+        "notes": "Provider default. The vendor has no model parameter and the client never reads the model string (config.rs:78-106), so any id reaches the same engine as the 'general' row; a session that supplies a model string should be told it is ignored. File upload is the only interface the vendor documents, so the default is file upload."
+      }
+    }
+  ]
+}

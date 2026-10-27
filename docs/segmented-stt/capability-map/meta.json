@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "map_version": "2026-10-04.1",
+  "map_revision": 3,
+  "release": 0,
+  "latency_classes": {
+    "realtime_max_ms": 600,
+    "fast_max_ms": 1200
+  },
+  "sdk_placeholder_models": [
+    "nova-3"
+  ]
+}

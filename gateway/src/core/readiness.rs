@@ -8,24 +8,35 @@
 //! 2. **Enabled-provider credentials present** — every provider whose credentials are configured
 //!    in [`ServerConfig`] is "enabled"; a misconfigured/blank credential makes the instance
 //!    not-ready for that provider.
-//! 3. **Cached TCP reachability (optional)** — a short, cached TCP connect to each enabled
-//!    provider's host:port. A reachable provider keeps the instance ready; an unreachable one
-//!    flips `/readyz` to `503` and is named in the per-provider JSON breakdown.
+//! 3. **Cached TCP reachability (optional)** — a short TCP connect to each enabled provider's
+//!    host:port, all providers at once, the result cached for [`CACHE_TTL`]. A reachable
+//!    provider keeps the instance ready; an unreachable one flips `/readyz` to `503` and is
+//!    named in the per-provider JSON breakdown.
 //!
-//! The probe target for a provider can be overridden with the env var
-//! `WAAV_READINESS_PROBE_<PROVIDER>` (value `host:port`, provider upper-cased with `-`→`_`),
-//! which is also how tests point a provider at a known-closed port to assert the 503 path.
+//! The probe target for a provider is where the gateway actually sends its traffic: the openai
+//! providers' `OPENAI_BASE_URL` when it is set, else the vendor's well-known host. It can be
+//! overridden with `WAAV_READINESS_PROBE_<PROVIDER>` (value `host:port`, provider upper-cased with
+//! `-`→`_`), which is also how tests point a provider at a known-closed port for the 503 path.
+//!
+//! `/readyz` is public and outside the rate limiter, so it must not let a caller make the gateway
+//! open outbound connections at will: concurrent requests share one evaluation and a result is
+//! reused for [`CACHE_TTL`], and every lookup and connect is bounded by [`PROBE_TIMEOUT`] on the
+//! async runtime (a blocking `getaddrinfo` used to hold a blocking-pool thread per request).
 
 use std::collections::BTreeMap;
-use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::config::ServerConfig;
 
-/// How long to wait for a single TCP reachability probe before declaring a provider unreachable.
+/// How long to wait for a single TCP reachability probe (lookup and connect) before declaring a
+/// provider unreachable.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// How long one evaluation answers `/readyz`: a probe storm costs one probe per provider per
+/// window, and a kubelet polling every few seconds still sees a change within one window.
+pub const CACHE_TTL: Duration = Duration::from_secs(10);
 
 /// Per-provider readiness detail in the `/readyz` JSON breakdown.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -94,14 +105,6 @@ fn enabled_provider_targets(config: &ServerConfig) -> BTreeMap<String, Option<(S
         "api.elevenlabs.io",
     );
     add(
-        "openai",
-        config
-            .openai_api_key
-            .as_deref()
-            .is_some_and(|k| !k.is_empty()),
-        "api.openai.com",
-    );
-    add(
         "cartesia",
         config
             .cartesia_api_key
@@ -142,7 +145,40 @@ fn enabled_provider_targets(config: &ServerConfig) -> BTreeMap<String, Option<(S
         "westus.api.cognitive.microsoft.com",
     );
 
+    if config
+        .openai_api_key
+        .as_deref()
+        .is_some_and(|k| !k.is_empty())
+    {
+        out.insert(
+            "openai".to_string(),
+            Some(openai_probe_target(
+                std::env::var("OPENAI_BASE_URL").ok().as_deref(),
+            )),
+        );
+    }
+
     out
+}
+
+/// Where the openai providers send their traffic: `OPENAI_BASE_URL`'s host and port when it is set
+/// (an OpenAI-compatible local server, a proxy), else `api.openai.com:443`. Probing the cloud while
+/// every request went to a local server made an offline gateway report itself not ready.
+fn openai_probe_target(base: Option<&str>) -> (String, u16) {
+    base.map(str::trim)
+        .filter(|b| !b.is_empty())
+        .and_then(|b| url::Url::parse(b).ok())
+        .and_then(|u| Some((u.host_str()?.to_string(), u.port_or_known_default()?)))
+        .map(|(host, port)| {
+            // `[::1]` → `::1`: the socket-address lookup takes the bare IPv6 literal.
+            let host = host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .map(str::to_string)
+                .unwrap_or(host);
+            (host, port)
+        })
+        .unwrap_or_else(|| ("api.openai.com".to_string(), 443))
 }
 
 /// Apply the `WAAV_READINESS_PROBE_<PROVIDER>` override if present (host:port).
@@ -157,14 +193,19 @@ fn probe_override(provider: &str) -> Option<(String, u16)> {
     Some((host.to_string(), port))
 }
 
-/// Probe one TCP endpoint with a short timeout. `true` if a connection was established.
-fn tcp_reachable(host: &str, port: u16) -> bool {
-    let addrs = match (host, port).to_socket_addrs() {
-        Ok(a) => a,
-        Err(_) => return false,
+/// Probe one TCP endpoint: the lookup and the connect each bounded by [`PROBE_TIMEOUT`], on the
+/// async runtime, so no request waits on an unbounded `getaddrinfo`. `true` if a connection was
+/// established.
+async fn tcp_reachable(host: &str, port: u16) -> bool {
+    let Ok(Ok(addrs)) =
+        tokio::time::timeout(PROBE_TIMEOUT, tokio::net::lookup_host((host, port))).await
+    else {
+        return false;
     };
     for addr in addrs {
-        if std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok() {
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr)).await
+        {
             return true;
         }
     }
@@ -173,58 +214,89 @@ fn tcp_reachable(host: &str, port: u16) -> bool {
 
 /// Evaluate readiness for the given config.
 ///
-/// `probe_network` gates the (blocking) TCP reachability check: when `false`, only credential
-/// presence is evaluated (`reachable` is reported as `None` but does not, by itself, fail
-/// readiness). When `true`, each enabled provider is TCP-probed and an unreachable provider
-/// flips the report to not-ready.
-pub fn evaluate(config: &ServerConfig, probe_network: bool) -> ReadinessReport {
-    let targets = enabled_provider_targets(config);
+/// `probe_network` gates the TCP reachability check: when `false`, only credential presence is
+/// evaluated (`reachable` is reported as `None` but does not, by itself, fail readiness). When
+/// `true`, every enabled provider is probed at once and an unreachable one flips the report to
+/// not-ready.
+pub async fn evaluate(config: &ServerConfig, probe_network: bool) -> ReadinessReport {
+    run_plan(probe_plan(config), probe_network).await
+}
 
-    let mut providers = Vec::with_capacity(targets.len());
-    for (provider, default_target) in targets {
-        // Credential presence is implied by membership in `enabled_provider_targets`.
-        let credential_present = true;
+/// Each enabled provider and the `host:port` its probe dials (the override wins).
+type ProbePlan = Vec<(String, Option<(String, u16)>)>;
 
-        // Resolve the probe target (override wins over the vendor default).
-        let target = probe_override(&provider).or(default_target);
+fn probe_plan(config: &ServerConfig) -> ProbePlan {
+    enabled_provider_targets(config)
+        .into_iter()
+        .map(|(provider, default_target)| {
+            let target = probe_override(&provider).or(default_target);
+            (provider, target)
+        })
+        .collect()
+}
 
-        let (reachable, ready, detail) = if !probe_network {
-            // Reachability not evaluated; credential presence alone determines readiness.
-            (None, credential_present, None)
-        } else {
-            match target {
-                Some((ref host, port)) => {
-                    let ok = tcp_reachable(host, port);
-                    let detail = if ok {
-                        None
-                    } else {
-                        Some(format!("TCP probe to {host}:{port} failed"))
-                    };
-                    (Some(ok), credential_present && ok, detail)
-                }
-                None => (
+async fn run_plan(targets: ProbePlan, probe_network: bool) -> ReadinessReport {
+    let probes = targets.iter().map(|(_, target)| async move {
+        match target {
+            Some((host, port)) if probe_network => Some(tcp_reachable(host, *port).await),
+            _ => None,
+        }
+    });
+    let reached = futures::future::join_all(probes).await;
+    let providers: Vec<ProviderReadiness> = targets
+        .into_iter()
+        .zip(reached)
+        .map(|((provider, target), reached)| {
+            let (reachable, ready, detail) = match (probe_network, target, reached) {
+                (false, _, _) => (None, true, None),
+                (true, Some((host, port)), Some(ok)) => (
+                    Some(ok),
+                    ok,
+                    (!ok).then(|| format!("TCP probe to {host}:{port} failed")),
+                ),
+                (true, _, _) => (
                     None,
                     false,
                     Some("no probe endpoint could be derived".to_string()),
                 ),
+            };
+            ProviderReadiness {
+                provider,
+                credential_present: true,
+                reachable,
+                ready,
+                detail,
             }
-        };
-
-        providers.push(ProviderReadiness {
-            provider,
-            credential_present,
-            reachable,
-            ready,
-            detail,
-        });
-    }
-
+        })
+        .collect();
     let all_ready = providers.iter().all(|p| p.ready);
     ReadinessReport {
         status: if all_ready { "ready" } else { "not_ready" }.to_string(),
         config_loaded: true,
         providers,
     }
+}
+
+/// The last evaluation: when it was made, for which plan and probe setting, and its report.
+type CachedReport = Option<(std::time::Instant, (ProbePlan, bool), ReadinessReport)>;
+
+/// [`evaluate`] behind a [`CACHE_TTL`] cache. Concurrent callers wait on one lock, so a burst of
+/// requests costs one evaluation; each later caller in the window reads the result. Keyed by what
+/// would be probed, so a different configuration (or a changed override) is never answered from
+/// another's result.
+pub async fn evaluate_cached(config: &ServerConfig, probe_network: bool) -> ReadinessReport {
+    static CACHE: tokio::sync::Mutex<CachedReport> = tokio::sync::Mutex::const_new(None);
+    let key = (probe_plan(config), probe_network);
+    let mut cached = CACHE.lock().await;
+    if let Some((at, cached_key, report)) = cached.as_ref()
+        && *cached_key == key
+        && at.elapsed() < CACHE_TTL
+    {
+        return report.clone();
+    }
+    let report = run_plan(key.0.clone(), probe_network).await;
+    *cached = Some((std::time::Instant::now(), key, report.clone()));
+    report
 }
 
 #[cfg(test)]
@@ -298,20 +370,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_providers_configured_is_ready() {
+    #[tokio::test]
+    async fn no_providers_configured_is_ready() {
         let cfg = base_config();
-        let report = evaluate(&cfg, true);
+        let report = evaluate(&cfg, true).await;
         assert!(report.providers.is_empty());
         assert!(report.is_ready(), "no enabled providers => ready");
         assert_eq!(report.status, "ready");
     }
 
-    #[test]
-    fn credential_only_check_is_ready_without_network() {
+    #[tokio::test]
+    async fn credential_only_check_is_ready_without_network() {
         let mut cfg = base_config();
         cfg.deepgram_api_key = Some("dg-key".to_string());
-        let report = evaluate(&cfg, false);
+        let report = evaluate(&cfg, false).await;
         assert_eq!(report.providers.len(), 1);
         assert_eq!(report.providers[0].provider, "deepgram");
         assert!(report.providers[0].credential_present);
@@ -319,8 +391,8 @@ mod tests {
         assert!(report.is_ready());
     }
 
-    #[test]
-    fn unreachable_provider_makes_not_ready() {
+    #[tokio::test]
+    async fn unreachable_provider_makes_not_ready() {
         // Point deepgram's probe at a closed local port via the override.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -330,7 +402,7 @@ mod tests {
 
         let mut cfg = base_config();
         cfg.deepgram_api_key = Some("dg-key".to_string());
-        let report = evaluate(&cfg, true);
+        let report = evaluate(&cfg, true).await;
 
         unsafe { std::env::remove_var("WAAV_READINESS_PROBE_DEEPGRAM") };
 
@@ -339,5 +411,61 @@ mod tests {
         assert!(!report.providers[0].ready);
         assert!(!report.is_ready(), "unreachable enabled provider => 503");
         assert_eq!(report.status, "not_ready");
+    }
+
+    #[test]
+    fn the_openai_probe_follows_openai_base_url() {
+        assert_eq!(
+            openai_probe_target(Some("http://127.0.0.1:8080")),
+            ("127.0.0.1".to_string(), 8080)
+        );
+        assert_eq!(
+            openai_probe_target(Some("https://llm.lan/v1")),
+            ("llm.lan".to_string(), 443)
+        );
+        assert_eq!(
+            openai_probe_target(Some("http://[::1]:9000/v1")),
+            ("::1".to_string(), 9000)
+        );
+        for unset in [None, Some(""), Some("  "), Some("not a url")] {
+            assert_eq!(
+                openai_probe_target(unset),
+                ("api.openai.com".to_string(), 443),
+                "{unset:?}"
+            );
+        }
+    }
+
+    /// A reachable local server answers ready, and the probe dialled it (not api.openai.com).
+    #[tokio::test]
+    async fn a_reachable_override_is_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // SAFETY: test-only env, this provider's override only; restored below.
+        unsafe { std::env::set_var("WAAV_READINESS_PROBE_CARTESIA", format!("127.0.0.1:{port}")) };
+        let mut cfg = base_config();
+        cfg.cartesia_api_key = Some("ct-key".to_string());
+        let report = evaluate(&cfg, true).await;
+        unsafe { std::env::remove_var("WAAV_READINESS_PROBE_CARTESIA") };
+        assert_eq!(report.providers[0].reachable, Some(true));
+        assert!(report.is_ready());
+    }
+
+    /// Within the window a second request reuses the evaluation instead of probing again.
+    #[tokio::test]
+    async fn a_burst_of_requests_costs_one_evaluation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // SAFETY: test-only env, this provider's override only; restored below.
+        unsafe { std::env::set_var("WAAV_READINESS_PROBE_HUME", format!("127.0.0.1:{port}")) };
+        let mut cfg = base_config();
+        cfg.hume_api_key = Some("hm-key".to_string());
+        let reports = futures::future::join_all((0..20).map(|_| evaluate_cached(&cfg, true))).await;
+        drop(listener);
+        // The listener is gone; a fresh probe would now fail, the cached result does not.
+        let after = evaluate_cached(&cfg, true).await;
+        unsafe { std::env::remove_var("WAAV_READINESS_PROBE_HUME") };
+        assert!(reports.iter().all(|r| r == &reports[0]));
+        assert_eq!(after, reports[0]);
     }
 }

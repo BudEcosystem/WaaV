@@ -56,18 +56,36 @@ pub fn is_agent_model(model: &str) -> bool {
 
 /// Everything decided before the upgrade.
 pub struct PreparedCascade {
-    pub caller: Caller,
-    pub agent: ResolvedVoiceAgent,
     pub model: String,
-    pub credential: String,
+    pub source: CascadeSource,
+}
+
+/// Who answers the session's turns.
+pub enum CascadeSource {
+    /// A Bud voice agent (`?model=prompt:<agent>`), acting as its caller.
+    Agent {
+        caller: Caller,
+        agent: ResolvedVoiceAgent,
+        credential: String,
+    },
+    /// A standalone gateway's server alias (`?model=<alias>`, `openai_compatible: true`): its
+    /// speech-to-text, LLM and text-to-speech legs, run by the conversation loop.
+    Alias {
+        name: String,
+        def: crate::core::alias::AliasDefinition,
+        auth: crate::auth::Auth,
+    },
 }
 
 impl std::fmt::Debug for PreparedCascade {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedCascade")
-            .field("model", &self.model)
-            .field("version", &self.agent.version)
-            .finish()
+        let mut d = f.debug_struct("PreparedCascade");
+        d.field("model", &self.model);
+        match &self.source {
+            CascadeSource::Agent { agent, .. } => d.field("version", &agent.version),
+            CascadeSource::Alias { name, .. } => d.field("alias", name),
+        };
+        d.finish()
     }
 }
 
@@ -121,11 +139,104 @@ pub async fn prepare(
             .param("model"),
         })?;
     Ok(PreparedCascade {
-        caller,
+        source: CascadeSource::Agent {
+            caller,
+            credential: hs.credential.expose().to_string(),
+            agent,
+        },
         model: hs.model,
-        credential: hs.credential.expose().to_string(),
-        agent,
     })
+}
+
+/// A standalone gateway (no Bud control plane): authenticate the handshake's key with the
+/// gateway's own authenticators and resolve `?model` to a server alias marked
+/// `openai_compatible: true` whose legs make a voice pipeline (speech-to-text, an LLM,
+/// text-to-speech).
+pub async fn prepare_alias(
+    state: &AppState,
+    query: Option<&str>,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<PreparedCascade, HandshakeError> {
+    let model = handshake::parse_model(query, headers)?;
+    let auth = match handshake::extract_credential(headers)? {
+        Some(credential) => crate::auth::standalone::authenticate_bearer(
+            state,
+            credential.expose(),
+            headers,
+            path,
+            "GET",
+        )
+        .await
+        .map_err(standalone_refusal)?,
+        None if !state.config.auth_required => crate::auth::Auth::empty(),
+        None => return Err(handshake::missing_credential()),
+    };
+    let def = crate::core::alias::global_aliases()
+        .resolve(&model)
+        .filter(|d| d.openai_compatible)
+        .ok_or_else(|| {
+            HandshakeError::new(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                format!(
+                    "Model '{model}' not found: name a server alias marked `openai_compatible: true`."
+                ),
+            )
+            .param("model")
+        })?;
+    let missing: Vec<&str> = [
+        ("stt", def.stt.is_none()),
+        ("llm", def.llm.is_none()),
+        ("tts", def.tts.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(leg, absent)| absent.then_some(leg))
+    .collect();
+    if !missing.is_empty() {
+        return Err(HandshakeError::new(
+            StatusCode::BAD_REQUEST,
+            "alias_not_realtime",
+            format!(
+                "Alias '{model}' has no {} leg: a realtime session needs speech-to-text, an LLM and \
+                 text-to-speech. (Relaying an alias to a vendor's own realtime API is not supported \
+                 without the Bud control plane.)",
+                missing.join(", ")
+            ),
+        )
+        .param("model"));
+    }
+    Ok(PreparedCascade {
+        source: CascadeSource::Alias {
+            name: model.clone(),
+            def,
+            auth,
+        },
+        model,
+    })
+}
+
+/// A standalone authenticator's refusal, in the handshake's (OpenAI) envelope, with the status
+/// the middleware would answer.
+fn standalone_refusal(e: crate::errors::auth_error::AuthError) -> HandshakeError {
+    let status = e.status_code();
+    let (code, message) = match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ("invalid_api_key", "Invalid API key."),
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => (
+            "auth_unavailable",
+            "The gateway's authentication service is unavailable; retry shortly.",
+        ),
+        _ => (
+            "server_error",
+            "The gateway could not authenticate the request.",
+        ),
+    };
+    let refusal = HandshakeError::new(status, code, message);
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        refusal.retry_after(1)
+    } else {
+        refusal
+    }
 }
 
 // =============================================================================================
@@ -184,6 +295,10 @@ struct UserItem {
     /// answered before any of them came.
     text: String,
     due: bool,
+    /// `speech_stopped` and `committed` were sent (a segmented turn's detector ended it).
+    stopped: bool,
+    /// The transcript already sent as deltas (a segmented turn's text grows per segment).
+    shown: String,
 }
 
 #[derive(Debug)]
@@ -209,6 +324,8 @@ struct Resp {
 pub struct CascadeGa {
     session_id: String,
     model: String,
+    /// A standalone alias session's alias (`None` for a Bud voice agent).
+    alias: Option<String>,
     prompt_name: String,
     version: i64,
     stt_endpoint: String,
@@ -252,7 +369,32 @@ pub struct CascadeGa {
     /// Interaction mode: agent audio that came ahead of its line's transcript.
     held: Vec<Bytes>,
     held_bytes: usize,
+    /// `ready.stt.transcription_mode` of the inner session, once it is ready.
+    stt_mode: Option<String>,
+    /// `bud.session.stt` and `bud.session.warning` (`WAAV_REALTIME_BUD_SESSION_EVENTS`, default on).
+    bud_events: bool,
+    stt_announced: bool,
 }
+
+/// `WAAV_REALTIME_BUD_SESSION_EVENTS`: anything but `off`, `false` or `0` keeps the Bud events on.
+fn bud_session_events_enabled() -> bool {
+    std::env::var("WAAV_REALTIME_BUD_SESSION_EVENTS")
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "0"
+            )
+        })
+        .unwrap_or(true)
+}
+
+/// The `/ws` codes the gateway, not the caller, is responsible for.
+const SERVER_SIDE_STT_CODES: [&str; 4] = [
+    "stt_segmentation_unavailable",
+    "stt_overloaded",
+    "stt_unavailable",
+    "deployment_changed",
+];
 
 fn new_id(prefix: &str) -> String {
     format!("{prefix}_bud_{}", uuid::Uuid::new_v4().simple())
@@ -266,6 +408,15 @@ pub(super) fn event(kind: &str, body: Value) -> String {
     m.insert("type".into(), Value::from(kind));
     m.insert("event_id".into(), Value::from(next_event_id()));
     Value::Object(m).to_string()
+}
+
+/// A `bud.*` event: `event_id` is `evt_bud_…`.
+fn bud_event(kind: &str, body: Value) -> String {
+    let mut v = json!({"type": kind, "event_id": next_event_id()});
+    if let (Some(o), Some(b)) = (v.as_object_mut(), body.as_object()) {
+        o.extend(b.clone());
+    }
+    v.to_string()
 }
 
 fn refuse(param: &str, message: &str, event_id: Option<&str>) -> String {
@@ -297,7 +448,7 @@ fn ga_usage(usage: &Value) -> Value {
 
 /// The `bud.*` name of an interaction-mode event that keeps its body
 /// (`docs/duplex-agent/providers/wire_events.md`).
-pub(super) fn bud_event(kind: &str) -> Option<&'static str> {
+pub(super) fn bud_event_name(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "unverified_claim" => "bud.claim.unverified",
         "task_created" => "bud.task.created",
@@ -332,6 +483,7 @@ fn error_kind(code: &str) -> &'static str {
         | "server_shutdown"
         | "session_limit"
         | "idle_timeout" => "server_error",
+        c if SERVER_SIDE_STT_CODES.contains(&c) => "server_error",
         _ => "invalid_request_error",
     }
 }
@@ -342,6 +494,7 @@ impl CascadeGa {
         Self {
             session_id: session_id.to_string(),
             model: model.to_string(),
+            alias: None,
             prompt_name: agent.prompt_name.clone(),
             version: agent.version,
             stt_endpoint: e.stt.endpoint_id.clone(),
@@ -373,7 +526,90 @@ impl CascadeGa {
             turn_seen: 0,
             held: Vec::new(),
             held_bytes: 0,
+            stt_mode: None,
+            bud_events: bud_session_events_enabled(),
+            stt_announced: false,
         }
+    }
+
+    /// A standalone alias session: the alias's legs, server turn detection (the conversation loop
+    /// answers when the caller stops), interruptible replies. The caller may pick the voice, speed
+    /// and transcription language before the session starts, as a `/ws` client may.
+    pub fn for_alias(
+        session_id: &str,
+        model: &str,
+        name: &str,
+        def: &crate::core::alias::AliasDefinition,
+    ) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+            alias: Some(name.to_string()),
+            prompt_name: name.to_string(),
+            version: 0,
+            stt_endpoint: def
+                .stt
+                .as_ref()
+                .and_then(|l| l.model.clone())
+                .unwrap_or_default(),
+            voice: def.tts.as_ref().and_then(|l| l.voice.clone()),
+            speed: None,
+            language: def.stt.as_ref().and_then(|l| l.language.clone()),
+            allow: ["stt.language", "tts.voice", "tts.speed"]
+                .map(String::from)
+                .to_vec(),
+            text_only: false,
+            manual: false,
+            semantic: false,
+            interrupt_response: true,
+            eagerness: "auto".to_string(),
+            eagerness_changed: false,
+            variables: None,
+            started: false,
+            turns_ran: false,
+            user: UserItem::default(),
+            typed: None,
+            response: None,
+            items: HashMap::new(),
+            last_item_id: None,
+            clock: std::time::Instant::now(),
+            tools: Vec::new(),
+            instructions: None,
+            staged: false,
+            metadata: None,
+            interaction: false,
+            floor: false,
+            turn_seen: 0,
+            held: Vec::new(),
+            held_bytes: 0,
+            stt_mode: None,
+            bud_events: bud_session_events_enabled(),
+            stt_announced: false,
+        }
+    }
+
+    /// The alias a standalone session runs, if it is one.
+    pub fn alias(&self) -> Option<&str> {
+        self.alias.as_deref()
+    }
+
+    pub fn set_bud_session_events(&mut self, on: bool) {
+        self.bud_events = on;
+    }
+
+    pub fn is_manual(&self) -> bool {
+        self.manual
+    }
+
+    /// The inner session's turns are the gateway's: its detector times speech and its text grows
+    /// per uploaded segment.
+    fn segmented(&self) -> bool {
+        self.stt_mode.as_deref() == Some("segmented")
+    }
+
+    /// A model whose client buffers until the client commits: only a manual turn can end.
+    fn buffered(&self) -> bool {
+        self.stt_mode.as_deref() == Some("buffered")
     }
 
     pub fn is_started(&self) -> bool {
@@ -410,7 +646,11 @@ impl CascadeGa {
             "instructions": self.instructions.as_deref().unwrap_or_default(),
             "tools": self.tools,
             "tool_choice": "auto",
-            "prompt": {"id": self.prompt_name, "version": self.version.to_string()},
+            "prompt": if self.alias.is_some() {
+                Value::Null
+            } else {
+                json!({"id": self.prompt_name, "version": self.version.to_string()})
+            },
             "audio": {
                 "input": {"format": format, "turn_detection": turn_detection,
                           "transcription": {"model": self.stt_endpoint, "language": self.language}},
@@ -437,6 +677,13 @@ impl CascadeGa {
             variables: self.variables.clone(),
             text_only: Some(self.text_only),
         };
+        let (stt, tts) = self.leg_configs();
+        (agent, stt, tts)
+    }
+
+    /// The legs' `/ws` configs: the GA audio format and what the caller may choose. Providers and
+    /// models are left empty for the agent (or alias) to supply.
+    pub fn leg_configs(&self) -> (STTWebSocketConfig, Option<TTSWebSocketConfig>) {
         let mut stt = crate::handlers::ws::config::default_agent_stt_config();
         stt.sample_rate = GA_RATE;
         if self.allows("stt.language")
@@ -459,7 +706,7 @@ impl CascadeGa {
                 eager: false,
             });
         }
-        (agent, stt, tts)
+        (stt, tts)
     }
 
     // ---------------------------------------------------------------------------------------
@@ -692,7 +939,11 @@ impl CascadeGa {
             } else if text.is_some() {
                 out.push(refuse(
                     "session.instructions",
-                    "A voice agent's instructions are its own (set in the agent); `instructions` is ignored.",
+                    if self.alias.is_some() {
+                        "An alias session's instructions are the server alias's (its `llm.system_prompt`); `instructions` is ignored."
+                    } else {
+                        "A voice agent's instructions are its own (set in the agent); `instructions` is ignored."
+                    },
                     eid,
                 ));
             }
@@ -709,12 +960,22 @@ impl CascadeGa {
             } else if !tools.is_empty() {
                 out.push(refuse(
                     "session.tools",
-                    "A voice agent's tools are its own (MCP, native, A2A); client tools are not supported (NG-2).",
+                    if self.alias.is_some() {
+                        "Client tools are not supported on an alias session."
+                    } else {
+                        "A voice agent's tools are its own (MCP, native, A2A); client tools are not supported (NG-2)."
+                    },
                     eid,
                 ));
             }
         }
-        if let Some(p) = s.get("prompt").filter(|p| !p.is_null()) {
+        if self.alias.is_some() && s.get("prompt").is_some_and(|p| !p.is_null()) {
+            out.push(refuse(
+                "session.prompt",
+                "An alias session has no prompt or variables; its settings are the server alias's.",
+                eid,
+            ));
+        } else if let Some(p) = s.get("prompt").filter(|p| !p.is_null()) {
             let id = p.get("id").and_then(Value::as_str).unwrap_or_default();
             let id = id.strip_prefix("prompt:").unwrap_or(id);
             let version = p.get("version").and_then(|v| {
@@ -756,7 +1017,13 @@ impl CascadeGa {
         }
         if let Some(m) = s.get("output_modalities").and_then(Value::as_array) {
             let text_only = m.iter().any(|x| x == "text") && !m.iter().any(|x| x == "audio");
-            if text_only != self.text_only {
+            if text_only && self.alias.is_some() {
+                out.push(refuse(
+                    "session.output_modalities",
+                    "An alias session speaks: text-only output is not available.",
+                    eid,
+                ));
+            } else if text_only != self.text_only {
                 if self.started {
                     out.push(refuse(
                         "session.output_modalities",
@@ -797,7 +1064,20 @@ impl CascadeGa {
                     // `{"type": "none"}` for the same.
                     let manual =
                         td.is_null() || td.get("type").and_then(Value::as_str) == Some("none");
-                    if manual != self.manual {
+                    if manual && self.alias.is_some() {
+                        out.push(refuse(
+                            "session.audio.input.turn_detection",
+                            "An alias session takes turns on the server (server_vad): it answers when the caller stops speaking.",
+                            eid,
+                        ));
+                    } else if self.manual && !manual && self.buffered() {
+                        out.push(gateway_error(
+                            "stt_live_unsupported",
+                            "This agent's speech-to-text model returns text only when the audio buffer is committed, so the gateway cannot detect turns on it. The session stays in manual mode.",
+                            Some("session.audio.input.turn_detection"),
+                            eid,
+                        ));
+                    } else if manual != self.manual {
                         self.manual = manual;
                         acts.push(ClientAct::Manual(manual));
                     }
@@ -1008,16 +1288,25 @@ impl CascadeGa {
         self.open_user(true, out)
     }
 
+    fn user_item_at(&mut self, audio_start_ms: u64, out: &mut Vec<String>) -> String {
+        self.open_user_at(true, audio_start_ms, out)
+    }
+
     /// The caller's item in progress, opened when there is none. `speech`: its opening is
     /// also the start of the caller's speech.
     fn open_user(&mut self, speech: bool, out: &mut Vec<String>) -> String {
+        let now = self.clock.elapsed().as_millis() as u64;
+        self.open_user_at(speech, now, out)
+    }
+
+    fn open_user_at(&mut self, speech: bool, audio_start_ms: u64, out: &mut Vec<String>) -> String {
         if let Some(id) = &self.user.id {
             return id.clone();
         }
         let id = new_id("item");
         self.user = UserItem {
             id: Some(id.clone()),
-            started_ms: self.clock.elapsed().as_millis() as u64,
+            started_ms: audio_start_ms,
             ..UserItem::default()
         };
         let item = json!({"id": id, "object": "realtime.item", "type": "message", "role": "user",
@@ -1028,13 +1317,14 @@ impl CascadeGa {
         ));
         self.last_item_id = Some(id.clone());
         if speech {
-            self.speech_edge(true, out);
+            self.speech_edge(true, None, out);
         }
         id
     }
 
-    /// `speech_started` or `speech_stopped` for the caller's item, once per change.
-    fn speech_edge(&mut self, speaking: bool, out: &mut Vec<String>) {
+    /// `speech_started` or `speech_stopped` for the caller's item, once per change. `at_ms`: when
+    /// the speech stopped (the detector's time on a segmented turn), else now.
+    fn speech_edge(&mut self, speaking: bool, at_ms: Option<u64>, out: &mut Vec<String>) {
         let Some(id) = self.user.id.as_deref() else {
             return;
         };
@@ -1056,20 +1346,74 @@ impl CascadeGa {
         } else {
             event(
                 "input_audio_buffer.speech_stopped",
-                json!({"audio_end_ms": now, "item_id": id}),
+                json!({"audio_end_ms": at_ms.unwrap_or(now), "item_id": id}),
             )
         });
     }
 
-    fn close_user(&mut self, transcript: &str, out: &mut Vec<String>) {
-        self.speech_edge(false, out);
-        let Some(id) = std::mem::take(&mut self.user).id else {
+    /// `speech_stopped` (when the caller was speaking) and `committed` for the open user item,
+    /// once.
+    fn stop_user(&mut self, audio_end_ms: Option<u64>, out: &mut Vec<String>) {
+        let Some(id) = self.user.id.clone().filter(|_| !self.user.stopped) else {
             return;
         };
+        self.user.stopped = true;
+        self.speech_edge(false, audio_end_ms, out);
         out.push(event(
             "input_audio_buffer.committed",
             json!({"previous_item_id": Value::Null, "item_id": id}),
         ));
+    }
+
+    /// A segmented turn's text so far: the part not yet shown, when the text only grew.
+    fn grow_user(&mut self, text: &str, out: &mut Vec<String>) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let item = self.user_item(out);
+        if let Some(delta) = text
+            .strip_prefix(self.user.shown.as_str())
+            .filter(|d| !d.is_empty())
+        {
+            out.push(event(
+                "conversation.item.input_audio_transcription.delta",
+                json!({"item_id": item, "content_index": 0, "delta": delta}),
+            ));
+            self.user.shown = text.to_string();
+        }
+    }
+
+    /// The open user item's transcription failed: `…transcription.failed` (the item stays open
+    /// unless `close`).
+    fn fail_user(&mut self, code: &str, message: &str, close: bool, out: &mut Vec<String>) {
+        let Some(id) = self.user.id.clone() else {
+            return;
+        };
+        if close {
+            self.stop_user(None, out);
+        }
+        out.push(event(
+            "conversation.item.input_audio_transcription.failed",
+            json!({"item_id": id, "content_index": 0,
+                   "error": {"type": "transcription_error", "code": code, "message": message, "param": Value::Null}}),
+        ));
+        if close {
+            self.user.id = None;
+            let item = json!({"id": id, "object": "realtime.item", "type": "message", "role": "user",
+                              "status": "incomplete", "content": [{"type": "input_audio", "transcript": Value::Null}]});
+            out.push(event("conversation.item.done", json!({"item": item})));
+        }
+    }
+
+    fn close_user(&mut self, transcript: &str, out: &mut Vec<String>) {
+        if self.user.id.is_none() {
+            return;
+        }
+        self.stop_user(None, out);
+        let Some(id) = std::mem::take(&mut self.user).id else {
+            return;
+        };
         out.push(event(
             "conversation.item.input_audio_transcription.completed",
             json!({"item_id": id, "content_index": 0, "transcript": transcript}),
@@ -1243,6 +1587,9 @@ impl CascadeGa {
     pub fn core(&mut self, msg: &OutgoingMessage) -> Vec<String> {
         let mut out = Vec::new();
         match msg {
+            OutgoingMessage::STTResult { transcript, .. } if self.segmented() => {
+                self.grow_user(transcript, &mut out);
+            }
             OutgoingMessage::STTResult {
                 transcript,
                 is_final,
@@ -1443,6 +1790,16 @@ impl CascadeGa {
                     None,
                 ));
             }
+            OutgoingMessage::DagError { code, message, .. } => {
+                out.push(super::policy::error_event(
+                    &next_event_id(),
+                    error_kind(code),
+                    code,
+                    message,
+                    None,
+                    None,
+                ));
+            }
             OutgoingMessage::Error { message } => {
                 // Leg refusals and setup failures are `code: message`.
                 let (code, text) = match message.split_once(": ") {
@@ -1460,16 +1817,38 @@ impl CascadeGa {
                     None,
                 ));
             }
-            OutgoingMessage::Authenticated { .. } => {
-                out.push(event("bud.session.authenticated", json!({})));
+            OutgoingMessage::CodedError { message, code, .. } => {
+                let text = message
+                    .strip_prefix(code.as_str())
+                    .and_then(|t| t.strip_prefix(": "))
+                    .unwrap_or(message);
+                out.push(super::policy::error_event(
+                    &next_event_id(),
+                    error_kind(code),
+                    code,
+                    text,
+                    None,
+                    None,
+                ));
             }
-            // The session runs interaction mode: its resolved settings.
             OutgoingMessage::Ready {
-                interaction: Some(echo),
-                ..
+                stt, interaction, ..
             } => {
-                self.interaction = true;
-                out.push(event("bud.interaction.state", json!({"interaction": echo})));
+                if let Some(stt) = stt {
+                    self.stt_mode = stt
+                        .get("transcription_mode")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if self.segmented() && self.bud_events && !self.stt_announced {
+                        self.stt_announced = true;
+                        out.push(bud_event("bud.session.stt", json!({"stt": stt})));
+                    }
+                }
+                // The session runs interaction mode: its resolved settings.
+                if let Some(echo) = interaction {
+                    self.interaction = true;
+                    out.push(event("bud.interaction.state", json!({"interaction": echo})));
+                }
             }
             OutgoingMessage::ConfigWarning {
                 code,
@@ -1480,6 +1859,65 @@ impl CascadeGa {
                     "bud.warning",
                     json!({"code": code, "message": message, "detail": detail}),
                 ));
+            }
+            OutgoingMessage::SttWarning {
+                code,
+                message,
+                detail,
+            } if code == "stt_segment_failed" && self.segmented() && self.user.id.is_some() => {
+                let _ = detail;
+                self.fail_user(code, message, false, &mut out);
+            }
+            OutgoingMessage::SttWarning {
+                code,
+                message,
+                detail,
+            }
+            | OutgoingMessage::ConfigWarning {
+                code,
+                message,
+                detail,
+            } => {
+                if code.starts_with("stt_")
+                    && code != "stt_buffered_until_commit"
+                    && self.bud_events
+                {
+                    out.push(bud_event(
+                        "bud.session.warning",
+                        json!({"code": code, "message": message, "detail": detail.clone().unwrap_or_else(|| json!({}))}),
+                    ));
+                } else if code == "stt_buffered_until_commit" {
+                    debug!(session = %self.session_id, "speech-to-text text arrives at each commit");
+                }
+            }
+            OutgoingMessage::VadEvent {
+                event: kind,
+                audio_ms,
+                had_transcript,
+                reason,
+                ..
+            } if self.segmented() => match kind.as_str() {
+                "turn_start" => {
+                    let at = audio_ms.unwrap_or_else(|| self.clock.elapsed().as_millis() as u64);
+                    self.user_item_at(at, &mut out);
+                }
+                "turn_end" => self.stop_user(*audio_ms, &mut out),
+                "turn_closed" if *had_transcript == Some(false) && self.user.id.is_some() => {
+                    if reason.as_deref() == Some("transcription_failed") {
+                        self.fail_user(
+                            "transcription_failed",
+                            "The caller's speech in this turn could not be transcribed.",
+                            true,
+                            &mut out,
+                        );
+                    } else {
+                        self.close_user("", &mut out);
+                    }
+                }
+                _ => {}
+            },
+            OutgoingMessage::Authenticated { .. } => {
+                out.push(event("bud.session.authenticated", json!({})));
             }
             _ => {}
         }
@@ -1539,7 +1977,7 @@ impl CascadeGa {
                 if caller {
                     self.open_user(false, &mut out);
                 }
-                self.speech_edge(caller, &mut out);
+                self.speech_edge(caller, None, &mut out);
                 out.push(event("bud.floor.state", body));
             }
             "agent_audio_stopped" => {
@@ -1565,7 +2003,7 @@ impl CascadeGa {
             // Not sent on this protocol: each line already opens and closes its own response,
             // and a client of it pings the socket itself.
             "audio_segment" | "heartbeat" => {}
-            other => match bud_event(other) {
+            other => match bud_event_name(other) {
                 Some(name) => out.push(event(name, body)),
                 None => warn!(
                     event = other,
@@ -1707,23 +2145,41 @@ pub async fn run(
     let (sink, mut stream) = socket.split();
     let (client, writer) = spawn_writer(sink, CLIENT_QUEUE);
     let session_id = format!("sess_bud_{}", uuid::Uuid::new_v4().simple());
-    let mut ga = CascadeGa::new(&session_id, &p.model, &p.agent);
-    info!(session = %session_id, agent = %p.agent.prompt_name, version = p.agent.version, "voice agent realtime session opened");
+    let mut ga = match &p.source {
+        CascadeSource::Agent { agent, .. } => {
+            info!(session = %session_id, agent = %agent.prompt_name, version = agent.version, "voice agent realtime session opened");
+            CascadeGa::new(&session_id, &p.model, agent)
+        }
+        CascadeSource::Alias { name, def, .. } => {
+            info!(session = %session_id, alias = %name, "alias realtime session opened");
+            CascadeGa::for_alias(&session_id, &p.model, name, def)
+        }
+    };
     if !send(&client, vec![ga.session_created()]).await {
         return;
     }
 
     // The in-process `/ws` session.
-    let auth = match state.bud_mode.as_ref() {
-        Some(bud) => bud.authenticate(&p.credential).await.unwrap_or_default(),
-        None => Default::default(),
+    let conn = match &p.source {
+        CascadeSource::Agent {
+            caller, credential, ..
+        } => {
+            let auth = match state.bud_mode.as_ref() {
+                Some(bud) => bud.authenticate(credential).await.unwrap_or_default(),
+                None => Default::default(),
+            };
+            let conn = Arc::new(RwLock::new(ConnectionState::with_auth(auth)));
+            {
+                let mut c = conn.write().await;
+                c.credential = Some(crate::auth::SessionCredential::new(credential.clone()));
+                c.caller_check = Some(caller.check.clone());
+            }
+            conn
+        }
+        CascadeSource::Alias { auth, .. } => {
+            Arc::new(RwLock::new(ConnectionState::with_auth(auth.clone())))
+        }
     };
-    let conn = Arc::new(RwLock::new(ConnectionState::with_auth(auth)));
-    {
-        let mut c = conn.write().await;
-        c.credential = Some(crate::auth::SessionCredential::new(p.credential.clone()));
-        c.caller_check = Some(p.caller.check.clone());
-    }
     let (core_tx, mut core_rx) = mpsc::channel::<MessageRoute>(CORE_QUEUE);
     let grace = tokio::time::sleep(START_GRACE);
     tokio::pin!(grace);
@@ -1797,7 +2253,7 @@ pub async fn run(
         }
     };
 
-    debug!(session = %session_id, reason = end.1, "voice agent realtime session ending");
+    debug!(session = %session_id, reason = end.1, "cascade realtime session ending");
     // Flush what the core already said (e.g. the error before a revocation close).
     while let Ok(route) = core_rx.try_recv() {
         match route {
@@ -1815,7 +2271,7 @@ pub async fn run(
     // A realtime client does not come back to a session: its end is always a clean one.
     crate::handlers::ws::handler::teardown_session(&conn, &state, true).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
-    info!(session = %session_id, reason = end.1, "voice agent realtime session closed");
+    info!(session = %session_id, reason = end.1, "cascade realtime session closed");
 }
 
 /// Start the in-process `/ws` agent session with the GA session's settings, then replay what the
@@ -1829,7 +2285,46 @@ async fn start_core(
     pending: &mut Vec<ClientAct>,
 ) -> bool {
     ga.mark_started();
+    if let Some(alias) = ga.alias().map(str::to_string) {
+        // The alias supplies the legs and the LLM; the configs carry the GA audio format and the
+        // caller's choices.
+        let (stt, tts) = ga.leg_configs();
+        let keep = crate::handlers::ws::config_handler::handle_config_message(
+            Some(ga.session_id.clone()),
+            Some(true),
+            Some(stt),
+            tts,
+            None,
+            None,
+            None,
+            None,
+            Some(alias),
+            conn,
+            core_tx,
+            state,
+        )
+        .await;
+        // An alias with an `interaction` block runs interaction mode in place of the loop.
+        let running = {
+            let c = conn.read().await;
+            c.conversation.is_some() || c.interaction.is_some()
+        };
+        if !keep || !running {
+            warn!("alias realtime session could not start its conversation loop");
+            // The core sent its refusal as `error` (+ a close); the loop relays and ends.
+            return keep && conn.read().await.voice_manager.is_some();
+        }
+        for pcm in held.drain(..) {
+            crate::handlers::ws::audio_handler::handle_audio_message(pcm, conn, core_tx).await;
+        }
+        for act in pending.drain(..) {
+            apply(state, conn, core_tx, act).await;
+        }
+        return true;
+    }
     let (agent, stt, tts) = ga.core_config();
+    // The resolver judges the session by the turn mode the client chose, not the agent's default.
+    conn.write().await.agent_manual = Some(ga.manual);
     let keep = crate::handlers::ws::config_handler::handle_config_message(
         Some(ga.session_id.clone()),
         Some(true),
@@ -1876,9 +2371,13 @@ async fn apply(
     core_tx: &mpsc::Sender<MessageRoute>,
     act: ClientAct,
 ) {
-    let (engine, actor) = {
-        let conn = conn.read().await;
-        (conn.agent.clone(), conn.interaction.clone())
+    let (engine, actor, conversation) = {
+        let c = conn.read().await;
+        (
+            c.agent.clone(),
+            c.interaction.clone(),
+            c.conversation.clone(),
+        )
     };
     // Interaction mode: the actor takes the turns, the cuts and its own three messages. It
     // measures what the caller heard itself, and the agent's runs take no item of a session's.
@@ -1949,17 +2448,28 @@ async fn apply(
                 engine.respond(text, instructions).await;
             }
         }
+        // An alias session: typed turns and cancels drive its conversation loop. Truncation,
+        // clearing, variables and the modes have nothing to act on there (the GA layer refused
+        // the modes already).
+        ClientAct::Turn(text) if engine.is_none() => {
+            if let Some(conversation) = conversation {
+                let tracker = conn.read().await.task_tracker.clone();
+                tracker.track(
+                    "typed-turn",
+                    tokio::spawn(async move { conversation.take_typed_turn(&text).await }),
+                );
+            }
+        }
+        ClientAct::Cancel if engine.is_none() => {
+            if let Some(conversation) = conversation {
+                conversation.handle_barge_in().await;
+            }
+        }
         ClientAct::Audio(pcm) => {
             crate::handlers::ws::audio_handler::handle_audio_message(pcm, conn, core_tx).await;
         }
         ClientAct::Commit => {
-            let _ = crate::handlers::ws::audio_handler::handle_audio_end(conn, core_tx).await;
-            if let Some(engine) = engine {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    engine.commit_input().await;
-                });
-            }
+            crate::handlers::ws::processor::commit_client_audio(conn, core_tx, true).await;
         }
         ClientAct::Clear => {
             if let Some(engine) = engine {

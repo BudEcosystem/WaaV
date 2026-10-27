@@ -1570,6 +1570,39 @@ pub(crate) fn deployment_extras(
     extras
 }
 
+/// A deployment whose data settings (`stt.data_region`, `stt.data_retention`, Release 5) its
+/// vendor's upload client cannot carry, refused before any audio is sent. The operator's to fix,
+/// like a misconfiguration.
+fn data_setting_refusal(
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+    name: &str,
+) -> Option<Response> {
+    use crate::core::stt::data_settings::{self, ClientPath, DataSettings};
+    let data = DataSettings::from_settings(&endpoint.config.stt());
+    let path = if crate::core::stt::prerecorded::PrerecordedVendor::from_provider(&endpoint.vendor)
+        .is_some()
+    {
+        ClientPath::Prerecorded
+    } else {
+        ClientPath::Streaming
+    };
+    let unapplied: Vec<(&'static str, &'static str)> =
+        data_settings::unapplied(&endpoint.vendor, path, data, endpoint.api_base.is_some())
+            .into_iter()
+            .map(|u| (u.setting, u.reason))
+            .collect();
+    if unapplied.is_empty() {
+        return None;
+    }
+    let (text, _) = data_settings::refusal(&endpoint.vendor, &unapplied, true);
+    Some(openai_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "api_error",
+        format!("{}: Endpoint '{name}': {text}", data_settings::REFUSAL_CODE),
+        None,
+    ))
+}
+
 /// A deployment whose configuration cannot reach its vendor, refused before any vendor call.
 ///
 /// The operator's to fix, not the caller's, so it is a 500 naming the endpoint — the same shape as
@@ -2778,6 +2811,15 @@ async fn transcribe_on(
     let mut advisories = base_advisories.clone();
     let api_key = endpoint.credential.clone().unwrap_or_default();
 
+    // Before any branch that sends the file: the passthrough below forwards it whole.
+    if let Some(refusal) = data_setting_refusal(endpoint, label) {
+        return Err(SttFailure::Refused(PlanRefusal::classified(
+            VoiceErrorType::Config,
+            crate::core::stt::data_settings::REFUSAL_CODE,
+            refusal,
+        )));
+    }
+
     // A self-hosted deployment already speaks this exact API, so the file is FORWARDED whole
     // rather than decoded and replayed through a streaming provider. That is not a shortcut:
     // decoding would impose WaaV's WAV-only limit on a backend that may well accept mp3, and
@@ -2921,7 +2963,6 @@ async fn transcribe_on(
     if let Some(refusal) = endpoint_misconfiguration(endpoint, label, &mut advisories) {
         return Err(SttFailure::Refused(PlanRefusal::unclassified(refusal)));
     }
-
     info!(
         endpoint = %label,
         vendor = %endpoint.vendor,
@@ -3011,6 +3052,9 @@ async fn transcribe_on(
     );
     apply_request_stt_fields(&mut std_config, settings, &endpoint.vendor, &mut advisories);
     std_config.extras.0.extend(deployment_extras(endpoint));
+    std_config.extras.0.extend(
+        crate::core::stt::data_settings::DataSettings::from_settings(&stt_settings).extras(),
+    );
 
     match spans
         .vendor_scope(req.vendor_operation)
@@ -3416,6 +3460,57 @@ fn passthrough_response(
     // exists to pass through untouched.
     advisories.apply(&mut headers);
     (StatusCode::OK, headers, body).into_response()
+}
+
+#[cfg(test)]
+mod data_setting_tests {
+    use super::*;
+
+    fn endpoint(vendor: &str, stt: serde_json::Value) -> bud_auth::credentials::VoiceEndpoint {
+        let entry = serde_json::json!({
+            "vendor": vendor,
+            "endpoints": ["audio_transcription"],
+            "config": {"stt": stt}
+        });
+        let blob = serde_json::json!({ "ep": entry }).to_string();
+        bud_auth::credentials::parse_voice_blob(&blob, &bud_auth::CredentialDecryptor::disabled())
+            .unwrap()
+            .remove("ep")
+            .unwrap()
+    }
+
+    /// Release 5: an upload is refused before any audio is sent when the vendor's client cannot
+    /// carry the deployment's data settings; a vendor that can, or no setting, goes ahead.
+    #[tokio::test]
+    async fn an_upload_the_vendor_cannot_keep_in_the_eu_or_unretained_is_refused() {
+        let both = serde_json::json!({"data_region": "eu", "data_retention": "none"});
+        assert!(data_setting_refusal(&endpoint("deepgram", both.clone()), "dg").is_none());
+        assert!(data_setting_refusal(&endpoint("elevenlabs", both.clone()), "el").is_none());
+        assert!(data_setting_refusal(&endpoint("openai", serde_json::json!({})), "oa").is_none());
+        let refused = data_setting_refusal(&endpoint("openai", both), "oa").unwrap();
+        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(refused.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("stt_data_setting_unavailable"), "{text}");
+        assert!(text.contains("Endpoint 'oa'"), "{text}");
+        // AssemblyAI uploads reach its EU host but have no retention switch.
+        assert!(
+            data_setting_refusal(
+                &endpoint("assemblyai", serde_json::json!({"data_region": "eu"})),
+                "aai"
+            )
+            .is_none()
+        );
+        assert!(
+            data_setting_refusal(
+                &endpoint("assemblyai", serde_json::json!({"data_retention": "none"})),
+                "aai"
+            )
+            .is_some()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4042,6 +4137,16 @@ mod request_field_tests {
         c.extras
             .0
             .insert("prompt".into(), serde_json::json!("A platform talk."));
+        // The default model (`gpt-transcribe`, addendum B6) takes key terms as `keywords[]`, so the
+        // caller's prompt and the deployment's terms both reach it, separately.
+        let cfg = crate::core::stt::openai::OpenAISTTConfig::from_standard(&c);
+        assert_eq!(cfg.prompt.as_deref(), Some("A platform talk."));
+        assert_eq!(
+            cfg.keywords,
+            vec!["Kubernetes".to_string(), "Dapr".to_string()]
+        );
+        // Whisper has one prompt: the caller's text first, the key terms after it.
+        c.base.model = "whisper-1".into();
         let cfg = crate::core::stt::openai::OpenAISTTConfig::from_standard(&c);
         assert_eq!(
             cfg.prompt.as_deref(),

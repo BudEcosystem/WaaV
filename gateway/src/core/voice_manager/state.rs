@@ -69,14 +69,20 @@ pub struct InterruptionState {
     /// delivered minus audio still queued — which is what an interrupted voice agent's history is
     /// cut to. Never reset by a clear: it is a counter, consumers take differences.
     pub audio_out_ms_total: std::sync::atomic::AtomicU64,
+    /// Per-utterance interruptibility (the greeting fix): when an interruptible utterance follows
+    /// a protected one, the protected audio keeps its window until this deadline (monotonic ms) and
+    /// nothing after it extends the window. 0 = no protected tail.
+    pub protected_tail_until_ms: AtomicUsize,
 }
 
 impl InterruptionState {
     /// Check if interruption is currently allowed
     pub fn can_interrupt(&self) -> bool {
-        // If allow_interruption is true, we can always interrupt
+        // If allow_interruption is true, we can interrupt, unless a protected utterance queued
+        // before this one is still playing (per-utterance interruptibility).
         if self.allow_interruption.load(Ordering::Acquire) {
-            return true;
+            let tail = self.protected_tail_until_ms.load(Ordering::Acquire);
+            return tail == 0 || now_monotonic_ms() > tail;
         }
 
         // If completed and past the non-interruptible time, we can interrupt
@@ -96,10 +102,40 @@ impl InterruptionState {
     pub fn reset(&self) {
         self.allow_interruption.store(true, Ordering::Release);
         self.non_interruptible_until_ms.store(0, Ordering::Release);
+        self.protected_tail_until_ms.store(0, Ordering::Release);
         self.is_completed.store(true, Ordering::Release);
         // Audio was cleared / utterance concluded: the bot is silent NOW.
         self.playout_end_ms
             .store(now_monotonic_ms(), Ordering::Release);
+    }
+
+    /// An utterance that may be cut is about to be spoken.
+    ///
+    /// Today (`per_utterance` false) nothing changes: after a protected utterance the flag stays
+    /// off, every later chunk extends the protected window, and a reply after a protected greeting
+    /// can never be cleared. With per-utterance interruptibility the protected audio keeps its
+    /// window until it has played, and this utterance's audio is interruptible.
+    pub fn begin_interruptible_utterance(&self, per_utterance: bool) {
+        if !per_utterance || self.allow_interruption.load(Ordering::Acquire) {
+            return;
+        }
+        let until = self.non_interruptible_until_ms.load(Ordering::Acquire);
+        self.protected_tail_until_ms
+            .store(until.max(1), Ordering::Release);
+        self.allow_interruption.store(true, Ordering::Release);
+    }
+
+    /// One chunk of TTS audio reached the egress: a protected utterance's window grows by it.
+    pub fn note_protected_chunk(&self, chunk_duration_ms: usize) {
+        if !self.allow_interruption.load(Ordering::Acquire) {
+            // `fetch_update` is `try_update` from Rust 1.99; the image still builds on 1.96.
+            #[allow(deprecated)]
+            let _ = self.non_interruptible_until_ms.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |cur| Some(cur + chunk_duration_ms),
+            );
+        }
     }
 
     /// Advance the estimated playout deadline by one egress chunk's duration.

@@ -2007,6 +2007,8 @@ pub const PROVIDER_FIXES: [(&str, Option<&str>); 59] = [
     ("nova_interactive_text", Some("nova_text_non_interactive")),
     ("ultravox_tools", Some("ultravox_omit_tools")),
     ("openai_realtime_default", None),
+    // Kept so an operator's list still parses: an empty OpenAI speech-to-text model is
+    // `gpt-transcribe` everywhere now (addendum B6), so the fix changes nothing.
     ("openai_stt_default", None),
     // Round 9 (each against the vendor's own reference; no key here, so none is probed).
     // OpenAI Realtime GA (and Azure, Grok, Inworld, which reuse its wire): manual turns are

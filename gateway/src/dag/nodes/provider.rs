@@ -19,7 +19,7 @@ use crate::core::realtime::{
     TranscriptCallback, TranscriptResult,
 };
 use crate::core::stt::{STTError, STTErrorCallback, STTResult, STTResultCallback};
-use crate::core::tts::{AudioCallback, AudioData, TTSError};
+use crate::core::tts::{AudioCallback, AudioData, BaseTTS, TTSError};
 use crate::dag::context::DAGContext;
 use crate::dag::error::{DAGError, DAGResult};
 
@@ -190,6 +190,51 @@ impl AudioCallback for DAGTTSCallback {
     }
 }
 
+/// The streaming TTS node's callback: like [`DAGTTSCallback`], but one provider speaks several
+/// utterances in a turn, so its completion is a stream (one signal per utterance), not a one-shot.
+struct StreamingTTSCallback {
+    audio_tx: mpsc::Sender<AudioData>,
+    error_tx: mpsc::Sender<TTSError>,
+    done_tx: mpsc::UnboundedSender<()>,
+}
+
+impl AudioCallback for StreamingTTSCallback {
+    fn on_audio(&self, audio_data: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let tx = self.audio_tx.clone();
+        Box::pin(async move {
+            if tx.send(audio_data).await.is_err() {
+                trace!("streaming TTS audio callback: channel closed");
+            }
+        })
+    }
+
+    fn on_error(&self, error: TTSError) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let tx = self.error_tx.clone();
+        Box::pin(async move {
+            let _ = tx.send(error).await;
+        })
+    }
+
+    fn on_complete(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let _ = self.done_tx.send(());
+        Box::pin(async {})
+    }
+}
+
+/// How long the streaming TTS node waits after an utterance's completion for audio still in flight
+/// (provider tasks may deliver the last chunk just after signalling completion).
+const TTS_COMPLETION_GRACE: Duration = Duration::from_millis(50);
+
+fn tts_chunk(audio: AudioData, is_final: bool) -> DAGData {
+    DAGData::TTSAudio(TTSAudioData {
+        data: Bytes::from(audio.data),
+        sample_rate: audio.sample_rate,
+        format: audio.format,
+        duration_ms: audio.duration_ms.map(u64::from),
+        is_final,
+    })
+}
+
 /// Default STT timeout in seconds (configurable)
 const DEFAULT_STT_TIMEOUT_SECS: u64 = 30;
 
@@ -208,6 +253,9 @@ pub struct STTProviderNode {
     config: serde_json::Value,
     /// Configurable timeout in seconds (default: 30, max: 300)
     timeout_secs: u64,
+    /// The gateway's own key for this provider, used when the node's config names none
+    /// (`DAGCompiler::with_server_keys`). Never printed: the `Debug` impl omits it.
+    server_key: Option<String>,
 }
 
 impl STTProviderNode {
@@ -220,7 +268,14 @@ impl STTProviderNode {
             language: None,
             config: serde_json::Value::Null,
             timeout_secs: DEFAULT_STT_TIMEOUT_SECS,
+            server_key: None,
         }
+    }
+
+    /// The gateway's own key for this provider, used when the node's config names none.
+    pub fn with_server_key(mut self, key: Option<String>) -> Self {
+        self.server_key = key;
+        self
     }
 
     /// Set the model to use
@@ -330,6 +385,7 @@ impl DAGNode for STTProviderNode {
             &self.provider,
             "STT",
         )?
+        .or_else(|| self.server_key.clone())
         .unwrap_or_default();
         let stt_config = crate::core::stt::STTConfig {
             provider: self.provider.clone(),
@@ -581,6 +637,9 @@ pub struct TTSProviderNode {
     max_audio_bytes: usize,
     /// FRD-023 WP-RT6.3: bound to a Bud deployment by the server.
     bud: Option<Arc<BudNodeBinding>>,
+    /// The gateway's own key for this provider, used when the node's config names none
+    /// (`DAGCompiler::with_server_keys`). Never printed: the `Debug` impl omits it.
+    server_key: Option<String>,
 }
 
 impl TTSProviderNode {
@@ -594,7 +653,14 @@ impl TTSProviderNode {
             config: serde_json::Value::Null,
             max_audio_bytes: DEFAULT_MAX_TTS_AUDIO_BYTES,
             bud: None,
+            server_key: None,
         }
+    }
+
+    /// The gateway's own key for this provider, used when the node's config names none.
+    pub fn with_server_key(mut self, key: Option<String>) -> Self {
+        self.server_key = key;
+        self
     }
 
     /// Set the voice ID
@@ -638,6 +704,129 @@ impl TTSProviderNode {
     pub fn max_audio_bytes(&self) -> usize {
         self.max_audio_bytes
     }
+
+    /// Count `text` against a Bud deployment's synthesis meter (FRD-023 RT6), once per text spoken.
+    fn meter_synthesis(&self, text: &str) {
+        if let Some(meter) = self.bud.as_ref().and_then(|b| b.on_synthesis.as_ref()) {
+            meter(text);
+        }
+    }
+
+    /// Build this node's provider, register `callback` (before connecting, which every provider
+    /// supports) and connect it.
+    async fn open_provider(&self, callback: Arc<dyn AudioCallback>) -> DAGResult<Box<dyn BaseTTS>> {
+        // Get TTS provider from registry
+        let registry = crate::plugin::global_registry();
+
+        // Build TTS configuration. A node bound to a Bud deployment uses the deployment's
+        // credential, address and parameters (FRD-023 WP-RT6.3). Otherwise a configured
+        // credential must resolve; when no DAG credential is supplied, provider-specific fallback
+        // may still apply.
+        let api_key = match &self.bud {
+            Some(bud) => bud.vendor_credential.clone().unwrap_or_default(),
+            None => resolve_configured_node_credential(
+                &self.config,
+                "api_key",
+                &self.id,
+                &self.provider,
+                "TTS",
+            )?
+            .or_else(|| self.server_key.clone())
+            .unwrap_or_default(),
+        };
+        let defaults = crate::core::tts::TTSConfig::default();
+        let tts_config = crate::core::tts::TTSConfig {
+            provider: self.provider.clone(),
+            voice_id: self.voice_id.clone(),
+            model: self.model.clone().unwrap_or_default(),
+            api_key,
+            api_base: self.bud.as_ref().and_then(|b| b.api_base.clone()),
+            // The node's `config` may name the client's audio format (as `tts_config` does for a
+            // plain session); without it the provider default (linear16 @ 24 kHz) is kept.
+            audio_format: self
+                .config
+                .get("audio_format")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or(defaults.audio_format.clone()),
+            sample_rate: self
+                .config
+                .get("sample_rate")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .or(defaults.sample_rate),
+            ..defaults
+        };
+
+        // Create TTS provider
+        let created = match &self.bud {
+            Some(bud) => {
+                let mut standard =
+                    crate::core::tts::standard::StandardTTSConfig::from_base(tts_config);
+                standard.extras.0 = bud.extras.clone();
+                crate::core::tts::standard::create_tts_standard(&self.provider, standard)
+            }
+            None => registry.create_tts(&self.provider, tts_config),
+        };
+        let mut tts = match created {
+            Ok(tts) => tts,
+            Err(e) => {
+                return Err(DAGError::TTSProviderError {
+                    provider: self.provider.clone(),
+                    error: e.to_string(),
+                });
+            }
+        };
+
+        // Register callback
+        if let Err(e) = tts.on_audio(callback) {
+            return Err(DAGError::TTSProviderError {
+                provider: self.provider.clone(),
+                error: format!("Failed to register audio callback: {}", e),
+            });
+        }
+
+        // Connect to the TTS provider
+        if let Err(e) = tts.connect().await {
+            return Err(DAGError::TTSProviderError {
+                provider: self.provider.clone(),
+                error: format!("Failed to connect: {}", e),
+            });
+        }
+
+        info!(
+            node_id = %self.id,
+            provider = %self.provider,
+            "Connected to TTS provider"
+        );
+        Ok(tts)
+    }
+}
+
+/// The text a TTS node speaks for `input`; `None` when there is nothing to say.
+fn tts_input_text(input: &DAGData) -> DAGResult<Option<String>> {
+    let text = match input {
+        DAGData::Text(t) => t.clone(),
+        DAGData::STTResult(r) => r.transcript.clone(),
+        DAGData::Json(j) => j
+            .get("text")
+            .or_else(|| j.get("content"))
+            .or_else(|| j.get("message"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| DAGError::UnsupportedDataType {
+                expected: "text".to_string(),
+                actual: "json without text field".to_string(),
+            })?,
+        DAGData::Empty => return Ok(None),
+        other => {
+            return Err(DAGError::UnsupportedDataType {
+                expected: "text".to_string(),
+                actual: other.type_name().to_string(),
+            });
+        }
+    };
+    Ok((!text.is_empty()).then_some(text))
 }
 
 impl std::fmt::Debug for TTSProviderNode {
@@ -670,33 +859,142 @@ impl DAGNode for TTSProviderNode {
         ]
     }
 
-    async fn execute(&self, input: DAGData, ctx: &mut DAGContext) -> DAGResult<DAGData> {
-        // Extract text from input
-        let text = match &input {
-            DAGData::Text(t) => t.clone(),
-            DAGData::STTResult(r) => r.transcript.clone(),
-            DAGData::Json(j) => j
-                .get("text")
-                .or_else(|| j.get("content"))
-                .or_else(|| j.get("message"))
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .ok_or_else(|| DAGError::UnsupportedDataType {
-                    expected: "text".to_string(),
-                    actual: "json without text field".to_string(),
-                })?,
-            DAGData::Empty => return Ok(DAGData::Empty),
-            other => {
-                return Err(DAGError::UnsupportedDataType {
-                    expected: "text".to_string(),
-                    actual: other.type_name().to_string(),
-                });
-            }
-        };
+    /// Streaming data-plane: ONE provider connection for the whole turn (not one per sentence the
+    /// LLM streams), each sentence spoken on it as it arrives, and every audio chunk forwarded the
+    /// moment the provider delivers it — first audio no longer waits for a whole sentence to be
+    /// synthesized. Each utterance's last chunk carries `is_final` (the session's
+    /// `tts_playback_complete`). Cancellation (barge-in) and failures disconnect the provider, so
+    /// nothing outlives the turn.
+    async fn execute_streaming(
+        &self,
+        mut inputs: mpsc::Receiver<DAGData>,
+        ctx: &mut DAGContext,
+        outputs: mpsc::Sender<DAGData>,
+    ) -> DAGResult<()> {
+        let (audio_tx, mut audio_rx) = mpsc::channel::<AudioData>(64);
+        let (error_tx, mut error_rx) = mpsc::channel::<TTSError>(4);
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
+        let callback: Arc<dyn AudioCallback> = Arc::new(StreamingTTSCallback {
+            audio_tx,
+            error_tx,
+            done_tx,
+        });
+        let cancel = ctx.cancel_token.clone();
+        let mut tts: Option<Box<dyn BaseTTS>> = None;
+        let mut total_bytes: usize = 0;
 
-        if text.is_empty() {
-            return Ok(DAGData::Empty);
+        let result: DAGResult<()> = async {
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(DAGError::Cancelled),
+                    item = inputs.recv() => match item {
+                        Some(item) => item,
+                        None => return Ok(()), // upstream finished: the turn's speech is done
+                    },
+                };
+                let Some(text) = tts_input_text(&item)? else {
+                    continue;
+                };
+                self.meter_synthesis(&text);
+                // Connect lazily: a turn with nothing to say opens nothing.
+                if tts.is_none() {
+                    tts = Some(self.open_provider(callback.clone()).await?);
+                }
+                let provider = tts.as_mut().ok_or_else(|| {
+                    DAGError::InternalError("streaming TTS provider missing after connect".into())
+                })?;
+                if let Err(e) = provider.speak(&text, true).await {
+                    return Err(DAGError::TTSProviderError {
+                        provider: self.provider.clone(),
+                        error: format!("Failed to synthesize speech: {e}"),
+                    });
+                }
+
+                let limit = ctx
+                    .remaining_time()
+                    .unwrap_or(Duration::from_secs(60))
+                    .min(Duration::from_secs(60));
+                let deadline = tokio::time::Instant::now() + limit;
+                // The newest chunk is held back one step so the utterance's LAST chunk can carry
+                // `is_final`; every earlier chunk goes downstream as soon as the next one arrives.
+                let mut held: Option<AudioData> = None;
+                let mut heard = false;
+                let mut completed = false;
+                loop {
+                    let grace = tokio::time::sleep(TTS_COMPLETION_GRACE);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(DAGError::Cancelled),
+                        Some(e) = error_rx.recv() => {
+                            return Err(DAGError::TTSProviderError {
+                                provider: self.provider.clone(),
+                                error: e.to_string(),
+                            });
+                        }
+                        Some(chunk) = audio_rx.recv() => {
+                            total_bytes = total_bytes.saturating_add(chunk.data.len());
+                            if total_bytes > self.max_audio_bytes {
+                                return Err(DAGError::TTSProviderError {
+                                    provider: self.provider.clone(),
+                                    error: format!(
+                                        "Audio size limit exceeded: {total_bytes} bytes received, max {} bytes allowed",
+                                        self.max_audio_bytes
+                                    ),
+                                });
+                            }
+                            heard = true;
+                            if let Some(prev) = held.replace(chunk)
+                                && outputs.send(tts_chunk(prev, false)).await.is_err()
+                            {
+                                return Ok(()); // downstream gone
+                            }
+                        }
+                        Some(()) = done_rx.recv(), if !completed => {
+                            completed = true;
+                        }
+                        // After completion, a short quiet spell ends the utterance.
+                        _ = grace, if completed => break,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            if !heard {
+                                return Err(DAGError::TTSProviderError {
+                                    provider: self.provider.clone(),
+                                    error: format!("no audio within {} ms", limit.as_millis()),
+                                });
+                            }
+                            warn!(
+                                node_id = %self.id,
+                                timeout_ms = %limit.as_millis(),
+                                "TTS timeout reached before the provider signalled completion"
+                            );
+                            break;
+                        }
+                    }
+                }
+                if let Some(last) = held
+                    && outputs.send(tts_chunk(last, true)).await.is_err()
+                {
+                    return Ok(());
+                }
+                if !heard {
+                    warn!(node_id = %self.id, "No audio data received from TTS provider");
+                }
+            }
         }
+        .await;
+
+        if let Some(mut provider) = tts
+            && let Err(e) = provider.disconnect().await
+        {
+            warn!(node_id = %self.id, error = %e, "Failed to disconnect from TTS provider");
+        }
+        result
+    }
+
+    async fn execute(&self, input: DAGData, ctx: &mut DAGContext) -> DAGResult<DAGData> {
+        let Some(text) = tts_input_text(&input)? else {
+            return Ok(DAGData::Empty);
+        };
 
         debug!(
             node_id = %self.id,
@@ -704,56 +1002,7 @@ impl DAGNode for TTSProviderNode {
             text_length = %text.len(),
             "Synthesizing speech"
         );
-
-        // Get TTS provider from registry
-        let registry = crate::plugin::global_registry();
-
-        // Build TTS configuration. A node bound to a Bud deployment uses the deployment's
-        // credential, address and parameters (FRD-023 WP-RT6.3). Otherwise a configured
-        // credential must resolve; when no DAG credential is supplied, provider-specific fallback
-        // may still apply.
-        let api_key = match &self.bud {
-            Some(bud) => bud.vendor_credential.clone().unwrap_or_default(),
-            None => resolve_configured_node_credential(
-                &self.config,
-                "api_key",
-                &self.id,
-                &self.provider,
-                "TTS",
-            )?
-            .unwrap_or_default(),
-        };
-        let tts_config = crate::core::tts::TTSConfig {
-            provider: self.provider.clone(),
-            voice_id: self.voice_id.clone(),
-            model: self.model.clone().unwrap_or_default(),
-            api_key,
-            api_base: self.bud.as_ref().and_then(|b| b.api_base.clone()),
-            ..Default::default()
-        };
-
-        // Create TTS provider
-        let created = match &self.bud {
-            Some(bud) => {
-                if let Some(meter) = &bud.on_synthesis {
-                    meter(&text);
-                }
-                let mut standard =
-                    crate::core::tts::standard::StandardTTSConfig::from_base(tts_config);
-                standard.extras.0 = bud.extras.clone();
-                crate::core::tts::standard::create_tts_standard(&self.provider, standard)
-            }
-            None => registry.create_tts(&self.provider, tts_config),
-        };
-        let mut tts = match created {
-            Ok(tts) => tts,
-            Err(e) => {
-                return Err(DAGError::TTSProviderError {
-                    provider: self.provider.clone(),
-                    error: e.to_string(),
-                });
-            }
-        };
+        self.meter_synthesis(&text);
 
         // Create channels for collecting audio chunks and completion signal
         let (audio_tx, mut audio_rx) = mpsc::channel::<AudioData>(64);
@@ -766,28 +1015,7 @@ impl DAGNode for TTSProviderNode {
             error_tx,
             complete_tx: Mutex::new(Some(complete_tx)),
         });
-
-        // Register callback
-        if let Err(e) = tts.on_audio(callback) {
-            return Err(DAGError::TTSProviderError {
-                provider: self.provider.clone(),
-                error: format!("Failed to register audio callback: {}", e),
-            });
-        }
-
-        // Connect to the TTS provider
-        if let Err(e) = tts.connect().await {
-            return Err(DAGError::TTSProviderError {
-                provider: self.provider.clone(),
-                error: format!("Failed to connect: {}", e),
-            });
-        }
-
-        info!(
-            node_id = %self.id,
-            provider = %self.provider,
-            "Connected to TTS provider"
-        );
+        let mut tts = self.open_provider(callback).await?;
 
         // Send text for synthesis
         if let Err(e) = tts.speak(&text, true).await {
@@ -809,9 +1037,15 @@ impl DAGNode for TTSProviderNode {
         let mut sample_rate = 16000u32;
         let mut format = "pcm16".to_string();
 
-        // Wrap oneshot in Option so we can consume it only once
-        let mut complete_rx = Some(complete_rx);
+        // The completion signal is polled BY REFERENCE (`&mut complete_rx`), so it survives every
+        // iteration another branch wins. (It used to be moved into a fresh `async` block per
+        // iteration: the first time that block was polled it took the receiver, and the first
+        // audio chunk to win the `select!` then dropped it — the provider's `on_complete` went
+        // nowhere and every turn ran into the executor's node timeout, its audio discarded.)
+        let mut complete_rx = complete_rx;
         let mut complete_received = false;
+        // Whether the loop ended on the node's own deadline rather than on completion.
+        let mut timed_out = false;
 
         loop {
             // Check if we should exit (completion received or channels closed)
@@ -848,15 +1082,14 @@ impl DAGNode for TTSProviderNode {
                     return Err(DAGError::Cancelled);
                 }
 
-                // Check for errors
-                error = error_rx.recv() => {
-                    if let Some(e) = error {
-                        let _ = tts.disconnect().await;
-                        return Err(DAGError::TTSProviderError {
-                            provider: self.provider.clone(),
-                            error: e.to_string(),
-                        });
-                    }
+                // Check for errors (a closed error channel disables the branch instead of
+                // spinning on `None`)
+                Some(e) = error_rx.recv() => {
+                    let _ = tts.disconnect().await;
+                    return Err(DAGError::TTSProviderError {
+                        provider: self.provider.clone(),
+                        error: e.to_string(),
+                    });
                 }
 
                 // Receive audio chunks
@@ -899,14 +1132,7 @@ impl DAGNode for TTSProviderNode {
                 }
 
                 // Wait for completion signal (only if we haven't received it yet)
-                result = async {
-                    if let Some(rx) = complete_rx.take() {
-                        rx.await
-                    } else {
-                        // Already consumed, just pend forever
-                        std::future::pending().await
-                    }
-                } => {
+                result = &mut complete_rx, if !complete_received => {
                     match result {
                         Ok(()) => debug!(node_id = %self.id, "TTS synthesis complete"),
                         Err(_) => debug!(node_id = %self.id, "TTS completion channel closed"),
@@ -917,11 +1143,13 @@ impl DAGNode for TTSProviderNode {
 
                 // Timeout
                 _ = tokio::time::sleep_until(deadline) => {
-                    debug!(
+                    warn!(
                         node_id = %self.id,
                         chunks_received = %audio_chunks.len(),
-                        "TTS timeout reached"
+                        timeout_ms = %timeout_duration.as_millis(),
+                        "TTS timeout reached before the provider signalled completion"
                     );
+                    timed_out = true;
                     break;
                 }
             }
@@ -942,6 +1170,14 @@ impl DAGNode for TTSProviderNode {
         let combined_data: Vec<u8> = audio_chunks.into_iter().flat_map(|c| c.data).collect();
 
         if combined_data.is_empty() {
+            // A synthesis that never finished and produced nothing is a failure the client must
+            // hear about, not a silent empty turn.
+            if timed_out {
+                return Err(DAGError::TTSProviderError {
+                    provider: self.provider.clone(),
+                    error: format!("no audio within {} ms", timeout_duration.as_millis()),
+                });
+            }
             warn!(
                 node_id = %self.id,
                 "No audio data received from TTS provider"
@@ -1102,6 +1338,9 @@ pub struct RealtimeProviderNode {
     provider: String,
     model: Option<String>,
     config: serde_json::Value,
+    /// The gateway's own key for this provider, used when the node's config names none
+    /// (`DAGCompiler::with_server_keys`). Never printed: the `Debug` impl omits it.
+    server_key: Option<String>,
 }
 
 impl RealtimeProviderNode {
@@ -1112,7 +1351,14 @@ impl RealtimeProviderNode {
             provider: provider.into(),
             model: None,
             config: serde_json::Value::Null,
+            server_key: None,
         }
+    }
+
+    /// The gateway's own key for this provider, used when the node's config names none.
+    pub fn with_server_key(mut self, key: Option<String>) -> Self {
+        self.server_key = key;
+        self
     }
 
     /// Set the model
@@ -1185,6 +1431,11 @@ impl RealtimeProviderNode {
         // Credential resolution WINS over any `api_key` the config JSON carried, but
         // fall back to the deserialized key if the resolver found nothing.
         if let Some(key) = resolve_node_credential(&self.config, "api_key") {
+            realtime_config.api_key = key;
+        }
+        if realtime_config.api_key.trim().is_empty()
+            && let Some(key) = self.server_key.clone()
+        {
             realtime_config.api_key = key;
         }
         // SSRF: never let a DAG `config` redirect the gateway's upstream connection.

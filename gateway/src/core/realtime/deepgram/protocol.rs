@@ -91,13 +91,14 @@ fn think_provider_of(model: &str) -> &'static str {
     }
 }
 
-/// `agent.language`: the language subtag of the code Deepgram takes for it (`de-DE` and `de`
-/// are `de`, Mandarin `zh`, `auto` `multi`); `en` when unset.
-fn agent_language(language: Option<&str>) -> String {
+/// `agent.language`: the language subtag of the code Deepgram's `listen_model` takes for it
+/// (`de-DE` and `de` are `de`, Mandarin `zh`, `auto` `multi` on a model that detects); `en` when
+/// unset. Empty when the model cannot take it (`auto` off Nova-3/Nova-2): none is sent then.
+fn agent_language(language: Option<&str>, listen_model: &str) -> String {
     match language.map(str::trim).filter(|l| !l.is_empty()) {
         None => "en".to_owned(),
         Some(language) => {
-            let native = crate::core::lang::map_language(language, "deepgram", "").native;
+            let native = crate::core::lang::map_language(language, "deepgram", listen_model).native;
             native.split('-').next().unwrap_or_default().to_owned()
         }
     }
@@ -178,14 +179,14 @@ impl DeepgramProtocol {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| think_provider_of(think_model));
-        let language = agent_language(cfg.language.as_deref());
-        // The handler fills an unset transcription model with OpenAI's `whisper-1`.
+        // The handler fills an unset transcription model with OpenAI's default.
         let listen_model = cfg
             .input_audio_transcription
             .as_ref()
             .map(|t| t.model.trim())
-            .filter(|m| !m.is_empty() && *m != "whisper-1")
+            .filter(|m| !m.is_empty() && !crate::core::realtime::is_openai_default_transcription(m))
             .unwrap_or(DEFAULT_LISTEN_MODEL);
+        let language = agent_language(cfg.language.as_deref(), listen_model);
 
         // `think.prompt` is the system prompt. Deepgram is lenient, but only emit
         // the key when we actually have instructions (skip-if-none discipline).
@@ -233,7 +234,7 @@ impl DeepgramProtocol {
         });
         // A Flux (`/v2/listen`) listen model refuses `agent.language` (`INVALID_SETTINGS`,
         // probed 2026-10-15): it is sent for the other listen models only.
-        if !crate::core::stt::deepgram::is_flux(listen_model) {
+        if !crate::core::stt::deepgram::is_flux(listen_model) && !language.is_empty() {
             settings["agent"]["language"] = json!(language);
         }
         settings
@@ -1204,17 +1205,36 @@ mod tests {
             assert_eq!(v["listen"]["provider"]["model"], flux);
             assert!(v.get("language").is_none(), "{flux}: {v}");
         }
-        // OpenAI's default transcription model the handler fills in is no listen model.
+        // OpenAI's default transcription model the handler fills in is no listen model (today's
+        // `gpt-transcribe`, and `whisper-1` before it).
+        for default in [
+            "whisper-1",
+            crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL,
+        ] {
+            let cfg = RealtimeConfig {
+                language: Some("auto".into()),
+                input_audio_transcription: Some(crate::core::realtime::InputTranscriptionConfig {
+                    model: default.into(),
+                }),
+                ..base_cfg()
+            };
+            let v = proto(&cfg).settings(&cfg);
+            assert_eq!(
+                v["agent"]["listen"]["provider"]["model"], "nova-3",
+                "{default}"
+            );
+            assert_eq!(v["agent"]["language"], "multi");
+        }
+        // A listen model that cannot detect gets no `multi` (Deepgram refuses it): no language.
         let cfg = RealtimeConfig {
             language: Some("auto".into()),
             input_audio_transcription: Some(crate::core::realtime::InputTranscriptionConfig {
-                model: "whisper-1".into(),
+                model: "base".into(),
             }),
             ..base_cfg()
         };
         let v = proto(&cfg).settings(&cfg);
-        assert_eq!(v["agent"]["listen"]["provider"]["model"], "nova-3");
-        assert_eq!(v["agent"]["language"], "multi");
+        assert!(v["agent"].get("language").is_none(), "{v}");
         // Functions: off by default, on with the fix, on when the delegate is among them.
         let tool = |name: &str| crate::core::realtime::ToolDefinition {
             tool_type: "function".into(),

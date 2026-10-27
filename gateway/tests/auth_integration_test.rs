@@ -323,10 +323,12 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
     async fn test_auth_service_returns_200_allows_request() {
         let mock_server = MockServer::start().await;
 
-        // Mock successful auth response
+        // Mock successful auth response: a 200 must name the caller.
         Mock::given(method("POST"))
             .and(path("/auth"))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "tenant-a"})),
+            )
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -352,6 +354,157 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A multipart upload (an OpenAI-SDK `audio.transcriptions` call) passes a responder: it is
+    /// asked once, with the request's headers, and the handler receives the whole body. It used to
+    /// be refused with 400 "request body must be valid JSON for auth validation" first.
+    #[tokio::test]
+    async fn test_responder_admits_a_multipart_upload_and_the_body_reaches_the_handler() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "tenant-a"})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let (state, _temp_dir) =
+            create_test_state_with_auth(&format!("{}/auth", mock_server.uri())).await;
+
+        async fn body_len(body: axum::body::Bytes) -> String {
+            body.len().to_string()
+        }
+        let app = Router::new()
+            .route("/upload", axum::routing::post(body_len))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let body = "--x\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+                    Content-Type: audio/wav\r\n\r\nRIFF....WAVE\r\n--x--\r\n";
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/upload")
+            .header("authorization", "Bearer valid-token")
+            .header("content-type", "multipart/form-data; boundary=x")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(got, body.len().to_string().as_bytes());
+    }
+
+    /// A body that says it is JSON is still parsed for the responder, and malformed JSON is still
+    /// refused before the responder is asked.
+    #[tokio::test]
+    async fn test_responder_still_refuses_malformed_json() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "tenant-a"})),
+            )
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let (state, _temp_dir) =
+            create_test_state_with_auth(&format!("{}/auth", mock_server.uri())).await;
+        let app = Router::new()
+            .route("/test", axum::routing::post(test_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("authorization", "Bearer valid-token")
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A responder `200` that names nobody (`{}`, `OK`, empty) must not admit: it is a contract
+    /// violation by the responder, answered 502 so the client is not told to rotate a key.
+    #[tokio::test]
+    async fn test_auth_service_200_without_identity_is_refused() {
+        for body in ["", "{}", "OK", r#"{"id":""}"#] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/auth"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+            let (state, _temp_dir) =
+                create_test_state_with_auth(&format!("{}/auth", mock_server.uri())).await;
+            let app = Router::new()
+                .route("/test", get(test_handler))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                ))
+                .with_state(state);
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("authorization", "Bearer any-token")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "body {body:?}");
+        }
+    }
+
+    /// With BOTH an API secret and a responder configured (AUTH_MODE=chain, the default), a
+    /// bearer that is not a secret is asked of the responder — it used to get 401 without the
+    /// responder ever being called.
+    #[tokio::test]
+    async fn test_api_secret_and_responder_chain() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "tenant-a"})),
+            )
+            .expect(1) // the secret is NOT sent to the responder; the user token is
+            .mount(&mock_server)
+            .await;
+        let (state, _temp_dir) =
+            create_test_state_with_auth(&format!("{}/auth", mock_server.uri())).await;
+        let mut config = state.config.clone();
+        config.auth_api_secrets = vec![waav_gateway::config::AuthApiSecret {
+            id: "ops".to_string(),
+            secret: "ops-secret".to_string(),
+        }];
+        let state = AppState::new(config).await;
+        let app = Router::new()
+            .route("/test", get(test_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+        for token in ["ops-secret", "user-token"] {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "token {token}");
+        }
     }
 
     #[tokio::test]
@@ -666,6 +819,51 @@ mod with_api_secret {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "missing_auth_header");
         assert_eq!(json["message"], "Missing Authorization header");
+    }
+
+    /// `/ws` defers to first-message auth only when no credential was offered; an offered but
+    /// malformed or wrong credential is a 401, not an unauthenticated pending session.
+    #[tokio::test]
+    async fn test_ws_defers_only_when_no_credential_is_offered() {
+        let state = create_test_state_with_api_secret("my-secret-token").await;
+        let app = Router::new()
+            .route("/ws", get(test_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+        let status = |headers: &[(&str, &str)]| {
+            let mut b = Request::builder().method(Method::GET).uri("/ws");
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let app = app.clone();
+            let request = b.body(Body::empty()).unwrap();
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+
+        assert_eq!(status(&[]).await, StatusCode::OK);
+        assert_eq!(
+            status(&[("authorization", "InvalidFormat")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(&[(
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.wrong"
+            )])
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(&[(
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.my-secret-token"
+            )])
+            .await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

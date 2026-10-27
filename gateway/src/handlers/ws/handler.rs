@@ -90,6 +90,10 @@ pub async fn ws_voice_handler(
     let response = ws
         .max_frame_size(MAX_WS_FRAME_SIZE)
         .max_message_size(MAX_WS_MESSAGE_SIZE)
+        // A browser that sends its key as the `openai-insecure-api-key.<key>` subprotocol offers
+        // `realtime` beside it; selecting it in the 101 is what Node's `ws` and browsers expect
+        // (the key itself is never echoed). A client offering none sees no change.
+        .protocols([crate::handlers::openai_realtime::handshake::SUBPROTOCOL])
         .on_upgrade(move |socket| {
             debug!("WebSocket upgrade callback triggered");
             handle_voice_socket(socket, state, auth, ip, slot, credential)
@@ -371,6 +375,10 @@ pub(crate) async fn teardown_session(
     // Spec 025: end the voice agent's live turn, which cancels its run at budprompt.
     if let Some(engine) = state.read().await.agent.clone() {
         engine.shutdown().await;
+    }
+    // End the conversation loop's live turn and drop its history.
+    if let Some(conversation) = state.write().await.conversation.take() {
+        conversation.shutdown().await;
     }
 
     // Snapshot state before cleanup so we can drop the read lock before awaiting

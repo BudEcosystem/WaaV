@@ -1,0 +1,544 @@
+{
+  "provider_id": "tinkoff",
+  "provider": {
+    "aliases": [
+      "tinkoff-stt",
+      "tinkoff_stt",
+      "voicekit",
+      "tinkoff-voicekit"
+    ],
+    "default_model": "default",
+    "model_string": "gateway_alias",
+    "registered_in_gateway": true,
+    "native_model_handling": "ignored",
+    "prerequisites": [
+      {
+        "kind": "trust_root",
+        "detail": "The Russian Trusted Root CA must be added for the vendor's hosts before any transport can connect."
+      }
+    ],
+    "notes": "T-Bank (formerly Tinkoff) VoiceKit. One recognition service with four methods and no published model ids; the row key 'default' is the gateway's placeholder and is never sent on the wire (the request the gateway builds has no model field, gateway/src/core/stt/tinkoff/messages.rs:268-295). The vendor streams natively (bidirectional gRPC with interim results and its own endpointing), so segmentation is only a fallback, and no release builds it. The existing streaming client is expected to fail against the vendor on four counts (trust root, authentication, response field number, response nesting; inferred from code reading and the certificate chain, not run). It stays the session's client from Release 0 and is reported as known broken (gateway_client.defect), because decisions section 15 reports a broken native client instead of refusing it. Its connect step opens the TLS channel first (gateway/src/core/stt/tinkoff/provider.rs:344-345, grpc.rs:49-61), so the session is expected to fail at setup on the certificate check, before authentication is attempted (inferred, not run). Besides the trust root, every transport needs JWT authentication ('authorization: Bearer <JWT>'). LongRunningRecognize is an asynchronous job of up to 24 hours and must never be used for calls. Aliases: only the literal 'tinkoff' reaches the standardized factory (gateway/src/core/stt/standard.rs:467); the registry aliases (gateway/src/plugin/builtin/mod.rs:1748-1751) take the flat path. Public examples are Russian only."
+  },
+  "rows": [
+    {
+      "id": "tinkoff:default",
+      "match": {
+        "provider": "tinkoff",
+        "model": "default"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 3600000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor allows 50 simultaneous recognition streams per method for every cloud user; whether the scope is the API key or the account is not stated. A breach returns gRPC code 8 (RESOURCE_EXHAUSTED)."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "speech_contexts",
+                "note": "Phrases with scores from -10 to 10. The documentation pages describe the field as working; a comment in the current proto calls it unsupported."
+              }
+            ],
+            "wire": "tinkoff_stt_v1_grpc_streaming"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "The existing streaming client does not match the vendor protocol. Found by reading the client against the vendor proto and by inspecting the certificate chain; nothing was run against the vendor. (1) api.tinkoff.ai chains to the Russian Trusted Root CA; the gRPC channel is given no extra root (gateway/src/core/stt/tinkoff/grpc.rs:49) and a stock operating-system trust store does not contain it. (2) The client sends x-api-key and x-secret-key metadata where the vendor requires 'authorization: Bearer <JWT>' (grpc.rs:70-86). (3) It reads results from protobuf field 1 where the vendor uses field 2, so every response decodes as empty and is dropped (messages.rs:491-496, provider.rs:146-149). (4) It decodes each result without the vendor's recognition_result nesting (messages.rs:583-588).",
+            "code_ref": "gateway/src/core/stt/tinkoff/grpc.rs:49 and :70-86; gateway/src/core/stt/tinkoff/messages.rs:491-496, :583-588 and :364-368; gateway/src/core/stt/tinkoff/config.rs:381-390; gateway/src/core/stt/tinkoff/provider.rs:146-149 and :419-426",
+            "notes": "Bidirectional gRPC StreamingRecognize at api.tinkoff.ai:443; audio is forwarded unbuffered and the vendor's voice-activity detector ends phrases (silence threshold 0.6 s by default); is_final is copied to is_speech_final (provider.rs:419-426). Further defects: every audio-encoding number except LINEAR16 is wrong (config.rs:381-390), and num_channels is not sent for mono although the vendor marks it mandatory (messages.rs:364-368). The mock end-to-end test encodes the gateway's own schema (gateway/tests/mock_endpoint_e2e.rs:1705-1707), so it cannot detect any of this. The vendor guarantees connection continuity only under 3 min 25 s (hard cap one hour), so reconnects are normal within a call. The vendor returns a 'relative confidence factor' per alternative and a per-word confidence that may be negative; neither is a 0 to 1 probability, so quality_signals is empty and the value must not be thresholded. Speech-context phrases map to the gateway's keyterms feature."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_tinkoff) is not implemented: the gateway has no request builder for the vendor's synchronous Recognize method. Shares two prerequisites with every T-Bank transport: the client must trust the Russian Trusted Root CA that api.tinkoff.ai chains to, and it must authenticate with 'authorization: Bearer <JWT>' (HS256, key id = API key, audience tinkoff.cloud.stt). A JWT signer already exists for text-to-speech (gateway/src/core/tts/tinkoff/grpc.rs:69-114).",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 32000000,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 3600000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor allows 50 simultaneous recognition streams per method for every cloud user; whether the scope is the API key or the account is not stated. A breach returns gRPC code 8 (RESOURCE_EXHAUSTED)."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "mp3",
+              "aac"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "encoding",
+                "value": "LINEAR16",
+                "in": "json"
+              },
+              {
+                "name": "sample_rate_hertz",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              },
+              {
+                "name": "num_channels",
+                "value": "1",
+                "in": "json"
+              },
+              {
+                "name": "do_not_perform_vad",
+                "value": "true",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "speech_contexts",
+                "note": "Phrases with scores from -10 to 10. The documentation pages describe the field as working; a comment in the current proto calls it unsupported."
+              }
+            ],
+            "wire": "tinkoff_stt_v1_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/tts/tinkoff/grpc.rs:69-114 (reusable JWT signer; no speech-to-text request code exists)",
+            "notes": "Vendor method Recognize is one synchronous request and one response, available as unary gRPC (/tinkoff.cloud.stt.v1.SpeechToText/Recognize) or as REST (POST https://api.tinkoff.ai/v1/stt:recognize, JSON body with base64 audio). The fact-check sent one request without credentials to each candidate REST host on 2026-10-03: api.tinkoff.ai answered 401 (the route exists and wants authentication) and api.tbank.ru, the host shown in the vendor's authorization example, answered 503, so api.tinkoff.ai is the host to use. Both hosts chain to the Russian Trusted Root CA. The adapter must: send headerless PCM16 (the vendor does not parse WAV); set sample_rate_hertz and num_channels=1 explicitly; set do_not_perform_vad=true so the vendor's own 0.6 s phrase splitter does not cut the segment again; mint a fresh JWT per request; and treat gRPC code 8 (RESOURCE_EXHAUSTED, 'Max open connection limit exceeded') as back-off, not as a reason to reconnect. Vendor release notes describe the Recognize model as updated separately from the StreamingRecognize model, so accuracy on this transport must be measured, not assumed equal to streaming. The 50 concurrent streams are per method."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. 10000 ms is the vendor audit's starting guess, not a measurement: the vendor publishes no latency for Recognize, and the streaming client's 60 s request timeout (gateway/src/core/stt/tinkoff/config.rs:104-106) is too long for a turn. Replace it with measured P99 plus a margin. The other defaults fit: a 25 s segment is about 0.8 MB of raw PCM (about 1.07 MB as base64 JSON), far below the 32 MB message cap; billing is per second with no published minimum, so short segments are not merged; two uploads in flight per call stay, behind a process-wide limiter under the 50 simultaneous streams the vendor allows per method."
+          },
+          "billing": {
+            "unit": "audio_second",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Online file tariff, lower than the stream tariff, billed per second of uploaded audio. No per-request minimum is published. Only uploaded segments are billed."
+          }
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "No client for StreamingUnaryRecognize exists in the gateway. Shares two prerequisites with every T-Bank transport: the client must trust the Russian Trusted Root CA that api.tinkoff.ai chains to, and it must authenticate with 'authorization: Bearer <JWT>' (HS256, key id = API key, audience tinkoff.cloud.stt). A JWT signer already exists for text-to-speech (gateway/src/core/tts/tinkoff/grpc.rs:69-114).",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_audio_ms": null,
+            "vendor_timeout_ms": 3600000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor allows 50 simultaneous recognition streams per method for every cloud user; whether the scope is the API key or the account is not stated. A breach returns gRPC code 8 (RESOURCE_EXHAUSTED)."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "speech_contexts",
+                "note": "Phrases with scores from -10 to 10. The documentation pages describe the field as working; a comment in the current proto calls it unsupported."
+              }
+            ],
+            "wire": "tinkoff_stt_v1_grpc_streaming_unary"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/tinkoff/grpc.rs:305-328 (config-then-audio request stream that a client-streaming call could reuse)",
+            "notes": "gRPC StreamingUnaryRecognize: the gateway sends the configuration, then audio chunks while the caller is still speaking, and closes the request stream when its own detector decides the utterance has ended; the vendor answers once. This removes the upload wait of a file request. No interim results. Which tariff applies (stream or file) is not published. Send do_not_perform_vad=true so the vendor returns one phrase."
+          },
+          "billing": {
+            "unit": "audio_second",
+            "min_billed_ms": null,
+            "bills_silence": null,
+            "notes": "Which tariff applies to StreamingUnaryRecognize (stream or online file) is not published. Only the audio of each utterance is sent."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Billed per second of audio, with three tariffs: stream, online file (lower than stream) and deferred. No per-request minimum is published. No pricing key exists for this provider in gateway/src/config/pricing.rs. This block describes the stream, the only transport usable with today's code. bills_silence is null because the vendor does not say whether the stream tariff counts silence: it is charged per second of audio and the gateway forwards all call audio, so silence is very probably billed."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://opensource.tbank.ru/voicekit/docs/-/raw/master/apis/tinkoff/cloud/stt/v1/stt.proto",
+          "https://raw.githubusercontent.com/Tinkoff/voicekit-examples/master/apis/tinkoff/cloud/stt/v1/stt.proto",
+          "https://developer.tbank.ru/voicekit/api/speech-recognition/grpc/recognize",
+          "https://developer.tbank.ru/voicekit/api/speech-recognition/grpc/streamingRecognize",
+          "https://developer.tbank.ru/voicekit/api/speech-recognition/grpc/streamingUnaryRecognize",
+          "https://developer.tbank.ru/voicekit/api/speech-recognition/stttutorial",
+          "https://developer.tbank.ru/voicekit/intro/authorization",
+          "https://developer.tbank.ru/voicekit/intro/formats",
+          "https://developer.tbank.ru/voicekit/intro/limits",
+          "https://developer.tbank.ru/voicekit/intro/tariff",
+          "https://developer.tbank.ru/voicekit/api/release-notes/releasenotesstt",
+          "https://opensource.tbank.ru/voicekit/docs/-/raw/master/scenarios/examples/recognize_rest.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/tinkoff/grpc.rs:49",
+          "gateway/src/core/stt/tinkoff/grpc.rs:70-86",
+          "gateway/src/core/stt/tinkoff/grpc.rs:305-328",
+          "gateway/src/core/stt/tinkoff/messages.rs:268-295",
+          "gateway/src/core/stt/tinkoff/messages.rs:364-368",
+          "gateway/src/core/stt/tinkoff/messages.rs:491-496",
+          "gateway/src/core/stt/tinkoff/messages.rs:583-588",
+          "gateway/src/core/stt/tinkoff/config.rs:381-390",
+          "gateway/src/core/stt/tinkoff/provider.rs:146-149",
+          "gateway/src/core/stt/tinkoff/provider.rs:344-345",
+          "gateway/src/core/stt/tinkoff/provider.rs:419-426",
+          "gateway/src/core/tts/tinkoff/grpc.rs:69-114"
+        ],
+        "unverified": [
+          "transports[native].gateway_client (the four mismatches are inferred from reading the client, the vendor proto and the certificate chain of api.tinkoff.ai; nothing was run against the vendor)",
+          "transports[*].latency (the vendor publishes no latency figure)",
+          "transports[*].limits.rates[].scope (50 simultaneous streams per method for every cloud user; whether the scope is the API key or the account is not stated)",
+          "transports[planned_file].limits.max_upload_bytes (32 MB per request message; exact byte count not stated; the lower is recorded)",
+          "transports[planned_file].limits.max_audio_ms and min_audio_ms (not published; the only stated ceiling is one hour of request execution time)",
+          "transports[planned_file].upload.accepted (the current proto also lists OGG_OPUS, AMR and AMR_WB, while the formats page says containers other than MP3 must be decoded first)",
+          "billing.min_billed_ms (billing is per second; no per-request minimum is published)",
+          "transports[planned_commit].billing (which tariff applies to StreamingUnaryRecognize is not published)",
+          "dialect.language_param (the proto documents language_code as currently ignored; public examples allow only ru-RU)",
+          "dialect.context_params (the documentation pages describe speech_contexts as working; a comment in the current proto calls it unsupported)",
+          "vendor pages on developer.tbank.ru and opensource.tbank.ru were fetched with certificate checks off because their chain is not publicly trusted; field numbers and encoding numbers agree with the older GitHub copy of the proto fetched over verified TLS",
+          "billing.bills_silence (left null: the vendor does not say whether the stream tariff counts silence; it is charged per second of audio and the gateway forwards all call audio, so silence is probably billed on the stream, and it is not billed on uploads)",
+          "transports[planned_file].segment_profile.request_timeout_ms (10000 ms is the vendor audit's starting guess; no latency is published and nothing was measured)"
+        ],
+        "notes": "'default' is the gateway's placeholder, not a vendor wire string. The vendor publishes no model ids: RecognitionConfig.model (proto field 10) is optional and the vendor's default model is used when it is unset. The gateway never reads the session's model for this provider and never sends one (gateway/src/core/stt/tinkoff/config.rs:145, messages.rs:266-295, provider.rs:302-322), and it must not start sending the word 'default'. The vendor's native stream is listed first because segmentation is only a fallback for this vendor; the file upload and the gateway-driven commit follow. The stream is the only transport usable with today's code and it is expected to fail (gateway_client.defect), so this provider has no working live path until the streaming client is repaired. No release builds the file upload or the gateway-driven commit."
+      }
+    },
+    {
+      "id": "tinkoff:any",
+      "match": {
+        "provider": "tinkoff",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_tinkoff) is not implemented: the gateway has no request builder for the vendor's synchronous Recognize method. Shares two prerequisites with every T-Bank transport: the client must trust the Russian Trusted Root CA that api.tinkoff.ai chains to, and it must authenticate with 'authorization: Bearer <JWT>' (HS256, key id = API key, audience tinkoff.cloud.stt). A JWT signer already exists for text-to-speech (gateway/src/core/tts/tinkoff/grpc.rs:69-114).",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 32000000,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 3600000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor allows 50 simultaneous recognition streams per method for every cloud user; whether the scope is the API key or the account is not stated. A breach returns gRPC code 8 (RESOURCE_EXHAUSTED)."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "mp3",
+              "aac"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "encoding",
+                "value": "LINEAR16",
+                "in": "json"
+              },
+              {
+                "name": "sample_rate_hertz",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              },
+              {
+                "name": "num_channels",
+                "value": "1",
+                "in": "json"
+              },
+              {
+                "name": "do_not_perform_vad",
+                "value": "true",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "speech_contexts",
+                "note": "Phrases with scores from -10 to 10. The documentation pages describe the field as working; a comment in the current proto calls it unsupported."
+              }
+            ],
+            "wire": "tinkoff_stt_v1_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/tts/tinkoff/grpc.rs:69-114 (reusable JWT signer; no speech-to-text request code exists)",
+            "notes": "Vendor method Recognize is one synchronous request and one response, available as unary gRPC (/tinkoff.cloud.stt.v1.SpeechToText/Recognize) or as REST (POST https://api.tinkoff.ai/v1/stt:recognize, JSON body with base64 audio). The fact-check sent one request without credentials to each candidate REST host on 2026-10-03: api.tinkoff.ai answered 401 (the route exists and wants authentication) and api.tbank.ru, the host shown in the vendor's authorization example, answered 503, so api.tinkoff.ai is the host to use. Both hosts chain to the Russian Trusted Root CA. The adapter must: send headerless PCM16 (the vendor does not parse WAV); set sample_rate_hertz and num_channels=1 explicitly; set do_not_perform_vad=true so the vendor's own 0.6 s phrase splitter does not cut the segment again; mint a fresh JWT per request; and treat gRPC code 8 (RESOURCE_EXHAUSTED, 'Max open connection limit exceeded') as back-off, not as a reason to reconnect. Vendor release notes describe the Recognize model as updated separately from the StreamingRecognize model, so accuracy on this transport must be measured, not assumed equal to streaming. The 50 concurrent streams are per method."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. 10000 ms is the vendor audit's starting guess, not a measurement: the vendor publishes no latency for Recognize, and the streaming client's 60 s request timeout (gateway/src/core/stt/tinkoff/config.rs:104-106) is too long for a turn. Replace it with measured P99 plus a margin. The other defaults fit: a 25 s segment is about 0.8 MB of raw PCM (about 1.07 MB as base64 JSON), far below the 32 MB message cap; billing is per second with no published minimum, so short segments are not merged; two uploads in flight per call stay, behind a process-wide limiter under the 50 simultaneous streams the vendor allows per method."
+          },
+          "billing": {
+            "unit": "audio_second",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Online file tariff, lower than the stream tariff, billed per second of uploaded audio. No per-request minimum is published. Only uploaded segments are billed."
+          }
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "No client for StreamingUnaryRecognize exists in the gateway. Shares two prerequisites with every T-Bank transport: the client must trust the Russian Trusted Root CA that api.tinkoff.ai chains to, and it must authenticate with 'authorization: Bearer <JWT>' (HS256, key id = API key, audience tinkoff.cloud.stt). A JWT signer already exists for text-to-speech (gateway/src/core/tts/tinkoff/grpc.rs:69-114).",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_audio_ms": null,
+            "vendor_timeout_ms": 3600000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor allows 50 simultaneous recognition streams per method for every cloud user; whether the scope is the API key or the account is not stated. A breach returns gRPC code 8 (RESOURCE_EXHAUSTED)."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "speech_contexts",
+                "note": "Phrases with scores from -10 to 10. The documentation pages describe the field as working; a comment in the current proto calls it unsupported."
+              }
+            ],
+            "wire": "tinkoff_stt_v1_grpc_streaming_unary"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/tinkoff/grpc.rs:305-328 (config-then-audio request stream that a client-streaming call could reuse)",
+            "notes": "gRPC StreamingUnaryRecognize: the gateway sends the configuration, then audio chunks while the caller is still speaking, and closes the request stream when its own detector decides the utterance has ended; the vendor answers once. This removes the upload wait of a file request. No interim results. Which tariff applies (stream or file) is not published. Send do_not_perform_vad=true so the vendor returns one phrase."
+          },
+          "billing": {
+            "unit": "audio_second",
+            "min_billed_ms": null,
+            "bills_silence": null,
+            "notes": "Which tariff applies to StreamingUnaryRecognize (stream or online file) is not published. Only the audio of each utterance is sent."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 3600000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": null,
+                "scope": "unknown",
+                "note": "The vendor allows 50 simultaneous recognition streams per method for every cloud user; whether the scope is the API key or the account is not stated. A breach returns gRPC code 8 (RESOURCE_EXHAUSTED)."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "speech_contexts",
+                "note": "Phrases with scores from -10 to 10. The documentation pages describe the field as working; a comment in the current proto calls it unsupported."
+              }
+            ],
+            "wire": "tinkoff_stt_v1_grpc_streaming"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "The existing streaming client does not match the vendor protocol. Found by reading the client against the vendor proto and by inspecting the certificate chain; nothing was run against the vendor. (1) api.tinkoff.ai chains to the Russian Trusted Root CA; the gRPC channel is given no extra root (gateway/src/core/stt/tinkoff/grpc.rs:49) and a stock operating-system trust store does not contain it. (2) The client sends x-api-key and x-secret-key metadata where the vendor requires 'authorization: Bearer <JWT>' (grpc.rs:70-86). (3) It reads results from protobuf field 1 where the vendor uses field 2, so every response decodes as empty and is dropped (messages.rs:491-496, provider.rs:146-149). (4) It decodes each result without the vendor's recognition_result nesting (messages.rs:583-588).",
+            "code_ref": "gateway/src/core/stt/tinkoff/grpc.rs:49 and :70-86; gateway/src/core/stt/tinkoff/messages.rs:491-496, :583-588 and :364-368; gateway/src/core/stt/tinkoff/config.rs:381-390; gateway/src/core/stt/tinkoff/provider.rs:146-149 and :419-426",
+            "notes": "Bidirectional gRPC StreamingRecognize at api.tinkoff.ai:443; audio is forwarded unbuffered and the vendor's voice-activity detector ends phrases (silence threshold 0.6 s by default); is_final is copied to is_speech_final (provider.rs:419-426). Further defects: every audio-encoding number except LINEAR16 is wrong (config.rs:381-390), and num_channels is not sent for mono although the vendor marks it mandatory (messages.rs:364-368). The mock end-to-end test encodes the gateway's own schema (gateway/tests/mock_endpoint_e2e.rs:1705-1707), so it cannot detect any of this. The vendor guarantees connection continuity only under 3 min 25 s (hard cap one hour), so reconnects are normal within a call. The vendor returns a 'relative confidence factor' per alternative and a per-word confidence that may be negative; neither is a 0 to 1 probability, so quality_signals is empty and the value must not be thresholded. Speech-context phrases map to the gateway's keyterms feature."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Billed per second of audio, with three tariffs: stream, online file (lower than stream) and deferred. No per-request minimum is published. No pricing key exists for this provider in gateway/src/config/pricing.rs. This block describes the stream, the only transport usable with today's code. bills_silence is null because the vendor does not say whether the stream tariff counts silence: it is charged per second of audio and the gateway forwards all call audio, so silence is very probably billed."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://opensource.tbank.ru/voicekit/docs/-/raw/master/apis/tinkoff/cloud/stt/v1/stt.proto",
+          "https://raw.githubusercontent.com/Tinkoff/voicekit-examples/master/apis/tinkoff/cloud/stt/v1/stt.proto",
+          "https://developer.tbank.ru/voicekit/api/speech-recognition/grpc/recognize",
+          "https://developer.tbank.ru/voicekit/api/speech-recognition/grpc/streamingRecognize",
+          "https://developer.tbank.ru/voicekit/api/speech-recognition/grpc/streamingUnaryRecognize",
+          "https://developer.tbank.ru/voicekit/api/speech-recognition/stttutorial",
+          "https://developer.tbank.ru/voicekit/intro/authorization",
+          "https://developer.tbank.ru/voicekit/intro/formats",
+          "https://developer.tbank.ru/voicekit/intro/limits",
+          "https://developer.tbank.ru/voicekit/intro/tariff",
+          "https://developer.tbank.ru/voicekit/api/release-notes/releasenotesstt",
+          "https://opensource.tbank.ru/voicekit/docs/-/raw/master/scenarios/examples/recognize_rest.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/tinkoff/grpc.rs:49",
+          "gateway/src/core/stt/tinkoff/grpc.rs:70-86",
+          "gateway/src/core/stt/tinkoff/grpc.rs:305-328",
+          "gateway/src/core/stt/tinkoff/messages.rs:268-295",
+          "gateway/src/core/stt/tinkoff/messages.rs:364-368",
+          "gateway/src/core/stt/tinkoff/messages.rs:491-496",
+          "gateway/src/core/stt/tinkoff/messages.rs:583-588",
+          "gateway/src/core/stt/tinkoff/config.rs:381-390",
+          "gateway/src/core/stt/tinkoff/provider.rs:146-149",
+          "gateway/src/core/stt/tinkoff/provider.rs:344-345",
+          "gateway/src/core/stt/tinkoff/provider.rs:419-426",
+          "gateway/src/core/tts/tinkoff/grpc.rs:69-114"
+        ],
+        "unverified": [
+          "transports[native].gateway_client (the four mismatches are inferred from reading the client, the vendor proto and the certificate chain of api.tinkoff.ai; nothing was run against the vendor)",
+          "transports[*].latency (the vendor publishes no latency figure)",
+          "transports[*].limits.rates[].scope (50 simultaneous streams per method for every cloud user; whether the scope is the API key or the account is not stated)",
+          "transports[planned_file].limits.max_upload_bytes (32 MB per request message; exact byte count not stated; the lower is recorded)",
+          "transports[planned_file].limits.max_audio_ms and min_audio_ms (not published; the only stated ceiling is one hour of request execution time)",
+          "transports[planned_file].upload.accepted (the current proto also lists OGG_OPUS, AMR and AMR_WB, while the formats page says containers other than MP3 must be decoded first)",
+          "billing.min_billed_ms (billing is per second; no per-request minimum is published)",
+          "transports[planned_commit].billing (which tariff applies to StreamingUnaryRecognize is not published)",
+          "dialect.language_param (the proto documents language_code as currently ignored; public examples allow only ru-RU)",
+          "dialect.context_params (the documentation pages describe speech_contexts as working; a comment in the current proto calls it unsupported)",
+          "vendor pages on developer.tbank.ru and opensource.tbank.ru were fetched with certificate checks off because their chain is not publicly trusted; field numbers and encoding numbers agree with the older GitHub copy of the proto fetched over verified TLS",
+          "match (whether RecognitionConfig.model can select a customer-specific model is not documented)",
+          "transports[planned_file].segment_profile.request_timeout_ms (10000 ms is the vendor audit's starting guess; no latency is published and nothing was measured)"
+        ],
+        "notes": "Fail-slow default for any other model string. Because the gateway never sends a model to this vendor, every model string reaches the same vendor service, so this row lists the same three transports as the 'default' row and differs only in order. File upload is listed first, as in version 1, and the gateway-driven commit (StreamingUnaryRecognize) and the stream follow. No release enables the first two, so every session gets the stream, exactly as on the 'default' row. If a release ever enables the file upload, reorder this row to match the 'default' row first, otherwise a customer who typed any other model string is silently given the slower path."
+      }
+    }
+  ]
+}

@@ -64,6 +64,11 @@ pub struct ConnectionState {
     pub interaction_request: Option<(serde_json::Value, bool)>,
     /// Interaction mode: the session's actor, once it runs.
     pub interaction: Option<crate::core::interaction::actor::InteractionHandle>,
+    /// The session's conversation loop (`conversation_config`, or an alias with an `llm` leg).
+    pub conversation: Option<Arc<crate::core::conversation::ConversationOrchestrator>>,
+    /// The turn mode a `/v1/realtime` client chose before its agent session started (the agent's
+    /// own `turn_detection` otherwise).
+    pub agent_manual: Option<bool>,
 
     /// D8 uplink opus decoder (feature `opus-codec`): `Some` only when the session negotiated
     /// `stt_config.audio_in_codec = opus`. Each client WS binary frame is one opus packet decoded
@@ -71,6 +76,13 @@ pub struct ConnectionState {
     /// the connection read-lock on the audio hot path.
     #[cfg(feature = "opus-codec")]
     pub opus_decoder: Option<tokio::sync::Mutex<crate::core::audio::opus_codec::OpusStreamDecoder>>,
+
+    /// RCA 2e: the uplink's denoiser (feature `noise-filter`): `Some` only when the session
+    /// asked for `stt_config.noise_suppression` and the server had a stream to give it. Each
+    /// client WS binary frame (after the opus decode) passes through it BEFORE the VoiceManager,
+    /// so the VAD / turn models and the STT provider all hear the filtered audio.
+    #[cfg(feature = "noise-filter")]
+    pub denoiser: Option<Arc<crate::utils::noise_filter::StreamDenoiser>>,
 
     // DAG routing state (feature-gated)
     /// Compiled DAG for this connection
@@ -114,8 +126,12 @@ impl ConnectionState {
             agent: None,
             interaction_request: None,
             interaction: None,
+            conversation: None,
+            agent_manual: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
+            #[cfg(feature = "noise-filter")]
+            denoiser: None,
             #[cfg(feature = "dag-routing")]
             compiled_dag: None,
             #[cfg(feature = "dag-routing")]
@@ -148,8 +164,12 @@ impl ConnectionState {
             agent: None,
             interaction_request: None,
             interaction: None,
+            conversation: None,
+            agent_manual: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
+            #[cfg(feature = "noise-filter")]
+            denoiser: None,
             #[cfg(feature = "dag-routing")]
             compiled_dag: None,
             #[cfg(feature = "dag-routing")]

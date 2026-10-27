@@ -255,12 +255,25 @@ pub async fn handle_incoming_message(
                 actor.send(Msg::TypedTurn(text)).await;
                 return true;
             }
-            match state.read().await.agent.clone() {
-                Some(engine) => engine.start_turn(text).await,
-                None => {
+            let (engine, conversation, tracker) = {
+                let s = state.read().await;
+                (
+                    s.agent.clone(),
+                    s.conversation.clone(),
+                    s.task_tracker.clone(),
+                )
+            };
+            match (engine, conversation) {
+                (Some(engine), _) => engine.start_turn(text).await,
+                // A conversation turn runs until its reply is spoken: off the message loop.
+                (None, Some(conversation)) => tracker.track(
+                    "typed-turn",
+                    tokio::spawn(async move { conversation.take_typed_turn(&text).await }),
+                ),
+                (None, None) => {
                     send_error(
                         message_tx,
-                        "agent_input applies to voice-agent sessions only",
+                        "agent_input applies to voice-agent and conversation sessions only",
                     )
                     .await
                 }
@@ -329,18 +342,7 @@ pub async fn handle_incoming_message(
                 actor.send(Msg::AudioEnd).await;
                 return true;
             }
-            let keep = handle_audio_end(state, message_tx).await;
-            // Spec 025 manual turn detection: the end of the client's audio commits its turn. The
-            // provider's last final lands within the finalize; give it a moment before committing.
-            if let Some(engine) = state.read().await.agent.clone()
-                && engine.is_manual()
-            {
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    engine.commit_input().await;
-                });
-            }
-            keep
+            commit_client_audio(state, message_tx, false).await
         }
     }
 }
@@ -373,6 +375,9 @@ pub enum WsAuthPath {
     Bud,
     /// Standalone WaaV: match against the configured API secret list.
     ApiSecret,
+    /// Standalone WaaV with both configured (`AUTH_MODE=chain`, the default): an API secret
+    /// first, then the external auth service for any other token — the HTTP middleware's chain.
+    ApiSecretThenJwt,
     /// JWT-only deployment: validate against the external auth service, as `auth_middleware`
     /// does for HTTP. Without this a JWT-only gateway advertises first-message auth and then
     /// closes every socket, leaving `?token=` — which leaks the token into access logs — as the
@@ -382,7 +387,9 @@ pub enum WsAuthPath {
     Unconfigured,
 }
 
-/// Bud mode wins whenever it is present, then API secrets, then JWT.
+/// Bud mode wins whenever it is present, then API secrets, then JWT (chained when both are
+/// active). The booleans are the ACTIVE authenticators (`AuthPolicy::secrets_active` /
+/// `responder_active`), not merely the configured ones.
 ///
 /// Same precedence as `auth_middleware`, and for the same reason: when a control plane is
 /// configured it IS the deployment's identity source, and falling through to a secret list
@@ -394,6 +401,8 @@ pub fn ws_auth_path(
 ) -> WsAuthPath {
     if bud_mode_present {
         WsAuthPath::Bud
+    } else if has_api_secrets && has_jwt_auth {
+        WsAuthPath::ApiSecretThenJwt
     } else if has_api_secrets {
         WsAuthPath::ApiSecret
     } else if has_jwt_auth {
@@ -411,13 +420,19 @@ async fn handle_auth_message(
 ) -> bool {
     let path = ws_auth_path(
         app_state.bud_mode.is_some(),
-        app_state.config.has_api_secret_auth(),
-        app_state.config.has_jwt_auth(),
+        app_state.auth_policy.secrets_active(&app_state.config),
+        app_state.auth_policy.responder_active(&app_state.config),
     );
 
     if path == WsAuthPath::Bud && !state.read().await.auth.is_pending() {
         return refresh_bud_credential(token, state, message_tx, app_state).await;
     }
+
+    // The chain's first link: a configured API secret admits without asking the responder.
+    let chained_secret_id = (path == WsAuthPath::ApiSecretThenJwt)
+        .then(|| match_api_secret_id(&token, &app_state.config.auth_api_secrets))
+        .flatten()
+        .map(str::to_string);
 
     let resolved: Option<String> = match path {
         WsAuthPath::Bud => {
@@ -449,7 +464,8 @@ async fn handle_auth_message(
         WsAuthPath::ApiSecret => {
             match_api_secret_id(&token, &app_state.config.auth_api_secrets).map(str::to_string)
         }
-        WsAuthPath::Jwt => {
+        WsAuthPath::ApiSecretThenJwt if chained_secret_id.is_some() => chained_secret_id,
+        WsAuthPath::Jwt | WsAuthPath::ApiSecretThenJwt => {
             // Route a first-message token through the SAME external auth service the HTTP
             // middleware uses (empty body/headers; the /ws upgrade context).
             let Some(auth_client) = app_state.auth_client.as_ref() else {
@@ -681,6 +697,52 @@ async fn handle_custom_message(
     true
 }
 
+/// The client ended its audio (`/ws` `audio_end`, `/v1/realtime` `input_audio_buffer.commit`).
+///
+/// A segmented session flushes its engine and, for an agent in manual mode, waits for the final of
+/// the turn the commit sealed (it always comes, empty if nothing was recognised) before committing
+/// the turn; a fixed sleep would commit before the upload returned. Any other session keeps
+/// today's path: the provider's last final lands within the finalize, so the commit waits 300 ms.
+/// `always_commit`: the Realtime surface commits even where `/ws` would (manual mode is its only
+/// way to end a turn there).
+pub async fn commit_client_audio(
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    always_commit: bool,
+) -> bool {
+    let (agent, vm) = {
+        let g = state.read().await;
+        (g.agent.clone(), g.voice_manager.clone())
+    };
+    if let Some(vm) = vm.filter(|vm| vm.is_gateway_endpointed()) {
+        tokio::spawn(async move {
+            let outcome = vm.flush_stt().await;
+            let Some(engine) = agent.filter(|e| always_commit || e.is_manual()) else {
+                return;
+            };
+            if let Some(turn) = outcome.and_then(|o| o.turn_id.filter(|_| o.result_follows)) {
+                let bound = vm
+                    .live_facts()
+                    .await
+                    .map_or(7_000, |f| u64::from(f.resolution_deadline_ms) + 1_000);
+                engine
+                    .wait_final_turn(turn, std::time::Duration::from_millis(bound))
+                    .await;
+            }
+            engine.commit_input().await;
+        });
+        return true;
+    }
+    let keep = handle_audio_end(state, message_tx).await;
+    if let Some(engine) = agent.filter(|e| always_commit || e.is_manual()) {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            engine.commit_input().await;
+        });
+    }
+    keep
+}
+
 #[cfg(test)]
 mod ws_auth_path_tests {
     use super::*;
@@ -713,8 +775,12 @@ mod ws_auth_path_tests {
     #[test]
     fn standalone_waav_still_uses_its_api_secrets() {
         assert_eq!(ws_auth_path(false, true, false), WsAuthPath::ApiSecret);
-        // Secrets outrank JWT, matching the HTTP middleware's order.
-        assert_eq!(ws_auth_path(false, true, true), WsAuthPath::ApiSecret);
+        // Both active: secrets first, then the responder — the HTTP middleware's chain. (A
+        // secret mismatch used to close the socket without asking the responder.)
+        assert_eq!(
+            ws_auth_path(false, true, true),
+            WsAuthPath::ApiSecretThenJwt
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ mod merge;
 pub mod pricing;
 mod sip;
 pub(crate) mod utils;
-mod validation;
+pub(crate) mod validation;
 mod yaml;
 
 pub use pricing::{
@@ -105,29 +105,51 @@ pub struct PluginConfig {
 /// ```
 #[derive(Debug, Clone)]
 pub struct DAGTimeoutsConfig {
-    /// Default node execution timeout in seconds (default: 30)
+    /// Default node execution timeout in seconds (default: 30): any node without its own
+    /// `timeout_ms` or a per-kind value below.
     pub node_execution_secs: u64,
-    /// Provider operation timeout in seconds (default: 30)
-    pub provider_operation_secs: u64,
-    /// STT endpoint timeout in seconds (default: 60)
-    pub stt_endpoint_secs: u64,
-    /// TTS endpoint timeout in seconds (default: 60)
-    pub tts_endpoint_secs: u64,
-    /// LLM endpoint timeout in seconds (default: 120)
-    pub llm_endpoint_secs: u64,
-    /// WebSocket operation timeout in seconds (default: 30)
-    pub websocket_operation_secs: u64,
+    /// STT, TTS and realtime provider nodes, when their own per-kind value is unset.
+    pub provider_operation_secs: Option<u64>,
+    /// `stt_provider` nodes.
+    pub stt_endpoint_secs: Option<u64>,
+    /// `tts_provider` nodes.
+    pub tts_endpoint_secs: Option<u64>,
+    /// `llm_endpoint` nodes.
+    pub llm_endpoint_secs: Option<u64>,
+    /// `websocket_endpoint` nodes.
+    pub websocket_operation_secs: Option<u64>,
+}
+
+impl DAGTimeoutsConfig {
+    /// The timeout a node of `kind` (its type tag) runs under when it has no `timeout_ms`: the
+    /// kind's own value if the operator set one, else `provider_operation_secs` for a provider
+    /// node, else `node_execution_secs`. The per-kind values used to be parsed and never read,
+    /// so an operator who set `llm_endpoint_secs: 5` still got 30 s; they have no default now,
+    /// so a deployment that never set them keeps exactly the node default it had.
+    pub fn for_kind(&self, kind: &str) -> u64 {
+        let provider = matches!(kind, "stt_provider" | "tts_provider" | "realtime_provider")
+            .then_some(self.provider_operation_secs)
+            .flatten();
+        let own = match kind {
+            "stt_provider" => self.stt_endpoint_secs,
+            "tts_provider" => self.tts_endpoint_secs,
+            "llm_endpoint" => self.llm_endpoint_secs,
+            "websocket_endpoint" => self.websocket_operation_secs,
+            _ => None,
+        };
+        own.or(provider).unwrap_or(self.node_execution_secs).max(1)
+    }
 }
 
 impl Default for DAGTimeoutsConfig {
     fn default() -> Self {
         Self {
             node_execution_secs: 30,
-            provider_operation_secs: 30,
-            stt_endpoint_secs: 60,
-            tts_endpoint_secs: 60,
-            llm_endpoint_secs: 120,
-            websocket_operation_secs: 30,
+            provider_operation_secs: None,
+            stt_endpoint_secs: None,
+            tts_endpoint_secs: None,
+            llm_endpoint_secs: None,
+            websocket_operation_secs: None,
         }
     }
 }
@@ -427,6 +449,13 @@ impl Drop for ServerConfig {
 }
 
 impl ServerConfig {
+    /// The keys a YAML config file sets that no field reads, as dotted paths (`waav-gateway check`).
+    pub fn unknown_yaml_keys(path: &PathBuf) -> Result<Vec<String>, String> {
+        yaml::YamlConfig::from_file_reporting(path)
+            .map(|(_, unknown)| unknown)
+            .map_err(|e| e.to_string())
+    }
+
     /// Load configuration from a YAML file with environment variable base
     ///
     /// Loads .env file (if present), then merges environment variables (with defaults),
@@ -687,6 +716,46 @@ impl ServerConfig {
     ///
     /// # Returns
     /// * `String` - The Azure region identifier (e.g., "eastus", "westus2")
+    /// The operator's key for a REALTIME (speech-to-speech) provider, as `/realtime` and DAG
+    /// realtime nodes use it, or `None` when none is configured. Nova Sonic authenticates through
+    /// the AWS credential chain, so it gets a present-but-empty key.
+    pub fn get_realtime_api_key(&self, provider: &str) -> Option<String> {
+        match provider.to_lowercase().as_str() {
+            "openai" => self.openai_api_key.clone(),
+            "hume" => self.hume_api_key.clone(),
+            // OpenAI-protocol clones (own credentials, GA wire reused by delegation).
+            "azure" | "azure-openai" | "azure_openai" => self.azure_openai_api_key.clone(),
+            "grok" | "xai" => self.grok_api_key.clone(),
+            "inworld" => self.inworld_api_key.clone(),
+            // Deepgram Voice Agent (S2S) reuses the EXISTING deepgram credential
+            // (shared with Deepgram STT/TTS — no new config field).
+            "deepgram" | "deepgram-agent" | "deepgram_voice_agent" => self.deepgram_api_key.clone(),
+            // ElevenLabs Conversational AI (S2S) reuses the EXISTING elevenlabs
+            // credential (shared with ElevenLabs STT/TTS — no new config field).
+            "elevenlabs" | "elevenlabs-convai" | "11labs" => self.elevenlabs_api_key.clone(),
+            // Google Gemini Live (BidiGenerateContent S2S) uses the dedicated Gemini
+            // API key (the `?key=` query param) — distinct from `google_credentials`
+            // (the service-account JSON for Google STT/TTS).
+            "gemini" | "gemini-live" | "google" => self.gemini_api_key.clone(),
+            // Ultravox (hosted S2S model API) uses the dedicated Ultravox API key
+            // (the `X-API-Key` create-call header).
+            "ultravox" | "fixie" => self.ultravox_api_key.clone(),
+            // AWS Nova Sonic (Amazon Bedrock S2S) authenticates with AWS credentials
+            // via the `aws-config` default chain (env / shared config / IAM role), NOT
+            // an api-key — so there is NO `nova_sonic_api_key` config field. Supply a
+            // present-but-empty key so the "missing_api_key" guard below is satisfied;
+            // `NovaSonicProtocol::from_config` ignores `cfg.api_key` entirely and the
+            // transport resolves SigV4 credentials at connect (exactly like the AWS
+            // Transcribe STT provider).
+            "nova_sonic" | "nova-sonic" | "aws" => Some(String::new()),
+            // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone) uses the dedicated
+            // Yandex API key (a Yandex IAM token / static API key), passed as the
+            // `Authorization: Bearer <token>` value. The folder id is injected below.
+            "yandex" | "yandexgpt" | "yandex-cloud" => self.yandex_api_key.clone(),
+            _ => None,
+        }
+    }
+
     pub fn get_azure_speech_region(&self) -> String {
         self.azure_speech_region
             .clone()
@@ -763,6 +832,31 @@ pub(crate) fn parse_auth_api_secrets_json(
         .collect())
 }
 
+/// The environment variable that holds `provider`'s operator key, as [`ServerConfig::get_api_key`]
+/// reads it, or `None` for a provider the server holds no key for.
+///
+/// The NAME an operator credential uses to say where that key may go
+/// (`core::credentials`): declaring `DEEPGRAM_API_KEY: {env: DEEPGRAM_API_KEY, hosts: [...]}`
+/// approves those hosts as destinations for the gateway's Deepgram key. Kept beside
+/// `get_api_key_inner`, which must accept exactly the providers this names (tested).
+pub fn provider_key_variable(provider: &str) -> Option<&'static str> {
+    Some(match provider.trim().to_ascii_lowercase().as_str() {
+        "deepgram" => "DEEPGRAM_API_KEY",
+        "elevenlabs" => "ELEVENLABS_API_KEY",
+        "google" => "GOOGLE_APPLICATION_CREDENTIALS",
+        "microsoft-azure" | "azure" => "AZURE_SPEECH_SUBSCRIPTION_KEY",
+        "cartesia" => "CARTESIA_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "assemblyai" => "ASSEMBLYAI_API_KEY",
+        "hume" => "HUME_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        "ibm-watson" | "ibm_watson" | "ibm" | "watson" => "IBM_WATSON_API_KEY",
+        "aws" | "aws-transcribe" | "aws-polly" | "amazon" => "AWS_ACCESS_KEY_ID",
+        "gnani" | "gnani-ai" | "gnani.ai" | "vachana" => "GNANI_TOKEN",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,6 +864,81 @@ mod tests {
     use std::env;
     use std::fs;
     use tempfile::TempDir;
+
+    /// `provider_key_variable` names a variable for exactly the providers `get_api_key` serves:
+    /// a provider missing from it could not have its key's destinations declared, and one extra
+    /// would approve destinations for a key the server never sends.
+    #[test]
+    fn provider_key_variable_covers_exactly_the_providers_get_api_key_serves() {
+        let config = test_config();
+        for provider in [
+            "deepgram",
+            "elevenlabs",
+            "google",
+            "microsoft-azure",
+            "azure",
+            "cartesia",
+            "openai",
+            "assemblyai",
+            "hume",
+            "groq",
+            "ibm-watson",
+            "ibm_watson",
+            "ibm",
+            "watson",
+            "aws",
+            "aws-transcribe",
+            "aws-polly",
+            "amazon",
+            "gnani",
+            "gnani-ai",
+            "gnani.ai",
+            "vachana",
+        ] {
+            assert!(provider_key_variable(provider).is_some(), "{provider}");
+            let served = config.get_api_key_inner(provider);
+            assert!(
+                !served
+                    .as_ref()
+                    .is_err_and(|e| e.starts_with("Unsupported provider")),
+                "{provider}: {served:?}"
+            );
+        }
+        for provider in ["sarvam", "speechmatics", "no-such-vendor"] {
+            assert_eq!(provider_key_variable(provider), None, "{provider}");
+            assert!(config.get_api_key_inner(provider).is_err(), "{provider}");
+        }
+    }
+
+    #[test]
+    fn a_node_kind_gets_its_own_timeout_then_the_provider_one_then_the_default() {
+        let unset = DAGTimeoutsConfig::default();
+        for kind in ["llm_endpoint", "stt_provider", "http_endpoint"] {
+            assert_eq!(
+                unset.for_kind(kind),
+                30,
+                "{kind}: nothing set keeps the node default"
+            );
+        }
+        let set = DAGTimeoutsConfig {
+            node_execution_secs: 20,
+            provider_operation_secs: Some(45),
+            stt_endpoint_secs: None,
+            tts_endpoint_secs: Some(90),
+            llm_endpoint_secs: Some(5),
+            websocket_operation_secs: Some(12),
+        };
+        assert_eq!(set.for_kind("llm_endpoint"), 5);
+        assert_eq!(set.for_kind("tts_provider"), 90);
+        assert_eq!(
+            set.for_kind("stt_provider"),
+            45,
+            "a provider kind without its own value"
+        );
+        assert_eq!(set.for_kind("realtime_provider"), 45);
+        assert_eq!(set.for_kind("websocket_endpoint"), 12);
+        assert_eq!(set.for_kind("http_endpoint"), 20);
+    }
 
     /// Helper function to create a test ServerConfig with defaults
     fn test_config() -> ServerConfig {

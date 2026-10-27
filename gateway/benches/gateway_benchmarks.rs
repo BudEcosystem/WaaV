@@ -162,6 +162,7 @@ fn bench_message_serialization(c: &mut Criterion) {
         audio_in_codec: None,
         audio_out_codec: None,
         interaction: None,
+        stt: None,
     };
 
     // STT result

@@ -1,0 +1,996 @@
+{
+  "provider_id": "sberdevices",
+  "provider": {
+    "aliases": [
+      "sber",
+      "sber-devices",
+      "sber_devices",
+      "salutespeech",
+      "salute-speech",
+      "salute_speech",
+      "smartspeech"
+    ],
+    "default_model": "general",
+    "model_string": "wire_model",
+    "registered_in_gateway": true,
+    "prerequisites": [
+      {
+        "kind": "trust_root",
+        "detail": "The Russian Trusted Root CA must be added for the vendor's hosts before any transport can connect."
+      }
+    ],
+    "availability": {
+      "status": "closed_to_new_customers",
+      "since": "2026-07-15",
+      "note": "Connection is not available to new customers from 15 July 2026; existing customers keep working and no end date is published."
+    },
+    "notes": "SberDevices SaluteSpeech. No model is file-only at the vendor (gRPC v2 streams with partial results and vendor end-of-utterance), but the gateway has no gRPC client for it, so every model needs the file-upload transport. The client registered today (gateway/src/core/stt/sberdevices/client.rs) is a synchronous REST client behind a 500 ms wall-clock timer. It is not a transport: when_unusable on each row records what a live session gets from it, and decisions section 5 keeps it, reported as known broken, until the file-upload transport is enabled. Today's client reads the session's model field as the OAuth scope, not as a model (gateway/src/core/stt/sberdevices/config.rs:297-302), so the map's model key only becomes meaningful once model and scope are separated. Until then the resolver must not use the session's model field as the lookup key for this provider: it holds a scope string or one of its short forms (PERS, PERSONAL, CORP, CORPORATE, B2B, LEGACY; config.rs:194-205). The acoustic model the customer asked for travels in extras[\"model\"] on the standardized path (config.rs:351-356); that value, or 'general' when it is absent, is the right key. Otherwise a session that asks for callcenter through extras resolves to the default row and uploads at 16 kHz instead of 8 kHz. Today a live session still builds the legacy client, whose connect step requests an OAuth token before anything else (gateway/src/core/stt/sberdevices/client.rs:509-530); because the gateway's HTTP client ships a root list without the Russian Trusted Root CA (gateway/Cargo.toml:169), the session is expected to fail at setup on the certificate check (inferred, not run). Aliases differ by path: the standardized factory accepts sberdevices, sber_devices, sber, salutespeech and salute_speech (gateway/src/core/stt/standard.rs:458); the plugin registry accepts sber, sber-devices, sber_devices, salutespeech, salute-speech and smartspeech (gateway/src/plugin/builtin/mod.rs:1753-1756)."
+  },
+  "rows": [
+    {
+      "id": "sberdevices:general",
+      "match": {
+        "provider": "sberdevices",
+        "model": "general"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_sberdevices) is not implemented. The Sber client registered today is not a substitute: it uploads about half a second of audio at a time on a wall-clock timer, speech or silence, and marks each piece as the end of a turn (gateway/src/core/stt/sberdevices/client.rs:340-484). Two prerequisites apply to any Sber transport: the HTTP client must trust the Russian Trusted Root CA that both Sber hosts chain to, and the customer-facing model field must stop being parsed as the OAuth scope (gateway/src/core/stt/sberdevices/config.rs:297-302).",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ru",
+                "en",
+                "kk",
+                "ky",
+                "uz"
+              ],
+              "note": "The vendor's tags are ru-RU (its default) and en-US, and kk-KZ, ky-KG and uz-UZ only when the vendor enables them for the account; there is no language detection. Today's client turns an unsupported language into ru-RU without a warning."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 2000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 10,
+                "plan": "legal_entity",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for a legal entity (OAuth scope SALUTE_SPEECH_CORP or SALUTE_SPEECH_B2B), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 5,
+                "plan": "individual",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for an individual (OAuth scope SALUTE_SPEECH_PERS), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              }
+            ],
+            "assumed_plan": "individual"
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav",
+              "ogg",
+              "mp3",
+              "flac"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "envelope": "raw_body",
+            "content_type": "audio/x-pcm;bit=16;rate={sample_rate_hz}",
+            "vendor_params": [
+              {
+                "name": "sample_rate",
+                "value": "{sample_rate_hz}",
+                "in": "query"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [],
+            "wire": "sber_salutespeech_rest_v1"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/sberdevices/client.rs:45-56 (request builder), :63-161 (OAuth token cache), :261-337 (recognize_sync); gateway/src/core/stt/sberdevices/config.rs:378-405 (URL and query)",
+            "notes": "The request, token and response code for the synchronous endpoint (POST /rest/v1/speech:recognize, raw audio body) already exists inside the legacy client and can be lifted into the adapter. The adapter must: send headerless PCM16 with Content-Type audio/x-pcm;bit=16;rate=<rate> and the sample_rate query parameter (Sber has no audio/wav type; PCM with a WAV header under the same type is also documented as accepted); keep uploads under 60 s and 2 MB (the client's own cap is 2 MiB and its 60 s constant is never enforced, config.rs:35-38); send the acoustic model as the 'model' query parameter (today it comes only from extras[\"model\"], config.rs:351-356); share one OAuth token cache and one HTTP client across sessions; map HTTP 429 to back-off and 404 to 'unknown model'; and report confidence as unknown instead of the hard-coded 0.95 (client.rs:439-443). The synchronous response carries text, emotions and speaker age and gender only: no confidence, no word times, no detected language. Hints are not available on this endpoint. The vendor recognises only the first channel of multichannel audio on this endpoint, so the adapter must send mono. The gateway's feature matrix nevertheless lists 'multichannel' for this provider and the client can send channels_count (gateway/src/core/capabilities.rs:346, config.rs:394-396), a claim this endpoint cannot honour (inferred from the vendor text, not run). The token's expiry field (expires_at) must be accepted in either seconds or milliseconds: the vendor's pages disagree, and the legacy client assumes milliseconds (gateway/src/core/stt/sberdevices/messages.rs:16-30), so if the API returns seconds every upload would first fetch a new token."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "request_timeout_ms": 10000,
+            "rationale": "The vendor limits parallel recognition streams per account: its API documentation says 10 for legal entities and 5 for individuals, while its FAQ says 50 and 1. Both documentation figures are recorded in limits.rates by plan (legal_entity 10, individual 5), and the individual figure is assumed when the deployment names no plan: it is below both figures for legal entities and above the FAQ's single stream for individuals. The limiter should be set per credential, and the OAuth scope the session already carries says which kind of account it is (SALUTE_SPEECH_PERS for individuals, SALUTE_SPEECH_CORP and SALUTE_SPEECH_B2B for legal entities). Two uploads in flight per call would let a handful of calls exhaust the account, so one per call plus an account-wide limiter. The 10000 ms request timeout, with about 3 s to connect, is the vendor audit's engineering judgement, not a measurement: no latency is published, and the legacy client's 60 s request and 30 s connect timeouts (gateway/src/core/stt/sberdevices/config.rs:311-312) would stall a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No streaming client for Sber exists in the gateway. The vendor streams only over gRPC v2 (smartspeech.recognition.v2.SmartSpeech/Recognize); the gateway's Sber module speaks only the synchronous REST endpoint. Needs the same trust-root and model-versus-scope fixes as the file-upload adapter.",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ru",
+                "en",
+                "kk",
+                "ky",
+                "uz"
+              ],
+              "note": "The vendor's tags are ru-RU (its default) and en-US, and kk-KZ, ky-KG and uz-UZ only when the vendor enables them for the account; there is no language detection. Today's client turns an unsupported language into ru-RU without a warning."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 10,
+                "plan": "legal_entity",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for a legal entity (OAuth scope SALUTE_SPEECH_CORP or SALUTE_SPEECH_B2B), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 5,
+                "plan": "individual",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for an individual (OAuth scope SALUTE_SPEECH_PERS), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested."
+              }
+            ],
+            "assumed_plan": "individual"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "hints",
+                "note": "A list of words (hints.words) in the gRPC v2 recognition options; not available on the synchronous endpoint."
+              }
+            ],
+            "wire": "sber_salutespeech_grpc_v2"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/Cargo.toml:282 (tonic 0.11 already a dependency; no client code exists)",
+            "notes": "Bidirectional gRPC: first message carries the options, later messages carry audio chunks (at most 4 MB and 2 s each, at most 5 s between messages). Partial results on request, multi-utterance mode, vendor end-of-utterance with a silence timeout of 0.5 to 5 s (default 1 s), word hints, word alignments; no confidence. The older gRPC v1 protocol is marked no longer supported. Low priority while the vendor is closed to new customers. The vendor documentation gives the host smartspeech.sber.ru without a port; the fact-check found port 443 open and 9443 closed on that host, which suggests 443 but is not documented."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/sberdevices/client.rs:340-484",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Billed per second of audio at the same rate for synchronous and streaming recognition; the postpaid plan has a monthly minimum charge in any month with usage. No per-request minimum is documented. Only uploaded segments are billed on the file upload; a stream would be billed for all audio sent. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/post-speech-recognition",
+          "https://media.sberdevices.ru/bsm-docs/0.950.0/docs/assets/js/37d8e71b.fa5f98c0.js",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/encodings",
+          "https://developers.sber.ru/docs/ru/salutespeech/api/authentication",
+          "https://developers.sber.ru/docs/ru/salutespeech/tariffs/legal-tariffs",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/improvement",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/overview",
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/salutespeech-rest-api",
+          "https://developers.sber.ru/help/salutespeech/faq",
+          "https://developers.sber.ru/docs/ru/salutespeech/api/grpc/recognition-stream-2",
+          "https://developers.sber.ru/docs/assets/files/recognition-2705-2ae60b27890aa4473ebe324ca4132223.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/sberdevices/client.rs:45-56",
+          "gateway/src/core/stt/sberdevices/client.rs:261-337",
+          "gateway/src/core/stt/sberdevices/client.rs:340-484",
+          "gateway/src/core/stt/sberdevices/config.rs:297-302",
+          "gateway/src/core/stt/sberdevices/config.rs:351-356",
+          "gateway/src/core/stt/sberdevices/config.rs:378-405"
+        ],
+        "unverified": [
+          "transports[*].latency (the vendor publishes no latency; no recognition request was made because no credentials were used)",
+          "transports[*].limits.rates (the documentation says 10 parallel streams for legal entities and 5 for individuals, both recorded by plan; the FAQ says 50 and 1; which is enforced, and how synchronous requests count, is untested)",
+          "limits.max_upload_bytes (the vendor says 2 MB; exact byte count not stated; the lower is recorded)",
+          "limits.min_audio_ms",
+          "billing.min_billed_ms (none documented; the only rounding example is on the monthly total)",
+          "upload.preferred (PCM rates other than 8000 and 16000 on the synchronous endpoint are untested; the reference lists those two, the formats guide says 8 to 96 kHz)",
+          "whether the service will be withdrawn from existing customers after the closure to new customers on 2026-07-15",
+          "that the gateway's TLS handshake to Sber fails in production (inferred from the bundled root list and the observed certificate chain; the gateway was not run)",
+          "transports[1].vendor_turn_signal (end-of-utterance is governed by a silence timeout hint; not exercised)",
+          "transports[0].segment_profile.request_timeout_ms (10000 ms is the vendor audit's engineering judgement; no latency is published and nothing was measured)",
+          "transports[*].limits.rates[].scope (the vendor states the stream limit per account and per kind of customer, legal entity or individual; 'account' is recorded, and whether the limit is counted per account or per project is not stated)",
+          "which root certificates the gateway's HTTP client trusts at run time (the fact-check found a native-roots feature requested by a build-time crate in gateway/Cargo.lock and judged that it should not reach the runtime client; confirm with 'cargo tree -e features -i reqwest' when builds are allowed, because if operating-system roots are loaded the fix is to install the Russian root in the image instead of adding it in code)",
+          "transports[1].limits.max_session_ms (no session ceiling is stated for gRPC v2; the options carry a no-speech timeout and a maximum-speech timeout per utterance)",
+          "the unit of expires_at in the OAuth token response (the authentication guide's example is milliseconds, the REST reference's example is seconds; no token was requested)"
+        ],
+        "notes": "Vendor default model, for audio sampled above 8 kHz. The key is the vendor's 'model' query parameter. Today the gateway parses the session's model field as the OAuth scope instead (gateway/src/core/stt/sberdevices/config.rs:297-302), so until model and scope are separated a real session carries a scope string such as SALUTE_SPEECH_CORP in that field and resolves to the provider default row. The file upload is listed first because it is the path this plan delivers; a gRPC v2 client is optional later work and should move ahead of the file upload only once it exists and has been measured. Nothing is usable with today's code; when_unusable records the legacy client."
+      }
+    },
+    {
+      "id": "sberdevices:callcenter",
+      "match": {
+        "provider": "sberdevices",
+        "model": "callcenter"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_sberdevices) is not implemented. The Sber client registered today is not a substitute: it uploads about half a second of audio at a time on a wall-clock timer, speech or silence, and marks each piece as the end of a turn (gateway/src/core/stt/sberdevices/client.rs:340-484). Two prerequisites apply to any Sber transport: the HTTP client must trust the Russian Trusted Root CA that both Sber hosts chain to, and the customer-facing model field must stop being parsed as the OAuth scope (gateway/src/core/stt/sberdevices/config.rs:297-302).",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ru",
+                "en",
+                "kk",
+                "ky",
+                "uz"
+              ],
+              "note": "The vendor's tags are ru-RU (its default) and en-US, and kk-KZ, ky-KG and uz-UZ only when the vendor enables them for the account; there is no language detection. Today's client turns an unsupported language into ru-RU without a warning."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 2000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 10,
+                "plan": "legal_entity",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for a legal entity (OAuth scope SALUTE_SPEECH_CORP or SALUTE_SPEECH_B2B), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 5,
+                "plan": "individual",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for an individual (OAuth scope SALUTE_SPEECH_PERS), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              }
+            ],
+            "assumed_plan": "individual"
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav",
+              "ogg",
+              "mp3",
+              "flac"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 8000,
+              "channels": 1
+            },
+            "envelope": "raw_body",
+            "content_type": "audio/x-pcm;bit=16;rate={sample_rate_hz}",
+            "vendor_params": [
+              {
+                "name": "sample_rate",
+                "value": "{sample_rate_hz}",
+                "in": "query"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [],
+            "wire": "sber_salutespeech_rest_v1"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/sberdevices/client.rs:45-56 (request builder), :63-161 (OAuth token cache), :261-337 (recognize_sync); gateway/src/core/stt/sberdevices/config.rs:378-405 (URL and query)",
+            "notes": "The request, token and response code for the synchronous endpoint (POST /rest/v1/speech:recognize, raw audio body) already exists inside the legacy client and can be lifted into the adapter. The adapter must: send headerless PCM16 with Content-Type audio/x-pcm;bit=16;rate=<rate> and the sample_rate query parameter (Sber has no audio/wav type; PCM with a WAV header under the same type is also documented as accepted); keep uploads under 60 s and 2 MB (the client's own cap is 2 MiB and its 60 s constant is never enforced, config.rs:35-38); send the acoustic model as the 'model' query parameter (today it comes only from extras[\"model\"], config.rs:351-356); share one OAuth token cache and one HTTP client across sessions; map HTTP 429 to back-off and 404 to 'unknown model'; and report confidence as unknown instead of the hard-coded 0.95 (client.rs:439-443). The synchronous response carries text, emotions and speaker age and gender only: no confidence, no word times, no detected language. Hints are not available on this endpoint. The vendor recognises only the first channel of multichannel audio on this endpoint, so the adapter must send mono. The gateway's feature matrix nevertheless lists 'multichannel' for this provider and the client can send channels_count (gateway/src/core/capabilities.rs:346, config.rs:394-396), a claim this endpoint cannot honour (inferred from the vendor text, not run). The token's expiry field (expires_at) must be accepted in either seconds or milliseconds: the vendor's pages disagree, and the legacy client assumes milliseconds (gateway/src/core/stt/sberdevices/messages.rs:16-30), so if the API returns seconds every upload would first fetch a new token."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "request_timeout_ms": 10000,
+            "rationale": "The vendor limits parallel recognition streams per account: its API documentation says 10 for legal entities and 5 for individuals, while its FAQ says 50 and 1. Both documentation figures are recorded in limits.rates by plan (legal_entity 10, individual 5), and the individual figure is assumed when the deployment names no plan: it is below both figures for legal entities and above the FAQ's single stream for individuals. The limiter should be set per credential, and the OAuth scope the session already carries says which kind of account it is (SALUTE_SPEECH_PERS for individuals, SALUTE_SPEECH_CORP and SALUTE_SPEECH_B2B for legal entities). Two uploads in flight per call would let a handful of calls exhaust the account, so one per call plus an account-wide limiter. Upload at 8 kHz: the vendor defines this model as the 8 kHz telephony model. The 10000 ms request timeout, with about 3 s to connect, is the vendor audit's engineering judgement, not a measurement: no latency is published, and the legacy client's 60 s request and 30 s connect timeouts (gateway/src/core/stt/sberdevices/config.rs:311-312) would stall a turn. Replace it with measured P99 plus a margin."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No streaming client for Sber exists in the gateway. The vendor streams only over gRPC v2 (smartspeech.recognition.v2.SmartSpeech/Recognize); the gateway's Sber module speaks only the synchronous REST endpoint. Needs the same trust-root and model-versus-scope fixes as the file-upload adapter.",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ru",
+                "en",
+                "kk",
+                "ky",
+                "uz"
+              ],
+              "note": "The vendor's tags are ru-RU (its default) and en-US, and kk-KZ, ky-KG and uz-UZ only when the vendor enables them for the account; there is no language detection. Today's client turns an unsupported language into ru-RU without a warning."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 10,
+                "plan": "legal_entity",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for a legal entity (OAuth scope SALUTE_SPEECH_CORP or SALUTE_SPEECH_B2B), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 5,
+                "plan": "individual",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for an individual (OAuth scope SALUTE_SPEECH_PERS), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested."
+              }
+            ],
+            "assumed_plan": "individual"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "hints",
+                "note": "A list of words (hints.words) in the gRPC v2 recognition options; not available on the synchronous endpoint."
+              }
+            ],
+            "wire": "sber_salutespeech_grpc_v2"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/Cargo.toml:282 (tonic 0.11 already a dependency; no client code exists)",
+            "notes": "Bidirectional gRPC: first message carries the options, later messages carry audio chunks (at most 4 MB and 2 s each, at most 5 s between messages). Partial results on request, multi-utterance mode, vendor end-of-utterance with a silence timeout of 0.5 to 5 s (default 1 s), word hints, word alignments; no confidence. The older gRPC v1 protocol is marked no longer supported. Low priority while the vendor is closed to new customers. That this model is served on gRPC v2 is inferred from the vendor's model guide; the gRPC page does not list models. The vendor documentation gives the host smartspeech.sber.ru without a port; the fact-check found port 443 open and 9443 closed on that host, which suggests 443 but is not documented."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/sberdevices/client.rs:340-484",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Billed per second of audio at the same rate for synchronous and streaming recognition; the postpaid plan has a monthly minimum charge in any month with usage. No per-request minimum is documented. Only uploaded segments are billed on the file upload; a stream would be billed for all audio sent. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/post-speech-recognition",
+          "https://media.sberdevices.ru/bsm-docs/0.950.0/docs/assets/js/37d8e71b.fa5f98c0.js",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/encodings",
+          "https://developers.sber.ru/docs/ru/salutespeech/api/authentication",
+          "https://developers.sber.ru/docs/ru/salutespeech/tariffs/legal-tariffs",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/improvement",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/overview",
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/salutespeech-rest-api",
+          "https://developers.sber.ru/help/salutespeech/faq",
+          "https://developers.sber.ru/docs/ru/salutespeech/api/grpc/recognition-stream-2",
+          "https://developers.sber.ru/docs/assets/files/recognition-2705-2ae60b27890aa4473ebe324ca4132223.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/sberdevices/client.rs:45-56",
+          "gateway/src/core/stt/sberdevices/client.rs:261-337",
+          "gateway/src/core/stt/sberdevices/client.rs:340-484",
+          "gateway/src/core/stt/sberdevices/config.rs:297-302",
+          "gateway/src/core/stt/sberdevices/config.rs:351-356",
+          "gateway/src/core/stt/sberdevices/config.rs:378-405"
+        ],
+        "unverified": [
+          "transports[*].latency (the vendor publishes no latency; no recognition request was made because no credentials were used)",
+          "transports[*].limits.rates (the documentation says 10 parallel streams for legal entities and 5 for individuals, both recorded by plan; the FAQ says 50 and 1; which is enforced, and how synchronous requests count, is untested)",
+          "limits.max_upload_bytes (the vendor says 2 MB; exact byte count not stated; the lower is recorded)",
+          "limits.min_audio_ms",
+          "billing.min_billed_ms (none documented; the only rounding example is on the monthly total)",
+          "upload.preferred (PCM rates other than 8000 and 16000 on the synchronous endpoint are untested; the reference lists those two, the formats guide says 8 to 96 kHz)",
+          "whether the service will be withdrawn from existing customers after the closure to new customers on 2026-07-15",
+          "that the gateway's TLS handshake to Sber fails in production (inferred from the bundled root list and the observed certificate chain; the gateway was not run)",
+          "transports[1] (availability of callcenter on gRPC v2 is inferred from the model guide, not stated on the gRPC page)",
+          "transports[0].upload.accepted (whether 16 kHz G.711 is accepted is unclear: the reference lists it, the formats guide says 8 kHz)",
+          "transports[0].segment_profile.request_timeout_ms (10000 ms is the vendor audit's engineering judgement; no latency is published and nothing was measured)",
+          "transports[*].limits.rates[].scope (the vendor states the stream limit per account and per kind of customer, legal entity or individual; 'account' is recorded, and whether the limit is counted per account or per project is not stated)",
+          "which root certificates the gateway's HTTP client trusts at run time (the fact-check found a native-roots feature requested by a build-time crate in gateway/Cargo.lock and judged that it should not reach the runtime client; confirm with 'cargo tree -e features -i reqwest' when builds are allowed, because if operating-system roots are loaded the fix is to install the Russian root in the image instead of adding it in code)",
+          "transports[1].limits.max_session_ms (no session ceiling is stated for gRPC v2; the options carry a no-speech timeout and a maximum-speech timeout per utterance)",
+          "the unit of expires_at in the OAuth token response (the authentication guide's example is milliseconds, the REST reference's example is seconds; no token was requested)"
+        ],
+        "notes": "Telephony model; the vendor states its sample rate as 8 kHz, so segments are downsampled to 8 kHz for this model instead of the 16 kHz default. The key is the vendor's 'model' query parameter. Today the gateway parses the session's model field as the OAuth scope instead (gateway/src/core/stt/sberdevices/config.rs:297-302), so until model and scope are separated a real session carries a scope string such as SALUTE_SPEECH_CORP in that field and resolves to the provider default row."
+      }
+    },
+    {
+      "id": "sberdevices:media",
+      "match": {
+        "provider": "sberdevices",
+        "model": "media"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_sberdevices) is not implemented. The Sber client registered today is not a substitute: it uploads about half a second of audio at a time on a wall-clock timer, speech or silence, and marks each piece as the end of a turn (gateway/src/core/stt/sberdevices/client.rs:340-484). Two prerequisites apply to any Sber transport: the HTTP client must trust the Russian Trusted Root CA that both Sber hosts chain to, and the customer-facing model field must stop being parsed as the OAuth scope (gateway/src/core/stt/sberdevices/config.rs:297-302).",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ru",
+                "en",
+                "kk",
+                "ky",
+                "uz"
+              ],
+              "note": "The vendor's tags are ru-RU (its default) and en-US, and kk-KZ, ky-KG and uz-UZ only when the vendor enables them for the account; there is no language detection. Today's client turns an unsupported language into ru-RU without a warning."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 2000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 10,
+                "plan": "legal_entity",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for a legal entity (OAuth scope SALUTE_SPEECH_CORP or SALUTE_SPEECH_B2B), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 5,
+                "plan": "individual",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for an individual (OAuth scope SALUTE_SPEECH_PERS), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              }
+            ],
+            "assumed_plan": "individual"
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav",
+              "ogg",
+              "mp3",
+              "flac"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "envelope": "raw_body",
+            "content_type": "audio/x-pcm;bit=16;rate={sample_rate_hz}",
+            "vendor_params": [
+              {
+                "name": "sample_rate",
+                "value": "{sample_rate_hz}",
+                "in": "query"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [],
+            "wire": "sber_salutespeech_rest_v1"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/sberdevices/client.rs:45-56 (request builder), :63-161 (OAuth token cache), :261-337 (recognize_sync); gateway/src/core/stt/sberdevices/config.rs:378-405 (URL and query)",
+            "notes": "The request, token and response code for the synchronous endpoint (POST /rest/v1/speech:recognize, raw audio body) already exists inside the legacy client and can be lifted into the adapter. The adapter must: send headerless PCM16 with Content-Type audio/x-pcm;bit=16;rate=<rate> and the sample_rate query parameter (Sber has no audio/wav type; PCM with a WAV header under the same type is also documented as accepted); keep uploads under 60 s and 2 MB (the client's own cap is 2 MiB and its 60 s constant is never enforced, config.rs:35-38); send the acoustic model as the 'model' query parameter (today it comes only from extras[\"model\"], config.rs:351-356); share one OAuth token cache and one HTTP client across sessions; map HTTP 429 to back-off and 404 to 'unknown model'; and report confidence as unknown instead of the hard-coded 0.95 (client.rs:439-443). The synchronous response carries text, emotions and speaker age and gender only: no confidence, no word times, no detected language. Hints are not available on this endpoint. The vendor recognises only the first channel of multichannel audio on this endpoint, so the adapter must send mono. The gateway's feature matrix nevertheless lists 'multichannel' for this provider and the client can send channels_count (gateway/src/core/capabilities.rs:346, config.rs:394-396), a claim this endpoint cannot honour (inferred from the vendor text, not run). The token's expiry field (expires_at) must be accepted in either seconds or milliseconds: the vendor's pages disagree, and the legacy client assumes milliseconds (gateway/src/core/stt/sberdevices/messages.rs:16-30), so if the API returns seconds every upload would first fetch a new token."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "request_timeout_ms": 10000,
+            "rationale": "The vendor limits parallel recognition streams per account: its API documentation says 10 for legal entities and 5 for individuals, while its FAQ says 50 and 1. Both documentation figures are recorded in limits.rates by plan (legal_entity 10, individual 5), and the individual figure is assumed when the deployment names no plan: it is below both figures for legal entities and above the FAQ's single stream for individuals. The limiter should be set per credential, and the OAuth scope the session already carries says which kind of account it is (SALUTE_SPEECH_PERS for individuals, SALUTE_SPEECH_CORP and SALUTE_SPEECH_B2B for legal entities). Two uploads in flight per call would let a handful of calls exhaust the account, so one per call plus an account-wide limiter. The 10000 ms request timeout, with about 3 s to connect, is the vendor audit's engineering judgement, not a measurement: no latency is published, and the legacy client's 60 s request and 30 s connect timeouts (gateway/src/core/stt/sberdevices/config.rs:311-312) would stall a turn. Replace it with measured P99 plus a margin."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/sberdevices/client.rs:340-484",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Billed per second of audio at the same rate for synchronous and streaming recognition; the postpaid plan has a monthly minimum charge in any month with usage. No per-request minimum is documented. Only uploaded segments are billed on the file upload; a stream would be billed for all audio sent. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/post-speech-recognition",
+          "https://media.sberdevices.ru/bsm-docs/0.950.0/docs/assets/js/37d8e71b.fa5f98c0.js",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/encodings",
+          "https://developers.sber.ru/docs/ru/salutespeech/api/authentication",
+          "https://developers.sber.ru/docs/ru/salutespeech/tariffs/legal-tariffs",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/improvement",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/overview",
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/salutespeech-rest-api",
+          "https://developers.sber.ru/help/salutespeech/faq"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/sberdevices/client.rs:45-56",
+          "gateway/src/core/stt/sberdevices/client.rs:261-337",
+          "gateway/src/core/stt/sberdevices/client.rs:340-484",
+          "gateway/src/core/stt/sberdevices/config.rs:297-302",
+          "gateway/src/core/stt/sberdevices/config.rs:351-356",
+          "gateway/src/core/stt/sberdevices/config.rs:378-405"
+        ],
+        "unverified": [
+          "transports[*].latency (the vendor publishes no latency; no recognition request was made because no credentials were used)",
+          "transports[*].limits.rates (the documentation says 10 parallel streams for legal entities and 5 for individuals, both recorded by plan; the FAQ says 50 and 1; which is enforced, and how synchronous requests count, is untested)",
+          "limits.max_upload_bytes (the vendor says 2 MB; exact byte count not stated; the lower is recorded)",
+          "limits.min_audio_ms",
+          "billing.min_billed_ms (none documented; the only rounding example is on the monthly total)",
+          "upload.preferred (PCM rates other than 8000 and 16000 on the synchronous endpoint are untested; the reference lists those two, the formats guide says 8 to 96 kHz)",
+          "whether the service will be withdrawn from existing customers after the closure to new customers on 2026-07-15",
+          "that the gateway's TLS handshake to Sber fails in production (inferred from the bundled root list and the observed certificate chain; the gateway was not run)",
+          "the vendor gives no description of this model; it appears only in the synchronous endpoint's model list",
+          "whether the model is served on gRPC v2 or by the asynchronous job (no streaming transport is listed for that reason)",
+          "upload.preferred.sample_rate_hz (no vendor guidance for this model; the gateway default is kept)",
+          "transports[0].segment_profile.request_timeout_ms (10000 ms is the vendor audit's engineering judgement; no latency is published and nothing was measured)",
+          "transports[*].limits.rates[].scope (the vendor states the stream limit per account and per kind of customer, legal entity or individual; 'account' is recorded, and whether the limit is counted per account or per project is not stated)",
+          "which root certificates the gateway's HTTP client trusts at run time (the fact-check found a native-roots feature requested by a build-time crate in gateway/Cargo.lock and judged that it should not reach the runtime client; confirm with 'cargo tree -e features -i reqwest' when builds are allowed, because if operating-system roots are loaded the fix is to install the Russian root in the image instead of adding it in code)",
+          "the unit of expires_at in the OAuth token response (the authentication guide's example is milliseconds, the REST reference's example is seconds; no token was requested)"
+        ],
+        "notes": "The key is the vendor's 'model' query parameter. Today the gateway parses the session's model field as the OAuth scope instead (gateway/src/core/stt/sberdevices/config.rs:297-302), so until model and scope are separated a real session carries a scope string such as SALUTE_SPEECH_CORP in that field and resolves to the provider default row."
+      }
+    },
+    {
+      "id": "sberdevices:ivr",
+      "match": {
+        "provider": "sberdevices",
+        "model": "ivr"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_sberdevices) is not implemented. The Sber client registered today is not a substitute: it uploads about half a second of audio at a time on a wall-clock timer, speech or silence, and marks each piece as the end of a turn (gateway/src/core/stt/sberdevices/client.rs:340-484). Two prerequisites apply to any Sber transport: the HTTP client must trust the Russian Trusted Root CA that both Sber hosts chain to, and the customer-facing model field must stop being parsed as the OAuth scope (gateway/src/core/stt/sberdevices/config.rs:297-302).",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ru",
+                "en",
+                "kk",
+                "ky",
+                "uz"
+              ],
+              "note": "The vendor's tags are ru-RU (its default) and en-US, and kk-KZ, ky-KG and uz-UZ only when the vendor enables them for the account; there is no language detection. Today's client turns an unsupported language into ru-RU without a warning."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 2000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 10,
+                "plan": "legal_entity",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for a legal entity (OAuth scope SALUTE_SPEECH_CORP or SALUTE_SPEECH_B2B), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 5,
+                "plan": "individual",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for an individual (OAuth scope SALUTE_SPEECH_PERS), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              }
+            ],
+            "assumed_plan": "individual"
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav",
+              "ogg",
+              "mp3",
+              "flac"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "envelope": "raw_body",
+            "content_type": "audio/x-pcm;bit=16;rate={sample_rate_hz}",
+            "vendor_params": [
+              {
+                "name": "sample_rate",
+                "value": "{sample_rate_hz}",
+                "in": "query"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [],
+            "wire": "sber_salutespeech_rest_v1"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/sberdevices/client.rs:45-56 (request builder), :63-161 (OAuth token cache), :261-337 (recognize_sync); gateway/src/core/stt/sberdevices/config.rs:378-405 (URL and query)",
+            "notes": "The request, token and response code for the synchronous endpoint (POST /rest/v1/speech:recognize, raw audio body) already exists inside the legacy client and can be lifted into the adapter. The adapter must: send headerless PCM16 with Content-Type audio/x-pcm;bit=16;rate=<rate> and the sample_rate query parameter (Sber has no audio/wav type; PCM with a WAV header under the same type is also documented as accepted); keep uploads under 60 s and 2 MB (the client's own cap is 2 MiB and its 60 s constant is never enforced, config.rs:35-38); send the acoustic model as the 'model' query parameter (today it comes only from extras[\"model\"], config.rs:351-356); share one OAuth token cache and one HTTP client across sessions; map HTTP 429 to back-off and 404 to 'unknown model'; and report confidence as unknown instead of the hard-coded 0.95 (client.rs:439-443). The synchronous response carries text, emotions and speaker age and gender only: no confidence, no word times, no detected language. Hints are not available on this endpoint. The vendor recognises only the first channel of multichannel audio on this endpoint, so the adapter must send mono. The gateway's feature matrix nevertheless lists 'multichannel' for this provider and the client can send channels_count (gateway/src/core/capabilities.rs:346, config.rs:394-396), a claim this endpoint cannot honour (inferred from the vendor text, not run). The token's expiry field (expires_at) must be accepted in either seconds or milliseconds: the vendor's pages disagree, and the legacy client assumes milliseconds (gateway/src/core/stt/sberdevices/messages.rs:16-30), so if the API returns seconds every upload would first fetch a new token."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "request_timeout_ms": 10000,
+            "rationale": "The vendor limits parallel recognition streams per account: its API documentation says 10 for legal entities and 5 for individuals, while its FAQ says 50 and 1. Both documentation figures are recorded in limits.rates by plan (legal_entity 10, individual 5), and the individual figure is assumed when the deployment names no plan: it is below both figures for legal entities and above the FAQ's single stream for individuals. The limiter should be set per credential, and the OAuth scope the session already carries says which kind of account it is (SALUTE_SPEECH_PERS for individuals, SALUTE_SPEECH_CORP and SALUTE_SPEECH_B2B for legal entities). Two uploads in flight per call would let a handful of calls exhaust the account, so one per call plus an account-wide limiter. The 10000 ms request timeout, with about 3 s to connect, is the vendor audit's engineering judgement, not a measurement: no latency is published, and the legacy client's 60 s request and 30 s connect timeouts (gateway/src/core/stt/sberdevices/config.rs:311-312) would stall a turn. Replace it with measured P99 plus a margin."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/sberdevices/client.rs:340-484",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Billed per second of audio at the same rate for synchronous and streaming recognition; the postpaid plan has a monthly minimum charge in any month with usage. No per-request minimum is documented. Only uploaded segments are billed on the file upload; a stream would be billed for all audio sent. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/post-speech-recognition",
+          "https://media.sberdevices.ru/bsm-docs/0.950.0/docs/assets/js/37d8e71b.fa5f98c0.js",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/encodings",
+          "https://developers.sber.ru/docs/ru/salutespeech/api/authentication",
+          "https://developers.sber.ru/docs/ru/salutespeech/tariffs/legal-tariffs",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/improvement",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/overview",
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/salutespeech-rest-api",
+          "https://developers.sber.ru/help/salutespeech/faq"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/sberdevices/client.rs:45-56",
+          "gateway/src/core/stt/sberdevices/client.rs:261-337",
+          "gateway/src/core/stt/sberdevices/client.rs:340-484",
+          "gateway/src/core/stt/sberdevices/config.rs:297-302",
+          "gateway/src/core/stt/sberdevices/config.rs:351-356",
+          "gateway/src/core/stt/sberdevices/config.rs:378-405"
+        ],
+        "unverified": [
+          "transports[*].latency (the vendor publishes no latency; no recognition request was made because no credentials were used)",
+          "transports[*].limits.rates (the documentation says 10 parallel streams for legal entities and 5 for individuals, both recorded by plan; the FAQ says 50 and 1; which is enforced, and how synchronous requests count, is untested)",
+          "limits.max_upload_bytes (the vendor says 2 MB; exact byte count not stated; the lower is recorded)",
+          "limits.min_audio_ms",
+          "billing.min_billed_ms (none documented; the only rounding example is on the monthly total)",
+          "upload.preferred (PCM rates other than 8000 and 16000 on the synchronous endpoint are untested; the reference lists those two, the formats guide says 8 to 96 kHz)",
+          "whether the service will be withdrawn from existing customers after the closure to new customers on 2026-07-15",
+          "that the gateway's TLS handshake to Sber fails in production (inferred from the bundled root list and the observed certificate chain; the gateway was not run)",
+          "the vendor gives no description of this model; it appears only in the synchronous endpoint's model list",
+          "whether the model is served on gRPC v2 or by the asynchronous job (no streaming transport is listed for that reason)",
+          "upload.preferred.sample_rate_hz (no vendor guidance for this model; the gateway default is kept)",
+          "transports[0].segment_profile.request_timeout_ms (10000 ms is the vendor audit's engineering judgement; no latency is published and nothing was measured)",
+          "transports[*].limits.rates[].scope (the vendor states the stream limit per account and per kind of customer, legal entity or individual; 'account' is recorded, and whether the limit is counted per account or per project is not stated)",
+          "which root certificates the gateway's HTTP client trusts at run time (the fact-check found a native-roots feature requested by a build-time crate in gateway/Cargo.lock and judged that it should not reach the runtime client; confirm with 'cargo tree -e features -i reqwest' when builds are allowed, because if operating-system roots are loaded the fix is to install the Russian root in the image instead of adding it in code)",
+          "the unit of expires_at in the OAuth token response (the authentication guide's example is milliseconds, the REST reference's example is seconds; no token was requested)"
+        ],
+        "notes": "The key is the vendor's 'model' query parameter. Today the gateway parses the session's model field as the OAuth scope instead (gateway/src/core/stt/sberdevices/config.rs:297-302), so until model and scope are separated a real session carries a scope string such as SALUTE_SPEECH_CORP in that field and resolves to the provider default row."
+      }
+    },
+    {
+      "id": "sberdevices:any",
+      "match": {
+        "provider": "sberdevices",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_sberdevices) is not implemented. The Sber client registered today is not a substitute: it uploads about half a second of audio at a time on a wall-clock timer, speech or silence, and marks each piece as the end of a turn (gateway/src/core/stt/sberdevices/client.rs:340-484). Two prerequisites apply to any Sber transport: the HTTP client must trust the Russian Trusted Root CA that both Sber hosts chain to, and the customer-facing model field must stop being parsed as the OAuth scope (gateway/src/core/stt/sberdevices/config.rs:297-302).",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ru",
+                "en",
+                "kk",
+                "ky",
+                "uz"
+              ],
+              "note": "The vendor's tags are ru-RU (its default) and en-US, and kk-KZ, ky-KG and uz-UZ only when the vendor enables them for the account; there is no language detection. Today's client turns an unsupported language into ru-RU without a warning."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 2000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 10,
+                "plan": "legal_entity",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for a legal entity (OAuth scope SALUTE_SPEECH_CORP or SALUTE_SPEECH_B2B), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 5,
+                "plan": "individual",
+                "scope": "account",
+                "note": "Parallel recognition streams per account for an individual (OAuth scope SALUTE_SPEECH_PERS), from the vendor's documentation. The vendor's FAQ gives different figures (50 for legal entities, 1 for individuals); which is enforced is untested. How synchronous requests count against the limit is untested."
+              }
+            ],
+            "assumed_plan": "individual"
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav",
+              "ogg",
+              "mp3",
+              "flac"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "envelope": "raw_body",
+            "content_type": "audio/x-pcm;bit=16;rate={sample_rate_hz}",
+            "vendor_params": [
+              {
+                "name": "sample_rate",
+                "value": "{sample_rate_hz}",
+                "in": "query"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [],
+            "wire": "sber_salutespeech_rest_v1"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/sberdevices/client.rs:45-56 (request builder), :63-161 (OAuth token cache), :261-337 (recognize_sync); gateway/src/core/stt/sberdevices/config.rs:378-405 (URL and query)",
+            "notes": "The request, token and response code for the synchronous endpoint (POST /rest/v1/speech:recognize, raw audio body) already exists inside the legacy client and can be lifted into the adapter. The adapter must: send headerless PCM16 with Content-Type audio/x-pcm;bit=16;rate=<rate> and the sample_rate query parameter (Sber has no audio/wav type; PCM with a WAV header under the same type is also documented as accepted); keep uploads under 60 s and 2 MB (the client's own cap is 2 MiB and its 60 s constant is never enforced, config.rs:35-38); send the acoustic model as the 'model' query parameter (today it comes only from extras[\"model\"], config.rs:351-356); share one OAuth token cache and one HTTP client across sessions; map HTTP 429 to back-off and 404 to 'unknown model'; and report confidence as unknown instead of the hard-coded 0.95 (client.rs:439-443). The synchronous response carries text, emotions and speaker age and gender only: no confidence, no word times, no detected language. Hints are not available on this endpoint. The vendor recognises only the first channel of multichannel audio on this endpoint, so the adapter must send mono. The gateway's feature matrix nevertheless lists 'multichannel' for this provider and the client can send channels_count (gateway/src/core/capabilities.rs:346, config.rs:394-396), a claim this endpoint cannot honour (inferred from the vendor text, not run). The token's expiry field (expires_at) must be accepted in either seconds or milliseconds: the vendor's pages disagree, and the legacy client assumes milliseconds (gateway/src/core/stt/sberdevices/messages.rs:16-30), so if the API returns seconds every upload would first fetch a new token."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "request_timeout_ms": 10000,
+            "rationale": "The vendor limits parallel recognition streams per account: its API documentation says 10 for legal entities and 5 for individuals, while its FAQ says 50 and 1. Both documentation figures are recorded in limits.rates by plan (legal_entity 10, individual 5), and the individual figure is assumed when the deployment names no plan: it is below both figures for legal entities and above the FAQ's single stream for individuals. The limiter should be set per credential, and the OAuth scope the session already carries says which kind of account it is (SALUTE_SPEECH_PERS for individuals, SALUTE_SPEECH_CORP and SALUTE_SPEECH_B2B for legal entities). Two uploads in flight per call would let a handful of calls exhaust the account, so one per call plus an account-wide limiter. The 10000 ms request timeout, with about 3 s to connect, is the vendor audit's engineering judgement, not a measurement: no latency is published, and the legacy client's 60 s request and 30 s connect timeouts (gateway/src/core/stt/sberdevices/config.rs:311-312) would stall a turn. Replace it with measured P99 plus a margin."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/sberdevices/client.rs:340-484",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Billed per second of audio at the same rate for synchronous and streaming recognition; the postpaid plan has a monthly minimum charge in any month with usage. No per-request minimum is documented. Only uploaded segments are billed on the file upload; a stream would be billed for all audio sent. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/post-speech-recognition",
+          "https://media.sberdevices.ru/bsm-docs/0.950.0/docs/assets/js/37d8e71b.fa5f98c0.js",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/encodings",
+          "https://developers.sber.ru/docs/ru/salutespeech/api/authentication",
+          "https://developers.sber.ru/docs/ru/salutespeech/tariffs/legal-tariffs",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/improvement",
+          "https://developers.sber.ru/docs/ru/salutespeech/guides/recognition/overview",
+          "https://developers.sber.ru/docs/ru/salutespeech/rest/salutespeech-rest-api",
+          "https://developers.sber.ru/help/salutespeech/faq"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/sberdevices/client.rs:45-56",
+          "gateway/src/core/stt/sberdevices/client.rs:261-337",
+          "gateway/src/core/stt/sberdevices/client.rs:340-484",
+          "gateway/src/core/stt/sberdevices/config.rs:297-302",
+          "gateway/src/core/stt/sberdevices/config.rs:351-356",
+          "gateway/src/core/stt/sberdevices/config.rs:378-405"
+        ],
+        "unverified": [
+          "transports[*].latency (the vendor publishes no latency; no recognition request was made because no credentials were used)",
+          "transports[*].limits.rates (the documentation says 10 parallel streams for legal entities and 5 for individuals, both recorded by plan; the FAQ says 50 and 1; which is enforced, and how synchronous requests count, is untested)",
+          "limits.max_upload_bytes (the vendor says 2 MB; exact byte count not stated; the lower is recorded)",
+          "limits.min_audio_ms",
+          "billing.min_billed_ms (none documented; the only rounding example is on the monthly total)",
+          "upload.preferred (PCM rates other than 8000 and 16000 on the synchronous endpoint are untested; the reference lists those two, the formats guide says 8 to 96 kHz)",
+          "whether the service will be withdrawn from existing customers after the closure to new customers on 2026-07-15",
+          "that the gateway's TLS handshake to Sber fails in production (inferred from the bundled root list and the observed certificate chain; the gateway was not run)",
+          "transports[0].segment_profile.request_timeout_ms (10000 ms is the vendor audit's engineering judgement; no latency is published and nothing was measured)",
+          "transports[*].limits.rates[].scope (the vendor states the stream limit per account and per kind of customer, legal entity or individual; 'account' is recorded, and whether the limit is counted per account or per project is not stated)",
+          "which root certificates the gateway's HTTP client trusts at run time (the fact-check found a native-roots feature requested by a build-time crate in gateway/Cargo.lock and judged that it should not reach the runtime client; confirm with 'cargo tree -e features -i reqwest' when builds are allowed, because if operating-system roots are loaded the fix is to install the Russian root in the image instead of adding it in code)",
+          "the unit of expires_at in the OAuth token response (the authentication guide's example is milliseconds, the REST reference's example is seconds; no token was requested)"
+        ],
+        "notes": "Fail-slow default: file upload to the synchronous endpoint. The vendor answers an unknown model with HTTP 404 on the first segment. If the resolver looks up the session's model field, this is the row every real session reaches today, because the gateway puts the OAuth scope in that field (SALUTE_SPEECH_PERS, SALUTE_SPEECH_CORP, SALUTE_SPEECH_B2B, SBER_SPEECH and their short forms; gateway/src/core/stt/sberdevices/config.rs:194-205 and :297-302). The adapter must never send such a string as the vendor's model parameter. The resolver should instead take the key from extras[\"model\"] when it is present (config.rs:351-356) and from the provider default 'general' when it is not, so that general, callcenter, media and ivr reach their own rows; callcenter in particular needs its 8 kHz upload."
+      }
+    }
+  ]
+}

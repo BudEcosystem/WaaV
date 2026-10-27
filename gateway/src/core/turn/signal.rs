@@ -38,6 +38,12 @@ pub enum ControllerSignal {
     /// the controller; the expiry is fed back as a signal under the same
     /// serialized path as everything else — no strategy owns a task).
     Timer { generation: u64 },
+    /// The gateway's detector heard the caller (segmented sessions): speech confirmed, and again
+    /// at 384 ms of voiced time and every 128 ms after. Arrives before any transcript.
+    Speech { sustained_ms: u32 },
+    /// Every upload of the caller's turn resolved. `had_text: false` closes an open turn with no
+    /// input (a cough, or speech whose transcription was lost).
+    SpeechTurnClosed { had_text: bool },
 }
 
 impl ControllerSignal {
@@ -50,6 +56,8 @@ impl ControllerSignal {
             ControllerSignal::SttInterim { .. }
                 | ControllerSignal::SttFinal { .. }
                 | ControllerSignal::SmartTurn { .. }
+                | ControllerSignal::Speech { .. }
+                | ControllerSignal::SpeechTurnClosed { .. }
         )
     }
 }

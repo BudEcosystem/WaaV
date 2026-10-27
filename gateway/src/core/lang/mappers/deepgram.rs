@@ -20,6 +20,9 @@ use crate::core::lang::types::CanonicalLanguage;
 
 pub struct DeepgramLanguageMapper(DefaultLanguageMapper);
 
+/// The Deepgram models that take `language=multi`.
+const DEEPGRAM_MULTI_MODELS: &[&str] = &["nova-3", "nova-3-general", "nova-2", "nova-2-general"];
+
 impl DeepgramLanguageMapper {
     pub fn new() -> Self {
         Self(
@@ -84,6 +87,25 @@ impl LanguageMapper for DeepgramLanguageMapper {
     }
 
     fn map(&self, lang: CanonicalLanguage, model: &str) -> MappedLanguage {
+        // Deepgram detects the language (`multi`, code-switching) on Nova-3 and Nova-2 only;
+        // every other model refuses the handshake with a 400. There, auto is left out with a
+        // warning and the model's own default applies.
+        if lang == CanonicalLanguage::Auto
+            && !DEEPGRAM_MULTI_MODELS
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(model.trim()))
+        {
+            let model = model.trim();
+            let named = if model.is_empty() {
+                "the default model".to_string()
+            } else {
+                format!("model '{model}'")
+            };
+            return MappedLanguage::omitted().warn(format!(
+                "Deepgram {named} cannot detect the language (multi needs Nova-3 or Nova-2); \
+                 the model's default language applies"
+            ));
+        }
         let mut mapped = self.0.map(lang, model);
         if let Some(codes) = accepted(model)
             && !mapped.omit
@@ -142,7 +164,10 @@ mod tests {
             ("cmn-CN", "general", "zh-CN"),
             ("fr", "", "fr-FR"),
             ("fr", "a-model-nobody-listed", "fr-FR"),
-            ("auto", "enhanced-general", "multi"),
+            // Detection (`multi`) only where the model can (main's Nova-3/Nova-2 rule): elsewhere
+            // auto is left out, so the model's own default applies.
+            ("auto", "nova-3", "multi"),
+            ("auto", "enhanced-general", ""),
         ] {
             assert_eq!(dg(language, model), want, "{language} on {model}");
         }

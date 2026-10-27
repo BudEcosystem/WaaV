@@ -58,6 +58,24 @@ const LIVEKIT_POLL_INTERVAL_MS: u64 = 100;
 /// Lock timeout for LiveKit operations (in milliseconds)
 const LIVEKIT_LOCK_TIMEOUT_MS: u64 = 100;
 
+/// A setup step that fails after the session committed its stream id (from then on a second config
+/// is refused) leaves a session that can never become what it asked to be, still holding what it
+/// opened: provider streams, a LiveKit room. (A refused LLM credential or a DAG that cannot run
+/// used to leave a silent speech-to-text-only session.) Its cause has already gone to the client as an `error`; close with 1011
+/// so the client stops waiting for `ready` (it reconnects to retry) and the teardown releases what
+/// was opened. Before this, the socket stayed open and silent.
+async fn close_after_failed_setup(message_tx: &mpsc::Sender<MessageRoute>, reason: &str) -> bool {
+    send_critical(
+        message_tx,
+        MessageRoute::CloseWith {
+            code: 1011,
+            reason: reason.to_string(),
+        },
+    )
+    .await;
+    false
+}
+
 pub(super) async fn send_critical(message_tx: &mpsc::Sender<MessageRoute>, route: MessageRoute) {
     send_with_policy(message_tx, route, MessageClass::Critical).await;
 }
@@ -87,6 +105,90 @@ pub(super) async fn send_config_warning(
         }),
     )
     .await;
+}
+
+/// RCA 2e: whether the denoiser can take a session's uplink — mono 16-bit PCM, as the client
+/// sends it or as the gateway decodes it from opus.
+#[cfg(feature = "noise-filter")]
+fn uplink_is_mono_pcm16(
+    stt: &STTWebSocketConfig,
+    uplink: &crate::core::audio::CodecNegotiation,
+) -> bool {
+    stt.channels == 1
+        && (uplink.effective == crate::core::audio::AudioCodec::Opus
+            || crate::core::tts::sniff::is_linear_pcm16(&stt.encoding.to_ascii_lowercase()))
+}
+
+/// RCA 2e: the session's uplink denoiser, when `stt_config.noise_suppression` asks for one. A
+/// session the denoiser cannot serve (its audio format, or no stream free on the server) is told
+/// in a `config_warning` and goes on unfiltered: noise suppression never fails a session.
+#[cfg(feature = "noise-filter")]
+async fn open_uplink_denoiser(
+    stt: &STTWebSocketConfig,
+    uplink: &crate::core::audio::CodecNegotiation,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> Option<Arc<crate::utils::noise_filter::StreamDenoiser>> {
+    if stt.noise_suppression != Some(true) {
+        return None;
+    }
+    if !uplink_is_mono_pcm16(stt, uplink) {
+        crate::core::metrics::bridge::record_degraded("ws", "noise_filter_format");
+        send_config_warning(
+            message_tx,
+            "noise_suppression_unsupported",
+            format!(
+                "noise_suppression needs mono linear16 (or opus) audio; this session sends {} \
+                 with {} channel(s), and its audio is not filtered",
+                stt.encoding, stt.channels
+            ),
+            None,
+        )
+        .await;
+        return None;
+    }
+    match crate::utils::noise_filter::StreamDenoiser::open(stt.sample_rate).await {
+        Ok(denoiser) => {
+            info!(
+                sample_rate = stt.sample_rate,
+                "/ws uplink noise filter active"
+            );
+            Some(Arc::new(denoiser))
+        }
+        Err(e) => {
+            warn!("/ws uplink noise filter unavailable: {e}");
+            crate::core::metrics::bridge::record_degraded("ws", "noise_filter_unavailable");
+            send_config_warning(
+                message_tx,
+                "noise_suppression_unavailable",
+                format!(
+                    "noise_suppression could not start ({e}); the session's audio is not filtered"
+                ),
+                None,
+            )
+            .await;
+            None
+        }
+    }
+}
+
+/// RCA 2e: a build without the `noise-filter` feature says so to a session that asks for
+/// `noise_suppression`, rather than leaving it to think its audio was filtered.
+#[cfg(not(feature = "noise-filter"))]
+async fn warn_uplink_denoiser_not_built(
+    stt: &STTWebSocketConfig,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    if stt.noise_suppression == Some(true) {
+        crate::core::metrics::bridge::record_degraded("ws", "noise_filter_not_built");
+        send_config_warning(
+            message_tx,
+            "noise_suppression_unavailable",
+            "noise_suppression was asked for, but this gateway build does not include the \
+             noise-filter feature; the session's audio is not filtered",
+            None,
+        )
+        .await;
+    }
 }
 
 /// Resolve the stream identifier for the current session
@@ -190,6 +292,13 @@ pub async fn handle_config_message(
         }
     }
 
+    // What the client itself asked of speech-to-text, before any deployment's settings are laid
+    // over its config: `vad_events` and a named model.
+    let client_vad_events = stt_ws_config.as_ref().and_then(|s| s.features.vad_events);
+    let client_named_model = stt_ws_config
+        .as_ref()
+        .is_some_and(|s| !s.model.trim().is_empty() && app_state.bud_mode.is_none());
+
     // FRD-023 RT0 (X-1, X-2): in Bud mode a client never chooses where a platform-side call goes
     // or which credential it carries. Refused before anything is built, so nothing is dialled.
     if app_state.bud_mode.is_some()
@@ -197,6 +306,21 @@ pub async fn handle_config_message(
             bud_mode_config_refusal(conversation_ws_config.as_ref(), dag_ws_config.as_ref())
     {
         warn!(reason = %refusal, "Refusing a Bud-mode /ws config");
+        send_error(message_tx, refusal).await;
+        return true;
+    }
+    // Standalone: what the CLIENT itself wrote, checked here, before an alias is spliced in, so
+    // the operator's own choices (an alias's base_url and credential_ref) are never refused.
+    if app_state.bud_mode.is_none()
+        && let Some(refusal) = standalone_client_config_refusal(
+            conversation_ws_config.as_ref(),
+            dag_ws_config.as_ref(),
+            stt_ws_config.as_ref(),
+            tts_ws_config.as_ref(),
+            crate::core::client_destination::client_endpoints_denied(),
+        )
+    {
+        warn!(reason = %refusal, "Refusing a standalone /ws config");
         send_error(message_tx, refusal).await;
         return true;
     }
@@ -250,10 +374,13 @@ pub async fn handle_config_message(
     // whatever provider the alias resolved to).
     // The `interaction` block of the session's alias, when the definition has one.
     let mut alias_interaction = None;
+    let mut alias_legs = crate::core::alias::AliasLegs::default();
     let resolved_alias = if let Some(alias_name) = alias.as_deref() {
         match crate::core::alias::global_aliases().resolve(alias_name) {
             Some(def) => {
                 alias_interaction = def.interaction.clone();
+                // The legs' own servers stay server-side (never in the client-writable configs).
+                alias_legs = crate::core::alias::AliasLegs::of(&def);
                 let echo = crate::core::alias::splice_alias(
                     alias_name,
                     &def,
@@ -296,6 +423,9 @@ pub async fn handle_config_message(
 
     // Determine if audio processing is enabled (default to true)
     let audio_enabled = audio.unwrap_or(true);
+    // What speech-to-text the session got (`ready.stt`), when the rollout switch covers it.
+    #[allow(unused_mut)]
+    let mut ready_stt: Option<serde_json::Value> = None;
 
     info!(
         "Configuring connection with audio_enabled: {}, LiveKit: {}",
@@ -369,6 +499,71 @@ pub async fn handle_config_message(
             .await;
         }
     }
+
+    // A standalone leg with no key of the client's own carries the OPERATOR's vendor credential,
+    // and providers read their destination from the client's `extras` (`endpoint_override` and
+    // friends). Refused here, before segmented setup or any provider reads them, unless the
+    // operator approved the host (`core::client_destination`). Under Bud mode the legs use the
+    // deployment's extras and never a process key.
+    if app_state.bud_mode.is_none()
+        && let Some(refusal) =
+            client_destination_refusal(stt_ws_config.as_ref(), tts_ws_config.as_ref())
+    {
+        warn!(reason = %refusal, "Refusing a client destination for an operator credential");
+        send_error(message_tx, refusal).await;
+        return true;
+    }
+
+    // Segmented speech-to-text: how this session's model is reached on a live call, decided once
+    // and before anything is built. A refused session holds nothing (its leg admissions are
+    // released as `bud_legs` drops) and may send a corrected `config` on the same socket.
+    let live_setup = match stt_ws_config.as_ref().filter(|_| audio_enabled) {
+        Some(stt) => {
+            let shared = &app_state.core_state.stt_live;
+            let agent_manual = state.read().await.agent_manual;
+            let kind = super::segmented_session::session_kind(
+                resolved_agent.as_ref(),
+                agent_manual,
+                conversation_ws_config.is_some(),
+                dag_ws_config.is_some(),
+                stt,
+            );
+            let leg = bud_legs.as_ref().and_then(|l| l.stt_leg.clone());
+            let trusted_base = alias_legs
+                .stt
+                .as_ref()
+                .filter(|e| e.applies_to(&stt.provider))
+                .map(|e| e.base_url.clone());
+            let setup = super::segmented_session::resolve(
+                shared,
+                stt,
+                kind,
+                leg,
+                resolved_agent.as_ref(),
+                client_vad_events,
+                client_named_model,
+                trusted_base,
+            );
+            if let Some(refusal) = super::segmented_session::refusal_message(
+                &setup,
+                shared,
+                resolved_agent.as_ref().map(|a| a.prompt_name.as_str()),
+            ) {
+                warn!(
+                    provider = %setup.live.resolution.provider,
+                    row = %setup.live.resolution.row_id,
+                    "Refusing a live session the capability map cannot serve"
+                );
+                send_critical(message_tx, MessageRoute::Outgoing(refusal)).await;
+                return true;
+            }
+            for warning in super::stt_contract::config_warnings(&setup.live) {
+                send_critical(message_tx, MessageRoute::Outgoing(warning)).await;
+            }
+            Some(setup)
+        }
+        None => None,
+    };
 
     if bud_legs.is_none()
         && let Some(tts) = tts_ws_config.as_mut()
@@ -475,10 +670,24 @@ pub async fn handle_config_message(
             message_tx,
             bud_legs.as_ref(),
             may_interact,
+            live_setup.as_ref(),
+            &alias_legs,
         )
         .await
         {
             Some(vm) => {
+                // A segmented session: its engine's events reach the client and metering bills
+                // uploaded seconds.
+                if let Some(setup) = live_setup.as_ref().filter(|_| vm.is_gateway_endpointed()) {
+                    let tracker = state.read().await.task_tracker.clone();
+                    super::segmented_session::wire(
+                        &vm,
+                        setup,
+                        message_tx,
+                        bud_legs.as_ref().map(|l| Arc::clone(&l.meter)),
+                        &tracker,
+                    );
+                }
                 // FRD-023 RT6: the session now holds its legs' admissions; meter each leg (STT
                 // per final transcript, TTS per synthesis) and revalidate the caller.
                 if let Some(legs) = bud_legs.take() {
@@ -508,9 +717,20 @@ pub async fn handle_config_message(
                     }
                 };
 
+                // RCA 2e: the uplink's denoiser, opened before the state lock is taken (its
+                // model loads on a thread of its own).
+                #[cfg(feature = "noise-filter")]
+                let denoiser = open_uplink_denoiser(stt_config, &uplink_codec, message_tx).await;
+                #[cfg(not(feature = "noise-filter"))]
+                warn_uplink_denoiser_not_built(stt_config, message_tx).await;
+
                 // Store in connection state
                 let mut state_guard = state.write().await;
                 state_guard.voice_manager = Some(vm.clone());
+                #[cfg(feature = "noise-filter")]
+                {
+                    state_guard.denoiser = denoiser;
+                }
 
                 // D8: build the uplink opus decoder for an opus-negotiated session and stash it on
                 // the connection state, so the audio hot path decodes each WS binary frame to PCM16
@@ -552,7 +772,7 @@ pub async fn handle_config_message(
                 }
                 Some(vm)
             }
-            None => return true,
+            None => return close_after_failed_setup(message_tx, "voice_setup_failed").await,
         }
     } else {
         info!("Audio processing disabled - skipping voice manager initialization");
@@ -610,7 +830,8 @@ pub async fn handle_config_message(
                     let compiled =
                         compile_session_dag(dag, &stream_id, state, message_tx, app_state).await;
                     let auth_id = state.read().await.auth.id.clone();
-                    let graph = dag_background(&compiled, dag, &stream_id, auth_id);
+                    let executor = session_dag_executor(app_state);
+                    let graph = dag_background(&compiled, dag, &stream_id, auth_id, executor);
                     compiled_dag = Some(compiled);
                     Some(graph)
                 }
@@ -740,7 +961,7 @@ pub async fn handle_config_message(
                     state_guard.recording_egress_id = egress_id;
                     (Some(client), Some(room_name), Some(identity), Some(name))
                 }
-                None => return true,
+                None => return close_after_failed_setup(message_tx, "livekit_setup_failed").await,
             }
         } else {
             (None, None, None, None)
@@ -822,7 +1043,10 @@ pub async fn handle_config_message(
             Err(e) => {
                 error!("DAG routing initialization failed: {}", e);
                 send_error(message_tx, format!("DAG initialization failed: {}", e)).await;
-                false
+                // The session asked for a DAG it cannot run (a refused credential, a graph that does
+                // not compile); carrying on without it would look like a working agent that never
+                // answers.
+                return close_after_failed_setup(message_tx, "dag_setup_failed").await;
             }
         }
     } else {
@@ -917,10 +1141,14 @@ pub async fn handle_config_message(
     } else if let (Some(conv_config), Some(vm)) =
         (conversation_ws_config.as_ref(), voice_manager.as_ref())
     {
-        let (credential, attribution) = {
+        let (credential, attribution, tracker) = {
             let guard = state.read().await;
             let attribution = turn_attribution(&guard, &conv_config.model);
-            (guard.credential.clone(), attribution)
+            (
+                guard.credential.clone(),
+                attribution,
+                guard.task_tracker.clone(),
+            )
         };
         match initialize_conversation_loop(
             conv_config,
@@ -930,15 +1158,16 @@ pub async fn handle_config_message(
             app_state,
             credential,
             attribution,
+            &tracker,
         )
         .await
         {
-            Ok(true) => {
+            Ok(orchestrator) => {
                 info!("Conversation loop initialized for stream {}", stream_id);
+                state.write().await.conversation = Some(orchestrator);
                 emit_reasoning_config_warnings(conv_config, message_tx).await;
                 true
             }
-            Ok(false) => false,
             Err(e) => {
                 error!("Conversation loop initialization failed: {}", e);
                 send_error(
@@ -946,7 +1175,8 @@ pub async fn handle_config_message(
                     format!("Conversation loop initialization failed: {}", e),
                 )
                 .await;
-                false
+                // As for a DAG: no silent speech-to-text-only session in place of the agent asked for.
+                return close_after_failed_setup(message_tx, "conversation_setup_failed").await;
             }
         }
     } else {
@@ -955,6 +1185,15 @@ pub async fn handle_config_message(
         }
         false
     };
+
+    if let Some(setup) = live_setup.as_ref() {
+        ready_stt = super::segmented_session::ready_stt(
+            setup,
+            &app_state.core_state.stt_live,
+            voice_manager.as_ref(),
+        )
+        .await;
+    }
 
     // Send ready message with optional LiveKit room information
     // (D8 audio_in_codec/audio_out_codec were negotiated early, before the audio pipeline.)
@@ -967,6 +1206,7 @@ pub async fn handle_config_message(
                 crate::handlers::ws::messages::PROTOCOL_VERSION
             }
             .to_string(),
+            stt: ready_stt.clone().map(Box::new),
             stream_id: stream_id.clone(),
             livekit_room_name: livekit_room_name.clone(),
             livekit_url: Some(app_state.config.livekit_public_url.clone()),
@@ -975,7 +1215,7 @@ pub async fn handle_config_message(
             resolved_alias: resolved_alias.map(Box::new),
             audio_in_codec,
             audio_out_codec,
-            interaction: interaction.as_ref().map(|handle| handle.echo()),
+            interaction: interaction.as_ref().map(|handle| Box::new(handle.echo())),
         }),
     )
     .await;
@@ -1066,6 +1306,108 @@ pub(crate) fn agent_config_refusal(
     })
 }
 
+/// The first client-chosen destination in a standalone session's STT or TTS `extras` that would
+/// receive the operator's vendor credential without the operator's approval, as the refusal to
+/// send. A leg carrying the client's own `api_key` may point anywhere (SSRF rules still apply).
+pub(crate) fn client_destination_refusal(
+    stt: Option<&STTWebSocketConfig>,
+    tts: Option<&TTSWebSocketConfig>,
+) -> Option<String> {
+    use crate::core::client_destination::{client_supplies_credential, refusal};
+    let stt = stt
+        .filter(|c| !client_supplies_credential(c.api_key.as_deref(), &c.extras.0))
+        .and_then(|c| refusal("stt_config", &c.provider, &c.extras.0));
+    stt.or_else(|| {
+        tts.filter(|c| !client_supplies_credential(c.api_key.as_deref(), &c.extras.0))
+            .and_then(|c| refusal("tts_config", &c.provider, &c.extras.0))
+    })
+}
+
+/// What a standalone `/ws` config, as the client wrote it, may not carry, or `None`.
+///
+/// * A credential the operator kept for its own config (`clients: false`), named by
+///   `credential_ref` or `api_key: "${NAME}"` on either LLM tier — always.
+/// * With `WAAV_CLIENT_ENDPOINTS=deny` (`endpoints_denied`): every endpoint a client chooses —
+///   `conversation_config.base_url` / `reasoning_base_url`, any operator credential it names, an
+///   inline `dag_config.definition`, and STT/TTS `extras` destinations. Clients then name aliases
+///   and server templates only, as under Bud mode.
+pub(crate) fn standalone_client_config_refusal(
+    conversation: Option<&ConversationWebSocketConfig>,
+    dag: Option<&DAGWebSocketConfig>,
+    stt: Option<&STTWebSocketConfig>,
+    tts: Option<&TTSWebSocketConfig>,
+    endpoints_denied: bool,
+) -> Option<String> {
+    let registry = crate::core::credentials::global_credentials();
+    if let Some(conv) = conversation {
+        for (field, api_key, credential_ref) in [
+            (
+                "conversation_config",
+                conv.api_key.as_deref(),
+                conv.credential_ref.as_deref(),
+            ),
+            (
+                "conversation_config (reasoning tier)",
+                conv.reasoning_api_key.as_deref(),
+                conv.reasoning_credential_ref.as_deref(),
+            ),
+        ] {
+            if let Err(e) = registry.refuse_operator_only(api_key, credential_ref) {
+                return Some(format!("{field}: {e}"));
+            }
+        }
+    }
+    if !endpoints_denied {
+        return None;
+    }
+    if let Some(conv) = conversation {
+        let mut fields: Vec<&str> = Vec::new();
+        if !conv.base_url.trim().is_empty() {
+            fields.push("base_url");
+        }
+        if conv.reasoning_base_url.is_some() {
+            fields.push("reasoning_base_url");
+        }
+        if conv.credential_ref.is_some()
+            || conv
+                .api_key
+                .as_deref()
+                .and_then(crate::core::credentials::env_reference)
+                .is_some()
+        {
+            fields.push("credential_ref");
+        }
+        if conv.reasoning_credential_ref.is_some()
+            || conv
+                .reasoning_api_key
+                .as_deref()
+                .and_then(crate::core::credentials::env_reference)
+                .is_some()
+        {
+            fields.push("reasoning_credential_ref");
+        }
+        if !fields.is_empty() {
+            return Some(format!(
+                "conversation_config.{} is not accepted by this gateway: it does not let clients \
+                 choose endpoints or name its credentials ({}=deny). Use an alias, which carries \
+                 the operator's LLM endpoint and credential",
+                fields.join(", conversation_config."),
+                crate::core::client_destination::CLIENT_ENDPOINTS_ENV,
+            ));
+        }
+    }
+    if dag.is_some_and(|d| d.definition.is_some()) {
+        return Some(format!(
+            "dag_config.definition is not accepted by this gateway ({}=deny): use a server \
+             template (dag_config.template)",
+            crate::core::client_destination::CLIENT_ENDPOINTS_ENV,
+        ));
+    }
+    use crate::core::client_destination::any_destination;
+    stt.and_then(|c| any_destination("stt_config", &c.provider, &c.extras.0))
+        .or_else(|| tts.and_then(|c| any_destination("tts_config", &c.provider, &c.extras.0)))
+}
+
 /// What a Bud-mode `/ws` config may not carry (FRD-023 RT0, FR-WS-2, FR-WS-3), or `None`.
 ///
 /// * `conversation_config.base_url` / `api_key` / `reasoning_base_url` / `reasoning_api_key` — the
@@ -1095,6 +1437,13 @@ pub(crate) fn bud_mode_config_refusal(
         }
         if conv.reasoning_api_key.is_some() {
             fields.push("reasoning_api_key");
+        }
+        // Standalone operator credentials are not a Bud-mode concept either.
+        if conv.credential_ref.is_some() {
+            fields.push("credential_ref");
+        }
+        if conv.reasoning_credential_ref.is_some() {
+            fields.push("reasoning_credential_ref");
         }
         if !fields.is_empty() {
             return Some(format!(
@@ -1429,16 +1778,15 @@ async fn apply_lifecycle(
     bud_legs: Option<&super::bud_legs::PreparedLegs>,
     message_tx: &mpsc::Sender<MessageRoute>,
 ) -> bool {
-    use crate::core::interaction::config::provider_fix;
     use crate::core::interaction::lifecycle::{self, Leg};
-    use crate::core::stt::openai::{OpenAISTTConfig, OpenAISTTModel};
+    use crate::core::stt::openai::OpenAISTTModel;
     use crate::core::tts::openai::OpenAITTSModel;
     let openai = |provider: &str| provider.trim().eq_ignore_ascii_case("openai");
     let openai_base = std::env::var("OPENAI_BASE_URL").ok();
     // The id each provider sends: OpenAI's defaults and aliases applied, anything else as is.
     let stt_model = match stt.model.trim() {
         model if !openai(&stt.provider) => model.to_owned(),
-        "" => OpenAISTTConfig::default_model_id(provider_fix("openai_stt_default")).to_owned(),
+        "" => crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL.to_owned(),
         model => OpenAISTTModel::parse_known(model).map_or(model.to_owned(), |m| m.as_str().into()),
     };
     let tts_model = match tts.model.trim() {
@@ -1739,7 +2087,8 @@ async fn initialize_conversation_loop(
     app_state: &Arc<AppState>,
     credential: Option<crate::auth::SessionCredential>,
     attribution: Option<crate::core::conversation::TurnAttribution>,
-) -> Result<bool, String> {
+    tracker: &crate::core::observability::SessionTaskTracker,
+) -> Result<Arc<ConversationOrchestrator>, String> {
     let mut config = conv_config.to_conversation_config();
     if app_state.bud_mode.is_some() {
         bud_llm_leg(&mut config, credential)?;
@@ -1748,8 +2097,28 @@ async fn initialize_conversation_loop(
     let orchestrator =
         ConversationOrchestrator::new(stream_id.to_string(), config, voice_manager.clone())
             .map_err(|e| e.to_string())?;
+    if let Some(advisory) = orchestrator.key_advisory() {
+        send_config_warning(
+            message_tx,
+            "llm_key_not_sent",
+            advisory.message(),
+            Some(serde_json::json!({
+                "credential": advisory.credential,
+                "host": advisory.host,
+            })),
+        )
+        .await;
+    }
 
     let orchestrator = Arc::new(orchestrator);
+
+    // Each turn's lifecycle and spoken words, as the voice-agent path sends them:
+    // `agent_response_started`, `assistant_transcript`, `agent_truncated`, `agent_response_done`.
+    {
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+        orchestrator.set_turn_signals(signal_tx);
+        super::agent::spawn_signal_forwarder(signal_rx, message_tx.clone(), tracker);
+    }
 
     // S3 (REALTIME_REASONING.md §5): wire the async-tool final sink so an async
     // tool's result is recorded to history and (turn-id-gated) volunteered.
@@ -1762,11 +2131,20 @@ async fn initialize_conversation_loop(
     // strategy: the MinWords barge-in gate (A-G3) when configured, else the
     // legacy any-speech behavior. The bot-speaking truth comes from the
     // VoiceManager's live playout estimate (probe), not a stale flag.
-    let start_strategy: Box<dyn crate::core::turn::UserTurnStartStrategy> =
+    // A segmented session interrupts on the gateway's detector: its transcript arrives only after
+    // the caller's first pause plus an upload, which would let the bot talk over a whole sentence.
+    let segmented = voice_manager.is_gateway_endpointed();
+    let start_strategy: Box<dyn crate::core::turn::UserTurnStartStrategy> = if segmented {
+        Box::new(crate::core::turn::strategies::DetectorSpeechStart::new(
+            500,
+            conv_config.barge_in_min_words.unwrap_or(1),
+        ))
+    } else {
         match conv_config.barge_in_min_words {
             Some(n) if n >= 1 => Box::new(crate::core::turn::strategies::MinWordsStart::new(n)),
             _ => Box::new(crate::core::turn::strategies::AnySpeechStart),
-        };
+        }
+    };
     // D-G3: a FATAL turn error (auth/config — every turn would fail
     // identically) surfaces to the client as a Critical error message.
     {
@@ -1872,6 +2250,38 @@ async fn initialize_conversation_loop(
         }
     }
 
+    if segmented && let Some(dispatch) = voice_manager.segmented() {
+        use crate::core::stt::speech_activity::SpeechActivity;
+        let (tx, mut rx) = mpsc::unbounded_channel::<SpeechActivity>();
+        dispatch.add_speech_listener(Arc::new(move |a| {
+            let _ = tx.send(a);
+        }));
+        let orch = orchestrator.clone();
+        let ctrl = turn_controller.clone();
+        crate::core::observability::spawn_observed_detached(
+            "conversation.segmented-speech",
+            async move {
+                while let Some(a) = rx.recv().await {
+                    let signal = match a {
+                        SpeechActivity::Started { sustained_ms, .. } => {
+                            crate::core::turn::ControllerSignal::Speech { sustained_ms }
+                        }
+                        SpeechActivity::TurnClosed {
+                            had_text: false, ..
+                        } => crate::core::turn::ControllerSignal::SpeechTurnClosed {
+                            had_text: false,
+                        },
+                        _ => continue,
+                    };
+                    let events = ctrl.feed(&signal);
+                    if !events.is_empty() {
+                        orch.handle_turn_events(&events).await;
+                    }
+                }
+            },
+        );
+    }
+
     // Store on the connection so teardown can cancel any in-flight turn.
     // (Reuses the STT-callback slot in the VoiceManager; the orchestrator both
     // forwards the transcript and runs the loop, so there is no double delivery.)
@@ -1934,7 +2344,7 @@ async fn initialize_conversation_loop(
         return Err(format!("failed to register conversation STT callback: {e}"));
     }
 
-    Ok(true)
+    Ok(orchestrator)
 }
 
 /// Validate audio configurations are present
@@ -2087,6 +2497,84 @@ fn validate_audio_config_values(
     Ok(())
 }
 
+/// An alias leg's key ([`crate::core::alias::alias_leg_key`]), telling the client when the
+/// operator's key was withheld from the leg's server, or refusing the session when the alias's
+/// credential cannot be used there.
+async fn alias_leg_key_or_refuse(
+    endpoint: &crate::core::alias::AliasLegEndpoint,
+    client_key: Option<&str>,
+    role: &str,
+    config: &ServerConfig,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> Option<String> {
+    match crate::core::alias::alias_leg_key(endpoint, client_key, || {
+        config.get_api_key(&endpoint.provider).ok()
+    }) {
+        Ok(leg) => {
+            if leg.withheld {
+                let host = url::Url::parse(&endpoint.base_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_else(|| endpoint.base_url.clone());
+                send_config_warning(
+                    message_tx,
+                    format!("{role}_key_not_sent"),
+                    format!(
+                        "the gateway holds a {} key but it may not be sent to {host}; the {role} \
+                         leg runs without one. Name a credential for this host in the alias \
+                         ({role}.credential_ref)",
+                        endpoint.provider
+                    ),
+                    Some(serde_json::json!({ "provider": endpoint.provider, "host": host })),
+                )
+                .await;
+            }
+            Some(leg.key)
+        }
+        Err(message) => {
+            warn!(role, error = %message, "Refusing an alias leg's credential");
+            send_error(message_tx, message).await;
+            None
+        }
+    }
+}
+
+/// Point the legs at a server alias's own servers ([`crate::core::alias::AliasLegEndpoint`]):
+/// an OpenAI-compatible TTS server through the self-hosted provider (OpenAI's `/audio/speech`,
+/// at the base's `/v1`), any other leg through its provider's endpoint override.
+fn apply_alias_leg_endpoints(
+    legs: &crate::core::alias::AliasLegs,
+    stt: &mut crate::core::stt::standard::StandardSTTConfig,
+    tts: &mut crate::core::tts::standard::StandardTTSConfig,
+) {
+    use crate::core::stt::standard::ENDPOINT_OVERRIDE_KEY;
+    if let Some(endpoint) = legs
+        .stt
+        .as_ref()
+        .filter(|e| e.applies_to(&stt.base.provider))
+    {
+        stt.extras.0.insert(
+            ENDPOINT_OVERRIDE_KEY.to_string(),
+            serde_json::Value::String(endpoint.base_url.clone()),
+        );
+    }
+    if let Some(endpoint) = legs
+        .tts
+        .as_ref()
+        .filter(|e| e.applies_to(&tts.base.provider))
+    {
+        if endpoint.provider.trim().eq_ignore_ascii_case("openai") {
+            tts.base.provider = "self_hosted".to_string();
+            tts.base.api_base = Some(endpoint.openai_api_base());
+        } else {
+            tts.extras.0.insert(
+                ENDPOINT_OVERRIDE_KEY.to_string(),
+                serde_json::Value::String(endpoint.base_url.clone()),
+            );
+        }
+    }
+}
+
 /// Initialize voice manager with STT and TTS providers
 async fn initialize_voice_manager(
     stt_ws_config: &STTWebSocketConfig,
@@ -2095,6 +2583,8 @@ async fn initialize_voice_manager(
     message_tx: &mpsc::Sender<MessageRoute>,
     bud_legs: Option<&super::bud_legs::PreparedLegs>,
     defer_turn_models: bool,
+    live_setup: Option<&super::segmented_session::LiveSetup>,
+    alias_legs: &crate::core::alias::AliasLegs,
 ) -> Option<Arc<VoiceManager>> {
     info!(
         "Initializing voice manager with STT provider: {} and TTS provider: {}",
@@ -2112,24 +2602,60 @@ async fn initialize_voice_manager(
     let (stt_api_key, tts_api_key) = match bud_legs {
         Some(legs) => (legs.stt_key.clone(), legs.tts_key.clone()),
         None => {
-            let stt_api_key = resolve_provider_api_key(
-                stt_ws_config.api_key.as_deref(),
-                &stt_ws_config.provider,
-                "stt",
-                allow_client_keys,
-                &app_state.config,
-                message_tx,
-            )
-            .await?;
-            let tts_api_key = resolve_provider_api_key(
-                tts_ws_config.api_key.as_deref(),
-                &tts_ws_config.provider,
-                "tts",
-                allow_client_keys,
-                &app_state.config,
-                message_tx,
-            )
-            .await?;
+            let stt_api_key = match alias_legs
+                .stt
+                .as_ref()
+                .filter(|e| e.applies_to(&stt_ws_config.provider))
+            {
+                Some(endpoint) => {
+                    alias_leg_key_or_refuse(
+                        endpoint,
+                        stt_ws_config.api_key.as_deref(),
+                        "stt",
+                        &app_state.config,
+                        message_tx,
+                    )
+                    .await?
+                }
+                None => {
+                    resolve_provider_api_key(
+                        stt_ws_config.api_key.as_deref(),
+                        &stt_ws_config.provider,
+                        "stt",
+                        allow_client_keys,
+                        &app_state.config,
+                        message_tx,
+                    )
+                    .await?
+                }
+            };
+            let tts_api_key = match alias_legs
+                .tts
+                .as_ref()
+                .filter(|e| e.applies_to(&tts_ws_config.provider))
+            {
+                Some(endpoint) => {
+                    alias_leg_key_or_refuse(
+                        endpoint,
+                        tts_ws_config.api_key.as_deref(),
+                        "tts",
+                        &app_state.config,
+                        message_tx,
+                    )
+                    .await?
+                }
+                None => {
+                    resolve_provider_api_key(
+                        tts_ws_config.api_key.as_deref(),
+                        &tts_ws_config.provider,
+                        "tts",
+                        allow_client_keys,
+                        &app_state.config,
+                        message_tx,
+                    )
+                    .await?
+                }
+            };
             (stt_api_key, tts_api_key)
         }
     };
@@ -2210,11 +2736,16 @@ async fn initialize_voice_manager(
     // `create_stt_standard`/`create_tts_standard` → `from_standard` instead of dropping features
     // on the flat factory path. The flat `stt_config`/`tts_config` are still derived (== the
     // standardized bases) for cache hashing and other flat consumers below.
-    let standard_stt = stt_ws_config.to_standard_stt(stt_api_key);
+    let segmented_key = stt_api_key.clone();
+    let mut standard_stt = stt_ws_config.to_standard_stt(stt_api_key);
     let mut standard_tts = tts_ws_config.to_standard_tts(tts_api_key);
     if let Some(legs) = bud_legs {
         // The deployment's address, published by budapp — never the client's (§5.9).
         standard_tts.base.api_base = legs.tts_api_base.clone();
+    } else {
+        // A server alias's own servers, set here — after the client's extras were judged —
+        // and only for a leg that kept the alias's provider.
+        apply_alias_leg_endpoints(alias_legs, &mut standard_stt, &mut standard_tts);
     }
 
     // P2 language standardization: the client's canonical `language` was just mapped to each
@@ -2291,6 +2822,95 @@ async fn initialize_voice_manager(
                  silero-vad features — session degrades to timer fallback"
             );
             crate::core::metrics::bridge::record_degraded("turn_detection", "feature_not_built");
+        }
+    }
+
+    // Segmented speech-to-text: the engine owns its own detector, so the continuous smart-turn
+    // pipeline is not built for the session.
+    if let Some(setup) = live_setup
+        .filter(|s| s.live.decision == crate::core::stt::segmented::live::LiveDecision::Segmented)
+    {
+        // The setup probe (Release 2): a guessed row or a self-hosted server answers one silent
+        // clip before the caller speaks, so a mistyped model is refused here, not at the first turn.
+        let shared = &app_state.core_state.stt_live;
+        let admission = crate::core::stt::segmented::live::admission(
+            shared,
+            &setup.live,
+            &setup.req,
+            &segmented_key,
+        );
+        match super::stt_contract::admission_outcome(
+            &admission,
+            &setup.live.resolution.provider,
+            shared.rollout.release,
+        ) {
+            super::stt_contract::ProbeOutcome::Refuse(m) => {
+                warn!(
+                    ?admission,
+                    "segmented speech-to-text: the key is overloaded; session refused"
+                );
+                send_critical(message_tx, MessageRoute::Outgoing(m)).await;
+                return None;
+            }
+            super::stt_contract::ProbeOutcome::Warn(m) => {
+                send_critical(message_tx, MessageRoute::Outgoing(m)).await;
+            }
+            super::stt_contract::ProbeOutcome::Proceed => {}
+        }
+        if shared.setup_probe && setup.live.needs_probe() {
+            let verdict = crate::core::stt::segmented::live::probe_session(
+                shared,
+                &setup.live,
+                &setup.req,
+                segmented_key.clone(),
+            )
+            .await;
+            match super::stt_contract::probe_outcome(
+                &verdict,
+                &setup.live.resolution.provider,
+                &setup.live.resolution.model_sent,
+            ) {
+                super::stt_contract::ProbeOutcome::Refuse(m) => {
+                    warn!(
+                        ?verdict,
+                        "segmented speech-to-text: the setup probe refused the session"
+                    );
+                    send_critical(message_tx, MessageRoute::Outgoing(m)).await;
+                    return None;
+                }
+                super::stt_contract::ProbeOutcome::Warn(m) => {
+                    send_critical(message_tx, MessageRoute::Outgoing(m)).await;
+                }
+                super::stt_contract::ProbeOutcome::Proceed => {}
+            }
+        }
+        match crate::core::stt::segmented::live::build_plan(
+            &app_state.core_state.stt_live,
+            &setup.live,
+            &setup.req,
+            segmented_key,
+        ) {
+            Ok(plan) => {
+                #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+                {
+                    voice_config.smart_turn_config = None;
+                }
+                voice_config = voice_config.with_segmented(plan);
+            }
+            Err(e) => {
+                error!(error = %e, "segmented speech-to-text could not be planned");
+                send_critical(
+                    message_tx,
+                    MessageRoute::Outgoing(OutgoingMessage::CodedError {
+                        message: format!("stt_segmentation_unavailable: {e}"),
+                        code: "stt_segmentation_unavailable".into(),
+                        recoverable: true,
+                        details: Some(serde_json::json!({ "reason": "plan_failed" })),
+                    }),
+                )
+                .await;
+                return None;
+            }
         }
     }
 
@@ -2425,9 +3045,11 @@ async fn register_stt_error_callback(
         .on_stt_error(move |error| {
             let message_tx = message_tx_clone.clone();
             Box::pin(async move {
-                let msg = OutgoingMessage::Error {
-                    message: format!("STT streaming error: {error}"),
-                };
+                let msg = super::stt_contract::stt_unavailable(&error.to_string()).unwrap_or(
+                    OutgoingMessage::Error {
+                        message: format!("STT streaming error: {error}"),
+                    },
+                );
                 send_with_policy(
                     &message_tx,
                     MessageRoute::Outgoing(msg),
@@ -3579,14 +4201,13 @@ async fn initialize_dag_routing(
             conn_state.auth.id.clone(),
         )
     };
-    let dag_context = if let Some(timeout_ms) = dag_config.timeout_ms {
-        dag_context.with_timeout(std::time::Duration::from_millis(timeout_ms))
-    } else {
-        dag_context
-    };
+    // `timeout_ms` bounds each TURN: its deadline is set when the turn starts (the
+    // StreamDriver), never here — a deadline fixed at configuration time expired
+    // `timeout_ms` after the session began and failed every later turn before it ran.
+    let turn_timeout = dag_config.timeout_ms.map(Duration::from_millis);
 
     // Create executor (decoupled from the DAG; uses the DAG at execute time).
-    let executor = Arc::new(DAGExecutor::new());
+    let executor = Arc::new(session_dag_executor(app_state));
 
     // ── Output sink + drain task (W-O1) ─────────────────────────────────────────
     // Output nodes push `DagOutput`s here; the drain task maps them to LiveKit / WS.
@@ -3654,6 +4275,21 @@ async fn initialize_dag_routing(
                             None, // DAG sessions: chunking knob rides the conversation path only (carrier gap noted)
                         )
                         .await;
+                        // The utterance's last audio: tell the client, as a plain session's
+                        // TTS completion does.
+                        if audio.is_final {
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            send_critical(
+                                &message_tx,
+                                MessageRoute::Outgoing(OutgoingMessage::TTSPlaybackComplete {
+                                    timestamp,
+                                }),
+                            )
+                            .await;
+                        }
                     }
                     DagOutput::Text(text) => {
                         // Deliver DAG text output (e.g. an LLM response routed to a
@@ -3706,6 +4342,7 @@ async fn initialize_dag_routing(
             executor,
             dag_context,
             post_stt_node_id,
+            turn_timeout,
             message_tx,
             profiler,
         )
@@ -3716,6 +4353,28 @@ async fn initialize_dag_routing(
 
     info!(stream_id = %stream_id, "DAG routing enabled");
     Ok(true)
+}
+
+/// A session DAG's executor. A node without its own `timeout_ms` gets the operator's
+/// `dag_timeouts.node_execution_secs`, and a node of a kind the operator gave its own value
+/// (`llm_endpoint_secs` …) gets that.
+#[cfg(feature = "dag-routing")]
+fn session_dag_executor(app_state: &AppState) -> DAGExecutor {
+    let timeouts = &app_state.config.dag_timeouts;
+    let node_secs = timeouts.node_execution_secs.max(1);
+    let kind_timeouts = [
+        "stt_provider",
+        "tts_provider",
+        "realtime_provider",
+        "llm_endpoint",
+        "websocket_endpoint",
+    ]
+    .into_iter()
+    .map(|kind| (kind, Duration::from_secs(timeouts.for_kind(kind))))
+    .collect();
+    DAGExecutor::new()
+        .with_timeout(Duration::from_secs(node_secs))
+        .with_kind_timeouts(kind_timeouts)
 }
 
 /// What interaction mode asks of a session's DAG before it takes it for its background.
@@ -3746,7 +4405,20 @@ async fn compile_session_dag(
     // Get DAG definition from template or inline
     let mut dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
         // Parse inline definition
-        serde_json::from_value(def.clone()).map_err(|e| format!("Invalid DAG definition: {}", e))?
+        let parsed: DAGDefinition = serde_json::from_value(def.clone())
+            .map_err(|e| format!("Invalid DAG definition: {}", e))?;
+        // The config carries the definition as raw JSON, so the config-wide lint cannot see inside
+        // it: a misspelled node key (`voice_ID`) was silently ignored. Lint it now it is parsed.
+        if let Ok(accepted) = serde_json::to_value(&parsed) {
+            super::config_lint::warn_unknown_keys_under(
+                "dag_config.definition",
+                def,
+                &accepted,
+                message_tx,
+            )
+            .await;
+        }
+        parsed
     } else if let Some(ref template_name) = dag_config.template {
         // Load from template registry
         let templates = global_templates();
@@ -3764,6 +4436,17 @@ async fn compile_session_dag(
         bind_bud_dag(app_state, state, message_tx, &mut dag_definition, stream_id).await?;
     }
 
+    // A graph that ends in a `tts_provider` (`stt → llm → tts`) is meant to be heard: its
+    // speech is routed to the session as if it had named an `audio_output`.
+    let routed = dag_definition.route_unread_speech();
+    if !routed.is_empty() {
+        info!(
+            dag_id = %dag_definition.id,
+            added = ?routed,
+            "Routed unread DAG speech to the session"
+        );
+    }
+
     info!(
         dag_id = %dag_definition.id,
         dag_name = %dag_definition.name,
@@ -3778,8 +4461,23 @@ async fn compile_session_dag(
         endpoints: dag_definition.has_endpoints(),
     };
 
-    // Compile the DAG
-    let compiler = DAGCompiler::new();
+    // Compile the DAG. An inline definition is CLIENT input (no environment reads; credential
+    // references must name an operator credential bound to the node's host); a template is the
+    // operator's.
+    let compiler = if dag_config.definition.is_some() {
+        DAGCompiler::new()
+    } else {
+        DAGCompiler::for_operator_template()
+    };
+    // Standalone: a provider node without a key of its own uses the gateway's, as a `/ws` leg
+    // does. Under Bud mode a node's credential comes from its deployment, never the process.
+    let compiler = if app_state.bud_mode.is_none() {
+        compiler.with_server_keys(crate::dag::compiler::ServerKeys::from_config(
+            &app_state.config,
+        ))
+    } else {
+        compiler
+    };
     let compiled_dag = compiler
         .compile(dag_definition)
         .map_err(|e| format!("DAG compilation failed: {}", e))?;
@@ -3866,6 +4564,7 @@ fn dag_background(
     dag_config: &DAGWebSocketConfig,
     stream_id: &str,
     auth_id: Option<String>,
+    executor: DAGExecutor,
 ) -> Result<Arc<dyn crate::core::interaction::background::TextBackend>, &'static str> {
     let Ok(Some((shape, dag))) = compiled else {
         return Err("dag_config");
@@ -3879,11 +4578,52 @@ fn dag_background(
     Ok(Arc::new(DagBackground {
         start: find_post_stt_node(dag),
         dag: dag.clone(),
-        executor: DAGExecutor::new(),
+        executor,
         context: DAGContext::with_auth(stream_id.to_string(), None, auth_id),
         timeout: dag_config.timeout_ms.map(Duration::from_millis),
         endpoints: shape.endpoints,
     }))
+}
+
+/// The client's `error` for a failed DAG turn, naming the node that failed it.
+#[cfg(feature = "dag-routing")]
+fn dag_turn_error(
+    dag: &crate::dag::compiler::CompiledDAG,
+    failed: Option<crate::dag::FailedNode>,
+    error: &crate::dag::DAGError,
+) -> MessageRoute {
+    let timeout = matches!(error, crate::dag::DAGError::ExecutionTimeout(_));
+    // The streaming executor wraps a node's error as `NodeExecutionError`; the message below names
+    // the node itself, so use the node's own words ("… failed: TTS provider 'openai' error: …").
+    let error: &dyn std::fmt::Display = match error {
+        crate::dag::DAGError::NodeExecutionError { error, .. } if failed.is_some() => error,
+        other => other,
+    };
+    let (code, message) = match &failed {
+        Some(node) if timeout => (
+            "dag_node_timeout",
+            format!(
+                "DAG node '{}' ({}) timed out: {error}",
+                node.id, node.node_type
+            ),
+        ),
+        Some(node) => (
+            "dag_node_failed",
+            format!(
+                "DAG node '{}' ({}) failed: {error}",
+                node.id, node.node_type
+            ),
+        ),
+        None if timeout => ("dag_turn_timeout", format!("DAG turn timed out: {error}")),
+        None => ("dag_node_failed", format!("DAG turn failed: {error}")),
+    };
+    MessageRoute::Outgoing(OutgoingMessage::DagError {
+        message,
+        code: code.to_string(),
+        dag_id: dag.definition.id.clone(),
+        node_id: failed.as_ref().map(|node| node.id.clone()),
+        node_type: failed.map(|node| node.node_type),
+    })
 }
 
 /// Find the node directly downstream of the STT provider node (the "post-STT" node),
@@ -3910,13 +4650,38 @@ fn find_post_stt_node(dag: &crate::dag::compiler::CompiledDAG) -> String {
     dag.graph[dag.entry].id.clone()
 }
 
+/// The DAG turn in flight on a session: its cancel token and its task.
+#[cfg(feature = "dag-routing")]
+struct RunningDagTurn {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Cancel the session's DAG turn if it is still running. `true` when one was.
+#[cfg(feature = "dag-routing")]
+fn cancel_running_dag_turn(running: &std::sync::Mutex<Option<RunningDagTurn>>) -> bool {
+    let taken = running.lock().unwrap_or_else(|p| p.into_inner()).take();
+    match taken {
+        Some(turn) if !turn.task.is_finished() => {
+            turn.cancel.cancel();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Register the StreamDriver: on each finalized STT turn, run the compiled DAG once
 /// starting at the post-STT node, feeding it the transcript as an `STTResult`.
 ///
-/// A fresh per-turn `DAGContext` is derived from the template (carrying the same
-/// `stream_id`, auth, deadline and output sink) so per-turn node results don't leak
-/// across turns, while the LLM node's per-`stream_id` conversation history is
-/// preserved across turns.
+/// Each turn runs as its OWN task with a per-turn child of the session's cancel token, so the STT
+/// callback returns at once and the caller's next words are heard while the bot answers: a barge-in
+/// (the caller speaks while a turn runs) cancels the turn — its in-flight LLM/TTS calls are dropped —
+/// and clears queued TTS audio, as the conversation path does; a newer finished turn supersedes an
+/// older one still running. The turn runs on the streaming executor, so the TTS node starts speaking
+/// the LLM's first sentence while later ones are generated (graphs with a join fall back to the batch
+/// executor). A fresh per-turn `DAGContext` is derived from the template (carrying the same
+/// `stream_id`, auth and output sink) so per-turn node results don't leak across turns, while the
+/// LLM node's per-`stream_id` conversation history is preserved.
 #[cfg(feature = "dag-routing")]
 #[allow(clippy::too_many_arguments)]
 async fn register_dag_stream_driver(
@@ -3925,21 +4690,37 @@ async fn register_dag_stream_driver(
     executor: Arc<DAGExecutor>,
     ctx_template: DAGContext,
     post_stt_node_id: String,
+    turn_timeout: Option<Duration>,
     message_tx: &mpsc::Sender<MessageRoute>,
     profiler: Arc<crate::core::observability::LatencyProfiler>,
 ) {
     let message_tx = message_tx.clone();
-    // A-G0: the DAG session drives turn policy through the same controller
-    // spine as the conversation path (legacy set = previous inline gate).
-    // The controller's turn_id keys the TurnTrace (A11 partial: one id per
-    // turn across policy + profiling on this path).
-    let turn_controller = Arc::new(crate::core::turn::TurnController::new(
-        vec![Box::new(crate::core::turn::strategies::AnySpeechStart)],
-        vec![Box::new(
-            crate::core::turn::strategies::LegacySpeechFinalStop,
-        )],
-        vec![],
-    ));
+    let running: Arc<std::sync::Mutex<Option<RunningDagTurn>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Weak: the callback is stored on the voice manager itself.
+    let vm_weak = Arc::downgrade(voice_manager);
+    // A-G0: the DAG session drives turn policy through the same controller spine as the
+    // conversation path. The bot is "busy" while a DAG turn runs or the voice manager's playout
+    // estimate says it is audibly speaking, so a caller who starts talking then is a barge-in.
+    let probe_running = running.clone();
+    let probe_vm = vm_weak.clone();
+    let turn_controller = Arc::new(
+        crate::core::turn::TurnController::new(
+            vec![Box::new(crate::core::turn::strategies::AnySpeechStart)],
+            vec![Box::new(
+                crate::core::turn::strategies::LegacySpeechFinalStop,
+            )],
+            vec![],
+        )
+        .with_bot_speaking_probe(move || {
+            probe_running
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_some_and(|t| !t.task.is_finished())
+                || probe_vm.upgrade().is_some_and(|vm| vm.is_bot_speaking())
+        }),
+    );
     let result = voice_manager
         .on_stt_result(move |stt: STTResult| {
             let compiled_dag = compiled_dag.clone();
@@ -3949,6 +4730,8 @@ async fn register_dag_stream_driver(
             let message_tx = message_tx.clone();
             let profiler = profiler.clone();
             let turn_controller = turn_controller.clone();
+            let running = running.clone();
+            let vm_weak = vm_weak.clone();
 
             Box::pin(async move {
                 // Transcript egress: the DAG path REPLACES the simple-path STT callback
@@ -3972,9 +4755,6 @@ async fn register_dag_stream_driver(
                 )
                 .await;
 
-                // Turn policy via the controller (legacy set ≡ the previous
-                // inline `is_speech_final && !empty` gate); the DAG runs on
-                // the Stopped event, keyed by the controller's turn_id.
                 let signal = if stt.is_final || stt.is_speech_final {
                     crate::core::turn::ControllerSignal::SttFinal {
                         // Turn policy sees the FULL segment; client egress
@@ -3990,35 +4770,42 @@ async fn register_dag_stream_driver(
                     }
                 };
                 let events = turn_controller.feed(&signal);
+
+                // Barge-in: the caller spoke while the bot was busy. Stop the running turn (its
+                // in-flight LLM/TTS calls are dropped) and clear audio the session still holds.
+                let barge_in = events.iter().any(|e| {
+                    matches!(
+                        e,
+                        crate::core::turn::TurnEvent::Started {
+                            interrupt: true,
+                            ..
+                        } | crate::core::turn::TurnEvent::BargeInMopUp
+                    )
+                });
+                if barge_in {
+                    let cancelled = cancel_running_dag_turn(&running);
+                    if let Some(vm) = vm_weak.upgrade()
+                        && let Err(e) = vm.clear_tts().await
+                    {
+                        warn!(error = %e, "StreamDriver: clear_tts during barge-in failed");
+                    }
+                    debug!(cancelled, "StreamDriver: barge-in");
+                }
+
                 let Some((turn_id, turn_transcript)) = events.into_iter().find_map(|e| match e {
                     crate::core::turn::TurnEvent::Stopped {
                         turn_id,
                         transcript,
                     } => Some((turn_id, transcript)),
-                    // Started/barge-in has no DAG-side action today. ROOT
-                    // CAUSE (traced, review wc023gbbz#1): DAG turns execute
-                    // SERIALLY — the STT provider's result-forwarding loop
-                    // (`while recv { callback(result).await }`,
-                    // e.g. stt/deepgram.rs:1109) awaits THIS callback, whose
-                    // `executor.execute_from(..).await` below runs the whole
-                    // turn. So a barge-in's STT result QUEUES behind the
-                    // in-flight turn and this `Started` cannot even fire until
-                    // the prior turn's response completes (≤ its done/30s).
-                    // A persistent S2S node (B-G2) therefore streams its full
-                    // response before barge-in is processed. Closing this is
-                    // NOT the naive "fire ctx.cancel_token here" (the event
-                    // never arrives mid-turn, and clone_for_branch SHARES the
-                    // token so cancelling it poisons the session template): it
-                    // needs the turn to run as a SPAWNED, per-turn-child-token
-                    // cancellable task so the next Started can cancel it — an
-                    // architectural change affecting ALL DAG paths (LLM/TTS
-                    // too), out of scope for the B-G2 wiring. Cascade/
-                    // conversation path handles barge-in in its orchestrator,
-                    // not here.
                     _ => None,
                 }) else {
                     return;
                 };
+
+                // A newer finished turn supersedes one still answering.
+                if cancel_running_dag_turn(&running) {
+                    debug!("StreamDriver: superseded the previous DAG turn");
+                }
 
                 debug!(
                     transcript = %turn_transcript,
@@ -4026,8 +4813,16 @@ async fn register_dag_stream_driver(
                     "StreamDriver: running DAG for finalized turn"
                 );
 
-                // Fresh per-turn context (shares stream_id/auth/deadline/output sink).
-                let mut ctx = ctx_template.clone_for_branch();
+                // Fresh per-turn context (shares stream_id/auth/output sink) with its OWN cancel
+                // token: a child of the session's, so teardown still stops it, while cancelling this
+                // turn leaves the session (and later turns) untouched. The turn's deadline starts now.
+                let cancel = ctx_template.cancel_token.child_token();
+                let mut ctx = ctx_template
+                    .clone_for_branch()
+                    .with_cancel_token(cancel.clone());
+                if let Some(timeout) = turn_timeout {
+                    ctx = ctx.with_timeout(timeout);
+                }
 
                 use crate::core::observability::{TurnOutcome, TurnPath, TurnSink, TurnTrace};
                 let mut trace = TurnTrace::open(
@@ -4046,31 +4841,80 @@ async fn register_dag_stream_driver(
                     ..Default::default()
                 });
 
-                let exec_result = executor
-                    .execute_from(&compiled_dag, &post_stt_node_id, input, &mut ctx)
-                    .await;
-                trace.audio_out_ns = crate::core::observability::now_monotonic_ns();
-                trace.node_durations_us = ctx
-                    .timing
-                    .node_durations
-                    .iter()
-                    .map(|(node, dur)| (Arc::from(node.as_str()), dur.as_micros() as u64))
-                    .collect();
-                trace.outcome = if exec_result.is_ok() {
-                    TurnOutcome::Completed
-                } else {
-                    TurnOutcome::Aborted
-                };
-                trace.bottleneck = trace.compute_bottleneck();
-                profiler.record_turn(trace);
-                match exec_result {
-                    Ok(_) => {
-                        debug!("StreamDriver: DAG turn completed");
+                let task = tokio::spawn(async move {
+                    let exec_result: Result<(), crate::dag::DAGError> =
+                        match executor.streamable_node_count(&compiled_dag, &post_stt_node_id) {
+                            Some(nodes) => {
+                                // The streaming executor has no per-node timeouts: bound the whole turn
+                                // by the session's turn deadline, else by what the batch path allows
+                                // (the per-node timeout once per node).
+                                let bound = turn_timeout.unwrap_or_else(|| {
+                                    executor.default_node_timeout().saturating_mul(
+                                        u32::try_from(nodes.max(1)).unwrap_or(u32::MAX),
+                                    )
+                                });
+                                match tokio::time::timeout(
+                                    bound,
+                                    executor.execute_streaming_from(
+                                        &compiled_dag,
+                                        &post_stt_node_id,
+                                        input,
+                                        &mut ctx,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        ctx.cancel_token.cancel();
+                                        Err(crate::dag::DAGError::ExecutionTimeout(
+                                            bound.as_millis() as u64,
+                                        ))
+                                    }
+                                }
+                            }
+                            None => executor
+                                .execute_from(&compiled_dag, &post_stt_node_id, input, &mut ctx)
+                                .await
+                                .map(|_| ()),
+                        };
+                    trace.audio_out_ns = crate::core::observability::now_monotonic_ns();
+                    trace.node_durations_us = ctx
+                        .timing
+                        .node_durations
+                        .iter()
+                        .map(|(node, dur)| (Arc::from(node.as_str()), dur.as_micros() as u64))
+                        .collect();
+                    trace.outcome = if exec_result.is_ok() {
+                        TurnOutcome::Completed
+                    } else {
+                        TurnOutcome::Aborted
+                    };
+                    trace.bottleneck = trace.compute_bottleneck();
+                    profiler.record_turn(trace);
+                    match exec_result {
+                        Ok(()) => {
+                            debug!("StreamDriver: DAG turn completed");
+                        }
+                        // Barge-in / a superseding turn / teardown: nothing failed.
+                        Err(crate::dag::DAGError::Cancelled) => {
+                            debug!("StreamDriver: DAG turn cancelled");
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                node_id = ?ctx.failed_node.as_ref().map(|n| n.id.as_str()),
+                                "StreamDriver: DAG turn failed"
+                            );
+                            // As a plain session reports its STT/TTS/LLM failures: the client is
+                            // told, the session stays up.
+                            let route = dag_turn_error(&compiled_dag, ctx.failed_node.take(), &e);
+                            send_critical(&message_tx, route).await;
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "StreamDriver: DAG turn failed");
-                    }
-                }
+                });
+                *running.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(RunningDagTurn { cancel, task });
             })
         })
         .await;
@@ -4151,6 +4995,8 @@ mod tests {
             extras: Default::default(),
             translation: None,
             turn_detection: None,
+            transcription_mode: None,
+            noise_suppression: None,
         }
     }
 
@@ -4774,6 +5620,51 @@ mod frd023_bud_mode_tests {
         assert!(bud_mode_config_refusal(None, Some(&template)).is_none());
     }
 
+    /// A LiveKit setup that fails after the session committed its stream id used to leave the socket
+    /// open and silent (no `ready`, and a second config is refused). Now the cause is sent and the
+    /// session closes with 1011, so the client reconnects instead of waiting forever.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_livekit_setup_closes_the_session_instead_of_hanging() {
+        let app_state = AppState::new(crate::test_support::minimal_config()).await;
+        assert!(
+            app_state.livekit_room_handler.is_none(),
+            "no LiveKit credentials, so setup fails"
+        );
+        let state = Arc::new(RwLock::new(ConnectionState::new()));
+        let (tx, mut rx) = mpsc::channel(16);
+        let livekit: LiveKitWebSocketConfig =
+            serde_json::from_value(serde_json::json!({"room_name": "room-1"})).unwrap();
+
+        let keep = handle_config_message(
+            None,
+            Some(false),
+            None,
+            None,
+            Some(livekit),
+            None,
+            None,
+            None,
+            None,
+            &state,
+            &tx,
+            &app_state,
+        )
+        .await;
+
+        assert!(!keep, "the session ends");
+        let (mut errors, mut close) = (0, None);
+        while let Ok(route) = rx.try_recv() {
+            match route {
+                MessageRoute::Outgoing(OutgoingMessage::Error { .. }) => errors += 1,
+                MessageRoute::CloseWith { code, reason } => close = Some((code, reason)),
+                _ => {}
+            }
+        }
+        assert!(errors >= 1, "the cause reaches the client first");
+        assert_eq!(close, Some((1011, "livekit_setup_failed".to_string())));
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn tc_sec_01_handle_config_refuses_before_building_anything() {
@@ -5015,5 +5906,207 @@ mod frd023_bud_mode_tests {
             leg(serde_json::json!({"stt": {"model": "nova-3"}, "tts": {"provider": "deepgram"}}));
         let err = validate_audio_config_values(&stt, &tts).unwrap_err();
         assert!(err.contains("STT provider"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod standalone_destination_tests {
+    //! A standalone session's client may not point the OPERATOR's vendor credential at a host of
+    //! its choosing (`core::client_destination`), and `WAAV_CLIENT_ENDPOINTS=deny` refuses every
+    //! client-chosen endpoint before an alias is spliced in.
+    use super::*;
+    use serde_json::json;
+
+    fn stt(extra: serde_json::Value) -> STTWebSocketConfig {
+        let mut base = json!({"provider": "deepgram", "language": "en-US", "sample_rate": 16000,
+            "channels": 1, "punctuation": true});
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).expect("stt config")
+    }
+
+    fn tts(extra: serde_json::Value) -> TTSWebSocketConfig {
+        let mut base = json!({"provider": "elevenlabs"});
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).expect("tts config")
+    }
+
+    fn conversation(extra: serde_json::Value) -> ConversationWebSocketConfig {
+        let mut base = json!({"base_url": "", "model": "m"});
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).expect("conversation config")
+    }
+
+    #[test]
+    fn an_override_with_the_operator_key_is_refused_on_either_leg() {
+        let evil = json!({"extras": {"endpoint_override": "wss://attacker.example"}});
+        let refusal = client_destination_refusal(Some(&stt(evil.clone())), None).expect("stt");
+        assert!(
+            refusal.contains("stt_config.extras.endpoint_override"),
+            "{refusal}"
+        );
+        let refusal = client_destination_refusal(None, Some(&tts(evil))).expect("tts");
+        assert!(
+            refusal.contains("tts_config.extras.endpoint_override"),
+            "{refusal}"
+        );
+        let segmented = json!({"extras": {"base_url": "https://attacker.example/v1"}});
+        assert!(client_destination_refusal(Some(&stt(segmented)), None).is_some());
+    }
+
+    #[test]
+    fn a_client_with_its_own_key_may_point_it_anywhere() {
+        let own =
+            json!({"api_key": "dg-own", "extras": {"endpoint_override": "wss://proxy.example"}});
+        assert_eq!(client_destination_refusal(Some(&stt(own)), None), None);
+        assert_eq!(
+            client_destination_refusal(Some(&stt(json!({}))), Some(&tts(json!({})))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_provider_that_reads_its_own_key_is_judged_too() {
+        let evil = json!({"provider": "murf", "extras": {"endpoint_override": "https://attacker.example"}});
+        assert!(client_destination_refusal(None, Some(&tts(evil))).is_some());
+    }
+
+    #[test]
+    fn allow_mode_leaves_client_llm_endpoints_alone() {
+        let conv = conversation(json!({"base_url": "https://llm.example/v1"}));
+        assert_eq!(
+            standalone_client_config_refusal(Some(&conv), None, None, None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn deny_mode_refuses_every_client_chosen_endpoint() {
+        for (extra, field) in [
+            (json!({"base_url": "https://llm.example/v1"}), "base_url"),
+            (
+                json!({"reasoning_base_url": "https://llm.example/v1"}),
+                "reasoning_base_url",
+            ),
+            (json!({"credential_ref": "local-gw"}), "credential_ref"),
+            (json!({"api_key": "${local-gw}"}), "credential_ref"),
+        ] {
+            let conv = conversation(extra);
+            let refusal = standalone_client_config_refusal(Some(&conv), None, None, None, true)
+                .unwrap_or_else(|| panic!("{field} accepted"));
+            assert!(
+                refusal.contains(field) && refusal.contains("WAAV_CLIENT_ENDPOINTS"),
+                "{refusal}"
+            );
+        }
+        // A literal key of the client's own, with an alias's endpoint, is fine.
+        let own = conversation(json!({"api_key": "sk-own"}));
+        assert_eq!(
+            standalone_client_config_refusal(Some(&own), None, None, None, true),
+            None
+        );
+
+        let dag: DAGWebSocketConfig =
+            serde_json::from_value(json!({"definition": {"nodes": []}})).unwrap();
+        assert!(standalone_client_config_refusal(None, Some(&dag), None, None, true).is_some());
+        let template: DAGWebSocketConfig =
+            serde_json::from_value(json!({"template": "support"})).unwrap();
+        assert_eq!(
+            standalone_client_config_refusal(None, Some(&template), None, None, true),
+            None
+        );
+
+        let own_key_override =
+            stt(json!({"api_key": "own", "extras": {"endpoint_override": "wss://proxy.example"}}));
+        assert!(
+            standalone_client_config_refusal(None, None, Some(&own_key_override), None, true)
+                .is_some(),
+            "deny refuses client endpoints whoever's key they carry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod alias_leg_endpoint_tests {
+    //! A server alias's own servers reach the legs server-side, and only legs that kept the
+    //! alias's provider (Gaia's 25 Oct report, item 4).
+    use super::*;
+    use crate::core::alias::{AliasLegEndpoint, AliasLegs};
+    use serde_json::json;
+
+    fn legs() -> AliasLegs {
+        AliasLegs {
+            stt: Some(AliasLegEndpoint {
+                provider: "openai".into(),
+                base_url: "http://127.0.0.1:8081".into(),
+                credential_ref: None,
+            }),
+            tts: Some(AliasLegEndpoint {
+                provider: "openai".into(),
+                base_url: "http://127.0.0.1:8082".into(),
+                credential_ref: None,
+            }),
+        }
+    }
+
+    fn configs(
+        stt: &str,
+        tts: &str,
+    ) -> (
+        crate::core::stt::standard::StandardSTTConfig,
+        crate::core::tts::standard::StandardTTSConfig,
+    ) {
+        let stt: STTWebSocketConfig = serde_json::from_value(json!({"provider": stt,
+            "language": "en", "sample_rate": 16000, "channels": 1, "punctuation": true}))
+        .unwrap();
+        let tts: TTSWebSocketConfig = serde_json::from_value(json!({"provider": tts})).unwrap();
+        (
+            stt.to_standard_stt(String::new()),
+            tts.to_standard_tts(String::new()),
+        )
+    }
+
+    #[test]
+    fn an_openai_compatible_alias_server_is_used_by_both_legs() {
+        let (mut stt, mut tts) = configs("openai", "openai");
+        apply_alias_leg_endpoints(&legs(), &mut stt, &mut tts);
+        assert_eq!(stt.endpoint_override(), Some("http://127.0.0.1:8081"));
+        assert_eq!(tts.base.provider, "self_hosted");
+        assert_eq!(
+            tts.base.api_base.as_deref(),
+            Some("http://127.0.0.1:8082/v1")
+        );
+    }
+
+    #[test]
+    fn a_leg_whose_client_chose_another_provider_keeps_its_vendor() {
+        let (mut stt, mut tts) = configs("deepgram", "elevenlabs");
+        apply_alias_leg_endpoints(&legs(), &mut stt, &mut tts);
+        assert_eq!(stt.endpoint_override(), None);
+        assert_eq!(tts.base.provider, "elevenlabs");
+        assert_eq!(tts.base.api_base, None);
+    }
+
+    #[test]
+    fn a_session_synthesis_timeout_is_clamped() {
+        let tts: TTSWebSocketConfig =
+            serde_json::from_value(json!({"provider": "openai", "request_timeout": 100000}))
+                .unwrap();
+        assert_eq!(
+            tts.to_tts_config(String::new()).request_timeout,
+            Some(super::super::config::MAX_TTS_REQUEST_TIMEOUT_SECS)
+        );
+        let tts: TTSWebSocketConfig =
+            serde_json::from_value(json!({"provider": "openai"})).unwrap();
+        assert_eq!(
+            tts.to_tts_config(String::new()).request_timeout,
+            Some(60),
+            "default unchanged"
+        );
     }
 }

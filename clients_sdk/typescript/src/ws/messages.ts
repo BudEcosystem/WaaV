@@ -18,10 +18,14 @@ import type {
   PongMessage,
   SessionUpdateMessage,
   ConfigWarningMessage,
+  ReadyStt,
+  SttWarningMessage,
+  VadEventMessage,
   MessageType,
 } from '../types/messages.js';
 import type { STTConfig, TTSConfig, LiveKitConfig, DAGConfig, ConversationConfig, TurnDetectionConfig } from '../types/config.js';
 import { conversationConfigToWire } from '../types/conversation.js';
+import { voiceAgentConfigToWire, type VoiceAgentConfig } from '../types/agent.js';
 import { serializeDAGConfig } from '../types/dag.js';
 import type { FeatureFlags } from '../types/features.js';
 import type { InteractionConfig, InteractionEcho, InteractionClientMessage } from '../types/interaction.js';
@@ -132,6 +136,8 @@ export interface SDKConfigMessage {
    * The resolved concrete providers come back on `ready` as `resolved_alias`.
    */
   alias?: string;
+  /** A Bud voice agent (spec 025, wire `agent`): it decides both speech legs. */
+  agent?: VoiceAgentConfig;
   /**
    * Interaction mode (protocol 1.1): `true` for the defaults, an object of settings, or `false`
    * to turn off an alias's or the server's default block. Sent as-is under `interaction`
@@ -238,6 +244,10 @@ function configToWire(message: SDKConfigMessage): Record<string, unknown> {
   // {stt,tts,llm,dag} bundle server-side (an explicit config below overrides it).
   if (message.alias) {
     wire.alias = message.alias;
+  }
+
+  if (message.agent) {
+    wire.agent = voiceAgentConfigToWire(message.agent);
   }
 
   if (message.audio !== undefined) {
@@ -348,6 +358,10 @@ function sttConfigToWire(
   // frame). Distinct from `encoding`. Only set when the SDK will actually encode opus; the gateway
   // echoes the effective codec in `ready` and degrades to linear16 if it can't.
   setIfDefined(wire, 'audio_in_codec', config.audioInCodec);
+  // Segmented STT: the kind of speech-to-text wanted (auto | streaming | segmented). Omitted = auto;
+  // the gateway reports the mode the session got on `ready.stt.transcription_mode`.
+  setIfDefined(wire, 'transcription_mode', config.transcriptionMode);
+  setIfDefined(wire, 'noise_suppression', config.noiseSuppression);
   setIfDefined(wire, 'model', config.model);
   setIfDefined(wire, 'api_key', config.apiKey);
 
@@ -549,6 +563,10 @@ function fromWireFormat(wire: Record<string, unknown>): IncomingMessage {
       return sessionUpdateFromWire(wire);
     case 'config_warning':
       return configWarningFromWire(wire);
+    case 'vad_event':
+      return vadEventFromWire(wire);
+    case 'stt_warning':
+      return sttWarningFromWire(wire);
     default:
       // Return generic message for unknown types (e.g. tts_playback_complete,
       // message, participant_disconnected, sip_transfer_error). These already
@@ -591,6 +609,11 @@ function readyFromWire(wire: Record<string, unknown>): ReadyMessage {
   // Interaction mode: the resolved settings (present only when the session runs the mode).
   const interaction = asRecord(wire.interaction);
   if (interaction !== undefined) msg.interaction = interaction as unknown as InteractionEcho;
+  // Segmented STT: what speech-to-text the session got. An open object, kept as sent (snake_case
+  // keys, nulls, notices and any key a newer gateway adds); absent when the rollout does not cover
+  // the session.
+  const stt = asRecord(wire.stt);
+  if (stt !== undefined) msg.stt = stt as ReadyStt;
   return msg;
 }
 
@@ -653,16 +676,21 @@ function ttsAudioFromWire(wire: Record<string, unknown>): TTSAudioMessage {
 }
 
 /**
- * Convert error message from wire format
+ * Convert error message from wire format. An uncoded gateway error is `{type, message}` and keeps
+ * that shape; a coded one adds `code`, `recoverable` and `details` (each omitted when absent).
  */
 function errorFromWire(wire: Record<string, unknown>): ErrorMessage {
-  return {
+  const msg: ErrorMessage = {
     type: 'error',
-    code: asStringRequired(wire.code, 'code'),
     message: asStringRequired(wire.message, 'message'),
-    details: asRecord(wire.details),
-    recoverable: asBoolean(wire.recoverable),
   };
+  const code = asString(wire.code);
+  if (code !== undefined) msg.code = code;
+  const recoverable = asBoolean(wire.recoverable);
+  if (recoverable !== undefined) msg.recoverable = recoverable;
+  const details = asRecord(wire.details);
+  if (details !== undefined) msg.details = details;
+  return msg;
 }
 
 /**
@@ -707,6 +735,45 @@ function configWarningFromWire(wire: Record<string, unknown>): ConfigWarningMess
 }
 
 /**
+ * Convert a vad_event message from wire format. Gateway wire shape (handlers/ws/messages.rs
+ * OutgoingMessage::VadEvent): { type, event, turn_id, audio_ms?, sustained_ms?, discarded?,
+ * had_transcript?, reason? }.
+ */
+function vadEventFromWire(wire: Record<string, unknown>): VadEventMessage {
+  const msg: VadEventMessage = {
+    type: 'vad_event',
+    event: asStringRequired(wire.event, 'event'),
+    turn_id: asNumberRequired(wire.turn_id, 'turn_id'),
+  };
+  const audioMs = asNumber(wire.audio_ms);
+  if (audioMs !== undefined) msg.audio_ms = audioMs;
+  const sustainedMs = asNumber(wire.sustained_ms);
+  if (sustainedMs !== undefined) msg.sustained_ms = sustainedMs;
+  const discarded = asBoolean(wire.discarded);
+  if (discarded !== undefined) msg.discarded = discarded;
+  const hadTranscript = asBoolean(wire.had_transcript);
+  if (hadTranscript !== undefined) msg.had_transcript = hadTranscript;
+  const reason = asString(wire.reason);
+  if (reason !== undefined) msg.reason = reason;
+  return msg;
+}
+
+/**
+ * Convert an stt_warning message from wire format. Gateway wire shape (handlers/ws/messages.rs
+ * OutgoingMessage::SttWarning): { type, code, message, detail? }.
+ */
+function sttWarningFromWire(wire: Record<string, unknown>): SttWarningMessage {
+  const msg: SttWarningMessage = {
+    type: 'stt_warning',
+    code: asStringRequired(wire.code, 'code'),
+    message: asStringRequired(wire.message, 'message'),
+  };
+  const detail = asRecord(wire.detail);
+  if (detail !== undefined) msg.detail = detail;
+  return msg;
+}
+
+/**
  * Create a config message.
  *
  * `stt`/`tts`/`livekit`/`features` are positional for backward compatibility;
@@ -723,6 +790,7 @@ export function createConfigMessage(
     conversation?: ConversationConfig;
     turnDetection?: TurnDetectionConfig;
     alias?: string;
+    agent?: VoiceAgentConfig;
     streamId?: string;
     audio?: boolean;
     interaction?: boolean | InteractionConfig;
@@ -739,6 +807,7 @@ export function createConfigMessage(
   if (extra?.conversation !== undefined) msg.conversation = extra.conversation;
   if (extra?.turnDetection !== undefined) msg.turnDetection = extra.turnDetection;
   if (extra?.alias !== undefined) msg.alias = extra.alias;
+  if (extra?.agent !== undefined) msg.agent = extra.agent;
   if (extra?.streamId !== undefined) msg.streamId = extra.streamId;
   if (extra?.audio !== undefined) msg.audio = extra.audio;
   if (extra?.interaction !== undefined) msg.interaction = extra.interaction;

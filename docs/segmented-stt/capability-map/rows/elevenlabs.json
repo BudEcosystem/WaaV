@@ -1,0 +1,1082 @@
+{
+  "provider_id": "elevenlabs",
+  "provider": {
+    "aliases": [],
+    "default_model": "scribe_v2_realtime",
+    "model_string": "wire_model",
+    "key_normalisation": {
+      "strip_provider_prefix": true,
+      "placeholder_as_unset": true
+    },
+    "registered_in_gateway": true,
+    "production_base": "https://api.elevenlabs.io",
+    "base_url_convention": "origin",
+    "notes": "Registered as `elevenlabs` (gateway/src/plugin/builtin/mod.rs:1674); live sessions build the socket client through create_stt_standard (gateway/src/core/stt/standard.rs:420-422). The vendor has two disjoint model families: scribe_v2_realtime on a WebSocket, and scribe_v2 and scribe_v2_medical on a synchronous file endpoint. The gateway keeps one closed list of realtime ids (gateway/src/core/stt/elevenlabs/config.rs:189) and treats every other id as a file model (elevenlabs/batch.rs:63-65), which is why the provider default row is file upload. A live session that names a file model fails at setup today (config.rs:391), pinned by the test a_live_session_never_gets_the_batch_client (standard.rs:950). An empty model on a live session stays on the socket, because the configuration keeps its scribe_v2_realtime default (config.rs:331, :554-568) and the check at :391 skips an empty id; default_model records that. On the upload route an empty model resolves to scribe_v2 instead (elevenlabs/batch.rs:47), so the default depends on the route. The flat constructor ignores the configured model and always uses scribe_v2_realtime (client.rs:823-826). The spelling eleven_labs is accepted as a vendor name by the language mapper (gateway/src/core/lang/mappers/mod.rs:217) and by text-to-speech handlers (gateway/src/handlers/openai_audio.rs:1337), but not by the speech-to-text dispatcher (standard.rs:420) or the plugin registry (gateway/src/plugin/builtin/mod.rs:1674), so it is not listed as an alias; a live session that names it does not reach this client (inferred from the dispatch arms, not run)."
+  },
+  "rows": [
+    {
+      "id": "elevenlabs:scribe_v2",
+      "match": {
+        "provider": "elevenlabs",
+        "model": "scribe_v2"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "elevenlabs_batch",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_elevenlabs) is not built yet. Today a live session that names this model fails at setup, and the existing upload driver sends audio only at disconnect.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 2010,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "measured_on": "2026-02-09",
+                "conditions": "Pipecat constant ELEVENLABS_TTFS_P99 = 2.01 s: end of speech to final transcript for its voice-activity-segmented ElevenLabs file service, including a 200 ms detector stop delay. The Pipecat benchmark harness builds that service with scribe_v2 (https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/src/stt_benchmark/services.py, reported by the real-time levers research). The constant has not changed since 2026-02-09. No median is published and the vendor publishes no latency for the file endpoint.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_upload_bytes": 5000000000,
+            "max_audio_ms": 36000000,
+            "min_audio_ms": 100,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 12,
+                "plan": "starter",
+                "scope": "organisation",
+                "note": "Every HTTP request counts. Over the limit the vendor queues the request (about 50 ms) or answers 429 concurrent_limit_exceeded; the maximum-concurrent-requests response header carries the account's real ceiling."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20,
+                "plan": "creator",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 40,
+                "plan": "pro",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 60,
+                "plan": "business",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "flac",
+              "ogg",
+              "opus",
+              "mp3",
+              "mp4",
+              "m4a",
+              "aac",
+              "webm",
+              "aiff"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart",
+            "vendor_params": [
+              {
+                "name": "file_format",
+                "value": "other",
+                "in": "form"
+              }
+            ]
+          },
+          "quality_signals": [
+            "word_logprob",
+            "language_probability",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "timestamps_granularity=word"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms",
+                "max_items": 100,
+                "note": "The vendor allows 1000 entries, each under 50 characters and at most 5 words; above 100 entries every request is billed at least 20 s."
+              }
+            ],
+            "wire": "elevenlabs_multipart",
+            "limit_headers": {
+              "concurrency_current": "current-concurrent-requests",
+              "concurrency_limit": "maximum-concurrent-requests"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:765-836 (build_elevenlabs_transcription_with); gateway/src/core/stt/elevenlabs/batch.rs:392-502 (multipart_fields); gateway/src/core/stt/prerecorded.rs:988 (parse_elevenlabs) and :286 (flush_buffer, takes &mut self)",
+            "notes": "No adapter exists. The request builder and the response parser already serve the upload route, but the driver's flush takes &mut self and runs only at disconnect, on a shared HTTP client with a 300 s timeout that is limited to HTTP/1.1 (prerecorded.rs:72, :177-185), so two uploads cannot be in flight. A live session that names a file model fails session setup with a named error (gateway/src/core/stt/elevenlabs/config.rs:391). The live request must differ from the upload route: send tag_audio_events=false (the vendor default is true and writes tokens such as (laughter) into the text; the parser removes them from the word list but not from the text, prerecorded.rs:1003-1008); send language_code when the language is known; keep timestamps_granularity=word, because per-word log-probability is the only quality signal; send at most 100 key terms and never transcript_edit. The parser hard-codes confidence 1.0 and drops language_probability and transcription_id (prerecorded.rs:1033-1048). The upload route overwrites the configured region with the driver's base URL (gateway/src/core/stt/batch.rs:776). The vendor says raw 16 kHz PCM with file_format=pcm_s16le_16 is faster than an encoded file; the builder always sends file_format=other (elevenlabs/batch.rs:488-500) and the switch waits for one live probe."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The upload route's shared client allows 300 s (gateway/src/core/stt/prerecorded.rs:72); the vendor audit proposes 8 s in total and 2 s to connect, about four times the only measured P99 (2.01 s). This is an inference, not a measurement, and must be replaced once the gateway has its own numbers; how processing time grows with segment length is unknown. The container stays 16 kHz mono PCM16 WAV with file_format=other until a live probe confirms the vendor's faster raw PCM option. Pre-roll, trailing silence, the 25 s maximum segment and two uploads in flight keep the defaults; the vendor's own limits (10 hours, 5 GB) never bind."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "per_request",
+              "param": {
+                "name": "enable_logging",
+                "value": "false",
+                "in": "query"
+              }
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/core/stt/elevenlabs/config.rs:391 (the live client rejects any id outside its realtime list)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This ElevenLabs model transcribes uploaded files; ElevenLabs streams only scribe_v2_realtime. This gateway does not yet serve ElevenLabs file models on live calls. Use scribe_v2_realtime, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "conditional_minimums": [
+          {
+            "feature": "keyterms",
+            "above": 100,
+            "min_billed_ms": 20000
+          },
+          {
+            "feature": "transcript_edit",
+            "min_billed_ms": 10000
+          }
+        ],
+        "surcharges": [
+          {
+            "feature": "keyterms",
+            "percent": 20
+          },
+          {
+            "feature": "entity_detection",
+            "percent": 30
+          },
+          {
+            "feature": "transcript_edit",
+            "percent": 30
+          }
+        ],
+        "bills_silence": false,
+        "notes": "Vendor price in the evidence is $0.22 per audio hour and only uploaded segments are billed. No base minimum billed duration is documented for a plain request. Speaker roles add a further 10%. gateway/src/config/pricing.rs has no entry for this model (only the stale elevenlabs:scribe_v1 at :241), so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.elevenlabs.io/openapi.json",
+          "https://elevenlabs.io/docs/api-reference/speech-to-text/convert",
+          "https://elevenlabs.io/docs/overview/models",
+          "https://elevenlabs.io/docs/overview/capabilities/speech-to-text",
+          "https://elevenlabs.io/docs/eleven-api/resources/errors",
+          "https://elevenlabs.io/pricing/api",
+          "https://elevenlabs.io/docs/changelog/2026/6/1",
+          "https://elevenlabs.io/docs/changelog/2026/1/12",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/elevenlabs/config.rs:189",
+          "gateway/src/core/stt/elevenlabs/config.rs:391",
+          "gateway/src/core/stt/elevenlabs/batch.rs:63-65",
+          "gateway/src/core/stt/elevenlabs/batch.rs:366-381"
+        ],
+        "unverified": [
+          "transports[0].latency (third-party P99 only; no median)",
+          "transports[0].limits.max_upload_bytes (the API reference and the 2026-06-01 changelog say 5.0 GB, the capability page still says 3 GB; the byte value assumes decimal gigabytes)",
+          "transports[0].limits.rates (requests) (a rate_limit_exceeded error exists; no number is published)",
+          "transports[0].limits.rates (concurrent_requests) (plan-dependent; assumed_plan is starter, the lowest paid plan; Enterprise is 'Elevated' with no number)",
+          "transports[0].limits.rates[].scope (the vendor states the limit per plan; mapping that to organisation is an inference)",
+          "transports[0].upload.preferred (the vendor says raw PCM with file_format=pcm_s16le_16 is faster; whether that part must be headerless is unconfirmed, so WAV stays preferred until one live probe)",
+          "transports[0].quality_signals_require (whether words and their log-probabilities are still returned with timestamps_granularity=none is untested)",
+          "the format of the detected language_code in the response (the schema says ISO 639-3 such as 'eng'; the example shows 'en')",
+          "billing.min_billed_ms (no base minimum or rounding rule is documented)",
+          "transports[0].privacy (zero retention through enable_logging=false is for enterprise customers only; what another key receives when it sends the parameter is not documented)"
+        ],
+        "notes": "File endpoint only: the realtime socket accepts scribe_v2_realtime alone. The file endpoint answers in the same request unless webhook=true is sent. There is no free-text prompt on the file endpoint; vocabulary can be biased with key terms only. Audio-event tags are not listed as a quality signal because receiving them needs tag_audio_events=true, which the live request turns off. Over the concurrency limit the vendor either queues the request (about 50 ms) or answers 429 concurrent_limit_exceeded, and it reports the real ceiling in the maximum-concurrent-requests response header."
+      }
+    },
+    {
+      "id": "elevenlabs:scribe_v2_medical",
+      "match": {
+        "provider": "elevenlabs",
+        "model": "scribe_v2_medical"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "elevenlabs_batch",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_elevenlabs) is not built yet. Today a live session that names this model fails at setup, and the existing upload driver sends audio only at disconnect.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No figure for this model. Pipecat's P99 of 2.01 s was recorded with scribe_v2 on the same endpoint."
+          },
+          "limits": {
+            "max_upload_bytes": 5000000000,
+            "max_audio_ms": 36000000,
+            "min_audio_ms": 100,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 12,
+                "plan": "starter",
+                "scope": "organisation",
+                "note": "Every HTTP request counts. Over the limit the vendor queues the request (about 50 ms) or answers 429 concurrent_limit_exceeded; the maximum-concurrent-requests response header carries the account's real ceiling."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20,
+                "plan": "creator",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 40,
+                "plan": "pro",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 60,
+                "plan": "business",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "flac",
+              "ogg",
+              "opus",
+              "mp3",
+              "mp4",
+              "m4a",
+              "aac",
+              "webm",
+              "aiff"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart",
+            "vendor_params": [
+              {
+                "name": "file_format",
+                "value": "other",
+                "in": "form"
+              }
+            ]
+          },
+          "quality_signals": [
+            "word_logprob",
+            "language_probability",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "timestamps_granularity=word"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms",
+                "max_items": 100,
+                "note": "The vendor allows 1000 entries, each under 50 characters and at most 5 words; above 100 entries every request is billed at least 20 s."
+              }
+            ],
+            "wire": "elevenlabs_multipart",
+            "limit_headers": {
+              "concurrency_current": "current-concurrent-requests",
+              "concurrency_limit": "maximum-concurrent-requests"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:765-836 (build_elevenlabs_transcription_with); gateway/src/core/stt/elevenlabs/batch.rs:392-502 (multipart_fields); gateway/src/core/stt/prerecorded.rs:988 (parse_elevenlabs) and :286 (flush_buffer, takes &mut self)",
+            "notes": "No adapter exists. The request builder and the response parser already serve the upload route, but the driver's flush takes &mut self and runs only at disconnect, on a shared HTTP client with a 300 s timeout that is limited to HTTP/1.1 (prerecorded.rs:72, :177-185), so two uploads cannot be in flight. A live session that names a file model fails session setup with a named error (gateway/src/core/stt/elevenlabs/config.rs:391). The live request must differ from the upload route: send tag_audio_events=false (the vendor default is true and writes tokens such as (laughter) into the text; the parser removes them from the word list but not from the text, prerecorded.rs:1003-1008); send language_code when the language is known; keep timestamps_granularity=word, because per-word log-probability is the only quality signal; send at most 100 key terms and never transcript_edit. The parser hard-codes confidence 1.0 and drops language_probability and transcription_id (prerecorded.rs:1033-1048). The upload route overwrites the configured region with the driver's base URL (gateway/src/core/stt/batch.rs:776). The vendor says raw 16 kHz PCM with file_format=pcm_s16le_16 is faster than an encoded file; the builder always sends file_format=other (elevenlabs/batch.rs:488-500) and the switch waits for one live probe. For this model, do not send no_verbatim until it is tested: the vendor's schema says it is supported only with scribe_v2 while the capability page says the medical model supports it, and the builder sends the field for any file model (elevenlabs/batch.rs:473-475)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The upload route's shared client allows 300 s (gateway/src/core/stt/prerecorded.rs:72); the vendor audit proposes 8 s in total and 2 s to connect, about four times the only measured P99 (2.01 s). This is an inference, not a measurement, and must be replaced once the gateway has its own numbers; how processing time grows with segment length is unknown. The container stays 16 kHz mono PCM16 WAV with file_format=other until a live probe confirms the vendor's faster raw PCM option. Pre-roll, trailing silence, the 25 s maximum segment and two uploads in flight keep the defaults; the vendor's own limits (10 hours, 5 GB) never bind."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "per_request",
+              "param": {
+                "name": "enable_logging",
+                "value": "false",
+                "in": "query"
+              }
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/core/stt/elevenlabs/config.rs:391 (the live client rejects any id outside its realtime list)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This ElevenLabs model transcribes uploaded files; ElevenLabs streams only scribe_v2_realtime. This gateway does not yet serve ElevenLabs file models on live calls. Use scribe_v2_realtime, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "conditional_minimums": [
+          {
+            "feature": "keyterms",
+            "above": 100,
+            "min_billed_ms": 20000
+          },
+          {
+            "feature": "transcript_edit",
+            "min_billed_ms": 10000
+          }
+        ],
+        "surcharges": [
+          {
+            "feature": "keyterms",
+            "percent": 20
+          },
+          {
+            "feature": "entity_detection",
+            "percent": 30
+          },
+          {
+            "feature": "transcript_edit",
+            "percent": 30
+          }
+        ],
+        "bills_silence": false,
+        "notes": "Billed at the same rate as scribe_v2. Vendor price in the evidence is $0.22 per audio hour and only uploaded segments are billed. No base minimum billed duration is documented for a plain request. Speaker roles add a further 10%. gateway/src/config/pricing.rs has no entry for this model (only the stale elevenlabs:scribe_v1 at :241), so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.elevenlabs.io/openapi.json",
+          "https://elevenlabs.io/docs/api-reference/speech-to-text/convert",
+          "https://elevenlabs.io/docs/overview/models",
+          "https://elevenlabs.io/docs/overview/capabilities/speech-to-text",
+          "https://elevenlabs.io/docs/changelog/2026/9/11",
+          "https://elevenlabs.io/pricing/api"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/elevenlabs/config.rs:189",
+          "gateway/src/core/stt/elevenlabs/config.rs:391",
+          "gateway/src/core/stt/elevenlabs/batch.rs:63-65",
+          "gateway/src/core/stt/elevenlabs/batch.rs:366-381"
+        ],
+        "unverified": [
+          "transports[0].latency (no figure for this model)",
+          "whether this model accepts no_verbatim (vendor pages disagree)",
+          "transports[0].limits.max_upload_bytes (the API reference and the 2026-06-01 changelog say 5.0 GB, the capability page still says 3 GB; the byte value assumes decimal gigabytes)",
+          "transports[0].limits.rates (requests) (a rate_limit_exceeded error exists; no number is published)",
+          "transports[0].limits.rates (concurrent_requests) (plan-dependent; assumed_plan is starter, the lowest paid plan; Enterprise is 'Elevated' with no number)",
+          "transports[0].limits.rates[].scope (the vendor states the limit per plan; mapping that to organisation is an inference)",
+          "transports[0].upload.preferred (the vendor says raw PCM with file_format=pcm_s16le_16 is faster; whether that part must be headerless is unconfirmed, so WAV stays preferred until one live probe)",
+          "transports[0].quality_signals_require (whether words and their log-probabilities are still returned with timestamps_granularity=none is untested)",
+          "the format of the detected language_code in the response (the schema says ISO 639-3 such as 'eng'; the example shows 'en')",
+          "billing.min_billed_ms (no base minimum or rounding rule is documented)",
+          "transports[0].privacy (zero retention through enable_logging=false is for enterprise customers only; what another key receives when it sends the parameter is not documented)"
+        ],
+        "notes": "Generally available since 2026-09-11. The vendor's models page says it is a batch model and that live transcription should use Scribe v2 Realtime. It uses the same endpoint and request shape as scribe_v2."
+      }
+    },
+    {
+      "id": "elevenlabs:scribe_v2_realtime",
+      "match": {
+        "provider": "elevenlabs",
+        "model": "scribe_v2_realtime"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No figure for this transport. Pipecat's benchmark for scribe_v2_realtime (median 281 ms, P99 407 ms) was taken with a commit sent by the client, not with the vendor's own voice-activity commit that the gateway uses, so it is recorded on the second transport. Here the vendor commits only after 0.5 s of silence that it detects itself (gateway/src/core/stt/elevenlabs/config.rs:337), so the time from end of speech to the final transcript cannot be shorter than about 0.5 s plus processing (inferred, not measured). Measure through the gateway before publishing a latency class."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 15000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 6,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 9,
+                "plan": "starter",
+                "scope": "organisation",
+                "note": "Realtime sockets have their own per-plan limit, lower than the file endpoint's."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 15,
+                "plan": "creator",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 30,
+                "plan": "pro",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 45,
+                "plan": "scale",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 45,
+                "plan": "business",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms",
+                "note": "The realtime reference states no limit; the gateway's realtime configuration allows 100 and today's URL builder sends none."
+              },
+              {
+                "kind": "previous_text",
+                "wire_name": "previous_text",
+                "note": "Sent with the first audio chunk only."
+              }
+            ],
+            "wire": "elevenlabs_realtime_ws"
+          },
+          "gateway_client": {
+            "status": "verified_live",
+            "last_verified_on": "2026-06-04",
+            "defect": "When word timestamps are requested the vendor pairs each committed transcript with a committed_transcript_with_timestamps message and the client maps both to a turn-ending final, so one utterance probably ends the turn twice (inferred from reading, not run). The message parser does not recognise twelve of the fourteen error types the vendor documents and only logs them as unknown.",
+            "code_ref": "gateway/src/core/stt/elevenlabs/client.rs:324-341 (new_standard), :351-439 (build_websocket_url), :473-499 (partial and committed transcript mapping); gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs:145 (live test)",
+            "notes": "Exercised against the vendor once: the key-gated live test elevenlabs_stt_transcribes_live drove this client through create_stt_standard with scribe_v2_realtime and got the spoken sentence back on 2026-06-04 (commit 7acd6c9, whose message records the run). That date is the last known good, not a current check. The status follows the rule the fact-check applied to the Sarvam client, which was verified by the same test file in the same commit. Since that run the WebSocket upgrade request is built by into_client_request instead of by hand, an endpoint override and a model check were added, and the shutdown signal changed (client.rs, 2026-07-12, commit 151cd1c; config.rs, up to 2026-09-25, commit 73a378a); the query parameters and the audio frame are the same (read from the diff between 7acd6c9 and the current head; messages.rs has not changed since 2026-01-18). The live test is ignored by default, is not part of CI and was not re-run, and the 2026-10-03 vendor audit made no live call, so re-run it with a working key before relying on this status. The client is also covered by unit tests of the socket URL and message parsing (gateway/src/core/stt/elevenlabs/tests.rs, run by CI) and by a mock-socket test (gateway/tests/mock_endpoint_e2e.rs:1367, not one of the test binaries CI runs). The audit found three departures from the vendor's published protocol; none is known to stop transcription: each audio chunk omits the commit and sample_rate fields that the vendor schema marks as required (messages.rs:32-39; the same omission was present in the 2026-06-04 run, which passed); the message parser recognises three of the vendor's error types (messages.rs:386) and treats the rest as unknown; and the URL builder sends no key terms, diarization, entity detection or no_verbatim. A fourth departure matters only when word timestamps are requested: the vendor then pairs every commit with a second message, committed_transcript_with_timestamps (stated in a comment in Pipecat's client, which skips the first message for that reason; read from the source file the audit fetched, not covered by the fact-check), and the gateway maps both messages to a final result that ends the turn (client.rs:488-510), so one utterance probably ends the turn twice (inferred from reading, not run). The client always asks the vendor to commit by voice-activity detection after 0.5 s of silence (config.rs:337-340; client.rs:400-431) and maps each committed transcript to a final result that also ends the turn (client.rs:488-499). It reports confidence 1.0 for a committed transcript, or a value derived from per-word log-probabilities when word timestamps were requested (client.rs:501-510). The socket accepts PCM at 8 to 48 kHz and 8 kHz mu-law. The vendor starts transcribing after the first 2 seconds of audio and closes a socket after 15 s without client messages."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "per_request",
+              "param": {
+                "name": "enable_logging",
+                "value": "false",
+                "in": "query"
+              }
+            }
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "The gateway's ElevenLabs socket client never selects the vendor's manual commit strategy and never sends commit: true (adapter commit_elevenlabs is not built).",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "realtime",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 407,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Pipecat stt-benchmark for scribe_v2_realtime: 1000 samples from pipecat-ai/smart-turn-data-v3.1-train; end of speech to final transcript including a 200 ms detector stop delay; P95 348 ms. Pipecat's realtime service sends the commit from its own voice-activity detector by default (commit strategy manual) and the benchmark harness builds the service with its defaults (https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/src/stt_benchmark/services.py), which is the method this transport describes. That reading is inferred from the two sources; the benchmark page does not name the strategy. Measured with Pipecat's client, not through the gateway.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              },
+              {
+                "percentile": "p50",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 281,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Same Pipecat benchmark run as the p99 entry.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              },
+              {
+                "percentile": "p95",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 348,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Same Pipecat benchmark run as the p99 entry.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 15000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 6,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 9,
+                "plan": "starter",
+                "scope": "organisation",
+                "note": "Realtime sockets have their own per-plan limit, lower than the file endpoint's."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 15,
+                "plan": "creator",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 30,
+                "plan": "pro",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 45,
+                "plan": "scale",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 45,
+                "plan": "business",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms",
+                "note": "The realtime reference states no limit; the gateway's realtime configuration allows 100 and today's URL builder sends none."
+              },
+              {
+                "kind": "previous_text",
+                "wire_name": "previous_text",
+                "note": "Sent with the first audio chunk only."
+              }
+            ],
+            "wire": "elevenlabs_realtime_ws"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/elevenlabs/config.rs:105-113 (CommitStrategy::Manual exists; Vad is the default); gateway/src/core/stt/elevenlabs/messages.rs:32-36 (optional commit field on the audio chunk)",
+            "notes": "Manual commit is the vendor's own default strategy: the client sends commit: true on an audio chunk and the vendor finalises the transcript, while partial transcripts keep arriving during speech. The types exist in the client, but no production code sets the manual strategy or the commit flag. The vendor commits by itself after about 36 s of accumulated audio and has a commit_throttled error type; the segmenter's 25 s maximum segment stays under that. The vendor's commit guide warns that committing manually several times in a short sequence can degrade model performance, and says that transcript processing starts after the first 2 seconds of audio; a commit at every short pause therefore needs a live test with short utterances before this transport is enabled. Use this transport when the gateway's detector should own the utterance boundary on the streaming model, so that turn timing matches segmented models."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "per_request",
+              "param": {
+                "name": "enable_logging",
+                "value": "false",
+                "in": "query"
+              }
+            }
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Vendor price in the evidence is $0.39 per audio hour, against $0.22 for the file models. Whether a socket is billed for all streamed audio including silence is not stated outright. Two vendor sentences suggest that it is: speech-to-text is charged by the duration of the audio sent (capability page), and a keepalive has no billing impact beyond the audio already being streamed (commit guide, read in the copy of the page the audit saved). The gateway streams the whole call to this socket, silence included. gateway/src/config/pricing.rs has no elevenlabs:scribe_v2_realtime entry, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime",
+          "https://elevenlabs.io/docs/eleven-api/guides/how-to/speech-to-text/realtime/transcripts-and-commit-strategies",
+          "https://elevenlabs.io/docs/overview/models",
+          "https://elevenlabs.io/pricing/api",
+          "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/elevenlabs/stt.py",
+          "https://elevenlabs.io/docs/overview/capabilities/speech-to-text"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/elevenlabs/config.rs:189",
+          "gateway/src/core/stt/elevenlabs/config.rs:331",
+          "gateway/src/core/stt/elevenlabs/config.rs:341",
+          "gateway/src/core/stt/elevenlabs/client.rs:434-435"
+        ],
+        "unverified": [
+          "transports[0].latency (unmeasured for the vendor voice-activity commit that the gateway uses today)",
+          "transports[0].gateway_client.status (verified_live rests on one live run on 2026-06-04; the handshake code changed on 2026-07-12, the test was not re-run and the vendor audit made no live call)",
+          "transports[*].limits.max_session_ms (a session_time_limit_exceeded error type exists; no number is in the evidence)",
+          "transports[*].limits.rates (concurrent_sessions) (plan-dependent; assumed_plan is starter, the lowest paid plan)",
+          "transports[*].limits.rates[].scope (the vendor states the limit per plan; mapping that to organisation is an inference)",
+          "the key term limit on the socket (the realtime reference states none; the gateway allows 100 at config.rs:358 while a comment at elevenlabs/batch.rs:49-50 says 50)",
+          "transports[*].quality_signals (the evidence names no confidence field on the socket)",
+          "billing.bills_silence and billing.min_billed_ms (the billing basis of a socket is not documented)",
+          "transports[1].latency (third-party figure measured with Pipecat's client; that the benchmark used a client-side commit is inferred from Pipecat's service source and benchmark harness, not stated on the benchmark page)",
+          "whether the vendor still accepts audio chunks without the commit and sample_rate fields that its schema marks as required (the gateway omits both)",
+          "transports[1]: the effect on accuracy of a commit at every pause (the vendor's guide warns against several manual commits in a short sequence; read from the page the audit fetched, not covered by the fact-check)",
+          "whether one utterance yields two turn-ending finals when word timestamps are requested (the vendor pairs committed_transcript with committed_transcript_with_timestamps according to Pipecat's client source; the gateway maps both; not probed)",
+          "transports[*].privacy (zero retention through enable_logging=false is for enterprise customers only; what another key receives is not documented)",
+          "transports[*].stream_audio.channels (the realtime reference does not state a channel count)"
+        ],
+        "notes": "The only id the vendor's realtime socket accepts, and the only ElevenLabs model that streams. It must keep exactly today's path: the first transport is the existing client, unchanged. The vendor has no file endpoint for it; the gateway's upload route refuses it (elevenlabs/batch.rs:341), though the vendor's own rejection was not tested. This is the model an empty model id resolves to on a live session. Zero retention is asked for with enable_logging=false on the socket address (enterprise accounts only). Today's client adds that parameter only as enable_logging=true and never sends false (gateway/src/core/stt/elevenlabs/client.rs:434-435), although its configuration defaults the flag to false (config.rs:341), so the vendor default applies."
+      }
+    },
+    {
+      "id": "elevenlabs:scribe_v1",
+      "match": {
+        "provider": "elevenlabs",
+        "model": "scribe_v1"
+      },
+      "lifecycle": {
+        "status": "retired",
+        "shutdown_on": "2026-07-09",
+        "replacement": [
+          "scribe_v2",
+          "scribe_v2_realtime"
+        ]
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/core/stt/elevenlabs/config.rs:391 (the live client rejects any id outside its realtime list, this one included)",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_model_retired",
+          "text": "ElevenLabs removed this model on 2026-07-09, so it can no longer be used. Choose scribe_v2_realtime for streaming, or scribe_v2 where segmented speech-to-text is enabled for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "No pricing_key is set because nothing can be billed on a retired model. gateway/src/config/pricing.rs:241 still holds an elevenlabs:scribe_v1 entry, with a 'min 15s billing' note that current vendor pages do not support; the entry should be removed."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://elevenlabs.io/docs/changelog/2026/6/8",
+          "https://elevenlabs.io/docs/overview/models",
+          "https://api.elevenlabs.io/openapi.json"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/elevenlabs/config.rs:189",
+          "gateway/src/core/stt/elevenlabs/config.rs:391",
+          "gateway/src/core/stt/elevenlabs/batch.rs:63-65"
+        ],
+        "unverified": [
+          "whether the id still resolves after the removal date (not tested)",
+          "lifecycle.deprecated_on (the removal was announced in the 2026-06-08 changelog; the first deprecation date is not in the evidence)",
+          "billing.unit, billing.min_billed_ms and billing.bills_silence (not applicable: the model is retired)"
+        ],
+        "notes": "Kept in the map so that a session naming it gets a clear refusal. Today the gateway would treat it as a file model, because any id outside the closed realtime list is one (gateway/src/core/stt/elevenlabs/batch.rs:63-65). The gateway's own upload code states that ElevenLabs removed the model on 2026-07-09 and that naming it gives a 422 on every request (comment at gateway/src/core/stt/elevenlabs/batch.rs:45-46); that is an assertion in code, not a recorded probe. Why the row has no transport (the version 1 reason, kept for the record): ElevenLabs scheduled the removal of this model for 2026-07-09 and the id no longer appears in the vendor's OpenAPI document, so no transport can reach it. It was a file-only model. A session that names it should be refused at setup with a pointer to scribe_v2 (file upload, segmented) or scribe_v2_realtime (streaming)."
+      }
+    },
+    {
+      "id": "elevenlabs:any-realtime-any",
+      "match": {
+        "provider": "elevenlabs",
+        "model_glob": "*realtime*"
+      },
+      "lifecycle": {
+        "status": "unknown"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/core/stt/elevenlabs/config.rs:391 (the live client rejects any id outside its realtime list, which holds only scribe_v2_realtime, config.rs:189)",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This ElevenLabs realtime model is not yet known to this gateway, so it cannot be used on a call. Choose scribe_v2_realtime for streaming, or scribe_v2 where segmented speech-to-text is enabled for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not applicable: the row only refuses."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-04",
+        "verified_by": "code_reading",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://elevenlabs.io/docs/overview/models"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/elevenlabs/config.rs:189",
+          "gateway/src/core/stt/elevenlabs/config.rs:391"
+        ],
+        "unverified": [
+          "whether ElevenLabs has published realtime ids other than scribe_v2_realtime after 2026-10-03"
+        ],
+        "notes": "Added 2026-10-04. ElevenLabs serves its realtime models only on its socket and its file endpoint does not accept them. Without this row an unknown realtime id would fall to the provider default row and, from Release 1, be uploaded to the file endpoint on every utterance. When ElevenLabs publishes a new realtime id, add an exact row with the native transport once the gateway's realtime list includes it."
+      }
+    },
+    {
+      "id": "elevenlabs:any",
+      "match": {
+        "provider": "elevenlabs",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "elevenlabs_batch",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_elevenlabs) is not built yet. Today a live session that names this model fails at setup, and the existing upload driver sends audio only at disconnect.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 5000000000,
+            "min_audio_ms": 100,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 12,
+                "plan": "starter",
+                "scope": "organisation",
+                "note": "Every HTTP request counts. Over the limit the vendor queues the request (about 50 ms) or answers 429 concurrent_limit_exceeded; the maximum-concurrent-requests response header carries the account's real ceiling."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20,
+                "plan": "creator",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 40,
+                "plan": "pro",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "organisation"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 60,
+                "plan": "business",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart",
+            "vendor_params": [
+              {
+                "name": "file_format",
+                "value": "other",
+                "in": "form"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [],
+            "wire": "elevenlabs_multipart",
+            "limit_headers": {
+              "concurrency_current": "current-concurrent-requests",
+              "concurrency_limit": "maximum-concurrent-requests"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:765-836 (build_elevenlabs_transcription_with); gateway/src/core/stt/elevenlabs/batch.rs:392-502 (multipart_fields); gateway/src/core/stt/prerecorded.rs:988 (parse_elevenlabs) and :286 (flush_buffer, takes &mut self)",
+            "notes": "No adapter exists. The request builder and the response parser already serve the upload route, but the driver's flush takes &mut self and runs only at disconnect, on a shared HTTP client with a 300 s timeout that is limited to HTTP/1.1 (prerecorded.rs:72, :177-185), so two uploads cannot be in flight. A live session that names a file model fails session setup with a named error (gateway/src/core/stt/elevenlabs/config.rs:391). The live request must differ from the upload route: send tag_audio_events=false (the vendor default is true and writes tokens such as (laughter) into the text; the parser removes them from the word list but not from the text, prerecorded.rs:1003-1008); send language_code when the language is known; keep timestamps_granularity=word, because per-word log-probability is the only quality signal; send at most 100 key terms and never transcript_edit. The parser hard-codes confidence 1.0 and drops language_probability and transcription_id (prerecorded.rs:1033-1048). The upload route overwrites the configured region with the driver's base URL (gateway/src/core/stt/batch.rs:776). The vendor says raw 16 kHz PCM with file_format=pcm_s16le_16 is faster than an encoded file; the builder always sends file_format=other (elevenlabs/batch.rs:488-500) and the switch waits for one live probe. For an unknown id the adapter sends no key terms (they carry a surcharge and their support per model is unknown) and reads no quality fields."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The upload route's shared client allows 300 s (gateway/src/core/stt/prerecorded.rs:72); the vendor audit proposes 8 s in total and 2 s to connect, about four times the only measured P99 (2.01 s). This is an inference, not a measurement, and must be replaced once the gateway has its own numbers; how processing time grows with segment length is unknown. The container stays 16 kHz mono PCM16 WAV with file_format=other until a live probe confirms the vendor's faster raw PCM option. Pre-roll, trailing silence, the 25 s maximum segment and two uploads in flight keep the defaults; the vendor's own limits (10 hours, 5 GB) never bind."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "per_request",
+              "param": {
+                "name": "enable_logging",
+                "value": "false",
+                "in": "query"
+              }
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/core/stt/elevenlabs/config.rs:391 (the live client rejects any id outside its realtime list)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "ElevenLabs streams only scribe_v2_realtime, so other model ids are treated as file transcription models, which this gateway does not yet serve on live calls. Use scribe_v2_realtime, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "conditional_minimums": [
+          {
+            "feature": "keyterms",
+            "above": 100,
+            "min_billed_ms": 20000
+          },
+          {
+            "feature": "transcript_edit",
+            "min_billed_ms": 10000
+          }
+        ],
+        "surcharges": [
+          {
+            "feature": "keyterms",
+            "percent": 20
+          },
+          {
+            "feature": "entity_detection",
+            "percent": 30
+          },
+          {
+            "feature": "transcript_edit",
+            "percent": 30
+          }
+        ],
+        "bills_silence": false,
+        "notes": "ElevenLabs bills speech-to-text per hour of audio for every model; the rate of an unknown id is unknown."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.elevenlabs.io/openapi.json",
+          "https://elevenlabs.io/docs/overview/models"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/elevenlabs/config.rs:189",
+          "gateway/src/core/stt/elevenlabs/config.rs:391",
+          "gateway/src/core/stt/elevenlabs/batch.rs:63-65",
+          "gateway/src/core/stt/elevenlabs/batch.rs:366-381"
+        ],
+        "unverified": [
+          "everything model-specific; the row carries only endpoint-level facts from the vendor's OpenAPI document (100 ms minimum audio, file under 5.0 GB, language_code field, file_format field)",
+          "billing.min_billed_ms (no base minimum is documented for the endpoint; request options can create one)",
+          "transports[0].latency (no figure can apply to an unknown model)",
+          "transports[0].limits.rates (the per-plan concurrency limits are stated for the speech-to-text endpoint, not per model; applying them to an unknown id is an inference)",
+          "transports[0].privacy (zero retention through enable_logging=false is for enterprise customers only; what another key receives when it sends the parameter is not documented)"
+        ],
+        "notes": "Fail-slow default for an ElevenLabs model id the map has never seen: assume a file model. This mirrors the gateway's own rule (one closed list of realtime ids at gateway/src/core/stt/elevenlabs/config.rs:189, everything else is a file model, elevenlabs/batch.rs:63-65) and the vendor's file endpoint, whose model_id is a free string. If ElevenLabs publishes another realtime id it lands here and is rejected by the file endpoint; it then needs its own exact row. Two ids seen only in the vendor's skills repository (scribe_v2_realtime_turbo, scribe_v2_realtime_lite) are not in the API reference and deliberately have no row."
+      }
+    }
+  ]
+}

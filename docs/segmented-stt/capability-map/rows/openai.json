@@ -1,0 +1,1874 @@
+{
+  "provider_id": "openai",
+  "provider": {
+    "aliases": [],
+    "default_model": "gpt-transcribe",
+    "model_string": "wire_model",
+    "key_normalisation": {
+      "strip_provider_prefix": true,
+      "placeholder_as_unset": true
+    },
+    "registered_in_gateway": true,
+    "production_base": "https://api.openai.com",
+    "base_url_convention": "origin",
+    "notes": "Registered as `openai` (gateway/src/plugin/builtin/mod.rs:1687); live sessions build it through create_stt_standard (gateway/src/core/stt/standard.rs:447). The existing client is HTTP request and response only. On a live call it buffers audio and uploads only at hang-up, when the buffer reaches 20 MB, or when the client ends its audio by hand (an audio_end message on /ws, or a buffer commit on the /v1/realtime cascade), because the default flush strategy is OnDisconnect and no configuration path sets another (gateway/src/core/stt/openai/config.rs:651; client.rs:793-823), so a normal call gets no transcript while it is in progress. Either act makes the voice manager disconnect and reconnect the client (gateway/src/handlers/ws/audio_handler.rs:301-322, also called from gateway/src/handlers/openai_realtime/cascade.rs:1353-1354; gateway/src/core/voice_manager/manager.rs:1648-1672), and the disconnect uploads the buffer (client.rs:886-897). A push-to-talk client that ends each utterance itself is therefore the one kind of session that gets usable text from this provider during a call today. The same disconnect clears the result callback (client.rs:902-903) and nothing registers it again, so a second such act in the same session probably delivers nothing (inferred from reading, not run). There is no streaming speech-to-text client for OpenAI, so no native transport appears in any row. default_model is gpt-transcribe by integration decision (section 15, awaiting sign-off), while today's code still resolves an empty model to whisper-1 (config.rs:63-67, :671-674), which the vendor removes on 2027-02-26; the code default has to move to gpt-transcribe with it. There is no model allow-list: unknown ids are sent verbatim (config.rs:671-693). OpenAI, self-hosted servers, Azure OpenAI, Groq and WaaV Infer speak the same multipart request: the adapters openai_transcriptions, azure_openai_transcriptions and groq_transcriptions are one implementation with different hosts, authentication and limits. For any id outside its three-entry model list the client labels the vendor call span with a family fallback instead of the id sent (client.rs:438-444; config.rs:109-115), which matters for per-model metering. The language a session configures is mapped to ISO 639-1, with `auto` omitted, before the client is built on the /ws path (gateway/src/handlers/ws/config.rs:475-504; gateway/src/core/lang/mappers/mod.rs:218-222); the segmented adapter must take that mapped value, while the DAG node passes its own default en-US unmapped (gateway/src/dag/nodes/provider.rs:334-343). Unlike self-hosted and Azure OpenAI deployments, which are refused before a client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and, for voice-agent legs, :815-826), an `openai` session is not refused today; both sites are where an interim refusal of OpenAI file models would go."
+  },
+  "rows": [
+    {
+      "id": "openai:gpt-transcribe",
+      "match": {
+        "provider": "openai",
+        "model": "gpt-transcribe"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the OpenAI client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "post_commit",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No published figure for this model on the file endpoint. The only OpenAI file-route number in the evidence is Pipecat's P99 of 2.01 s from end of speech to final transcript, attributed to gpt-4o-mini-transcribe."
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 500,
+                "plan": "tier_1",
+                "scope": "organisation"
+              },
+              {
+                "metric": "tokens",
+                "per": "minute",
+                "value": 200000,
+                "plan": "tier_1",
+                "scope": "organisation"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 30000,
+                "plan": "tier_5",
+                "scope": "organisation"
+              },
+              {
+                "metric": "tokens",
+                "per": "minute",
+                "value": 150000000,
+                "plan": "tier_5",
+                "scope": "organisation",
+                "note": "Read by the vendor audit on the model page; the fact-check confirmed the tier 5 request figure only."
+              }
+            ],
+            "assumed_plan": "tier_1",
+            "ramp": true
+          },
+          "upload": {
+            "accepted": [
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "languages",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              },
+              {
+                "kind": "keywords",
+                "wire_name": "keywords"
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/openai/client.rs:374 (flush_buffer, takes &mut self); gateway/src/core/stt/openai/config.rs:848-906 (transcription_text_fields)",
+            "notes": "No adapter exists. The request and response code lives inside the buffering client: flush_buffer wraps the whole buffered call in one WAV at the session sample rate, is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) and uses a 30 s timeout (client.rs:54). A stateless transcriber that takes one utterance has to be extracted from it. Field mapping must change for this model: the client sends the singular `language` field for every model (config.rs:856-858) and folds key terms into `prompt` (config.rs:773-777), while the vendor documents `languages[]` and `keywords[]` here and says not to send both language fields. The vendor call span is labelled with the model family fallback, not the id sent (client.rs:438-444), so this model is recorded as gpt-4o-transcribe. The model returns no confidence or log-probabilities; only a detected-language list, empty when not reliable. A tier 1 limit of 200,000 tokens per minute applies next to the 500 requests per minute. interim_results is post_commit because stream=true returns text deltas of an already uploaded file."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 30 s (gateway/src/core/stt/openai/client.rs:54), longer than a caller will wait; the vendor audit recommends 10 s, about five times the only published P99 for this endpoint (2.01 s). It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV), pre-roll, trailing silence, maximum segment and uploads in flight keep the defaults."
+          }
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "openai_realtime_transcription",
+          "enabled_from_release": 4,
+          "disabled_reason": "No gateway speech-to-text client speaks the OpenAI Realtime transcription socket (adapter commit_openai is not built). The /v1/realtime facade dials that socket only as a pass-through for customers who speak the Realtime protocol themselves.",
+          "interim_results": "post_commit",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No figure for gpt-transcribe on the socket. Pipecat measured a different model, gpt-4o-transcribe, on this socket with a client commit: median 637 ms, P95 965 ms, P99 1655 ms."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              24000
+            ],
+            "channels": 1
+          },
+          "commit": {
+            "audio_gating": "speech_only"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "languages",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              },
+              {
+                "kind": "keywords",
+                "wire_name": "keywords"
+              }
+            ],
+            "wire": "openai_realtime_ga"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/openai_realtime/upstream.rs:113-141 (pass-through facade, dials ?intent=transcription; not a BaseSTT client); gateway/src/core/realtime/openai/protocol.rs:75-90 (reusable audio format types)",
+            "notes": "The socket accepts only 24 kHz PCM or G.711 (mu-law or A-law), base64 inside input_audio_buffer.append, so wire audio at any other rate must be resampled. Completion events for different turns can arrive out of order and must be matched by item_id. A commit on an empty buffer is an error. The official WebSocket URL for a transcription session is unconfirmed: the gateway facade, Pipecat and LiveKit dial ?intent=transcription, while the vendor model pages name v1/realtime/transcription_sessions. For this model the socket transcribes only after input_audio_buffer.commit: audio is appended while the caller speaks and text deltas arrive after the commit. The gateway detector would send the commit at the same boundary where the file transport sends an upload."
+          },
+          "billing": {
+            "unit": "unknown",
+            "min_billed_ms": null,
+            "bills_silence": null,
+            "notes": "The vendor's cost guide says only that a different rate card applies on the Realtime socket; whether this model is billed at the file price there is not documented."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:651 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This model transcribes uploaded files and has no streaming interface. On this gateway it is not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Only uploaded segments are billed. Vendor price in the evidence is $0.0045 per audio minute. gateway/src/config/pricing.rs has no openai:gpt-transcribe entry yet (only openai:whisper-1), so no pricing_key is set. The response carries a usage object (seconds or tokens) that the gateway does not parse today."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/models/gpt-transcribe",
+          "https://developers.openai.com/api/docs/guides/speech-to-text",
+          "https://developers.openai.com/api/docs/guides/transcription",
+          "https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create",
+          "https://developers.openai.com/api/docs/guides/realtime-transcription",
+          "https://developers.openai.com/api/docs/guides/realtime-vad",
+          "https://developers.openai.com/api/docs/guides/realtime-costs",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/pricing",
+          "https://developers.openai.com/api/docs/guides/rate-limits",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:63-67",
+          "gateway/src/core/stt/openai/config.rs:97-104",
+          "gateway/src/core/stt/openai/config.rs:651",
+          "gateway/src/core/stt/openai/config.rs:671-693"
+        ],
+        "unverified": [
+          "transports[0].limits.max_audio_ms (no maximum duration is documented; community reports of about 1500 s are not official)",
+          "transports[0].limits.min_audio_ms (none documented)",
+          "transports[0].limits.rates (concurrent_requests) (none documented; limits are per minute)",
+          "transports[0].limits.rates (requests) (500 is usage tier 1, the lowest paid tier; higher tiers allow more)",
+          "transports[0].upload.preferred (OpenAI names no latency-preferred format; WAV is accepted)",
+          "billing.min_billed_ms (no minimum or rounding rule is documented)",
+          "transports[0].latency (no published figure for this model)",
+          "transports[0].dialect.response_formats (json is safe; the fact-check could not confirm the exact per-model restrictions)",
+          "transports[0].dialect.language_param (whether the API rejects or ignores a singular `language` for this model is unknown)",
+          "transports[1] endpointing_owner and vendor_turn_signal (whether this model accepts server voice-activity detection on the socket is inferred, not tested)",
+          "transports[1].limits.max_session_ms and rates (requests) (not on the pages fetched)",
+          "transports[1] socket URL (?intent=transcription is absent from official pages)",
+          "billing for transports[1] (the costs guide says only that a different rate card applies)",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)",
+          "transports[0].limits.rates (tokens, tier_5) (150,000,000 tokens per minute was read by the vendor audit on the model page; the fact-check confirmed the tier 5 request figure only)"
+        ],
+        "notes": "The vendor's recommended model for recorded speech. On the Realtime socket it starts transcribing only after a commit, so it must never be routed as a streaming model; the second transport records that route for the low-latency tier. The billing block describes the file transport."
+      }
+    },
+    {
+      "id": "openai:gpt-4o-transcribe",
+      "match": {
+        "provider": "openai",
+        "model": "gpt-4o-transcribe",
+        "model_aliases": [
+          "gpt4o-transcribe"
+        ]
+      },
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_on": "2026-08-26",
+        "shutdown_on": "2027-02-26",
+        "replacement": [
+          "gpt-transcribe",
+          "gpt-live-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the OpenAI client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "post_commit",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No published figure for this model on the file endpoint. The only OpenAI file-route number in the evidence is Pipecat's P99 of 2.01 s from end of speech to final transcript, attributed to gpt-4o-mini-transcribe."
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 500,
+                "plan": "tier_1",
+                "scope": "organisation"
+              },
+              {
+                "metric": "tokens",
+                "per": "minute",
+                "value": 10000,
+                "plan": "tier_1",
+                "scope": "organisation",
+                "note": "Binds long before the request limit: the limiter needs a token budget for this model."
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 10000,
+                "plan": "tier_5",
+                "scope": "organisation",
+                "note": "Read by the vendor audit on the model page; the fact-check did not re-read the tier 5 figures for this model."
+              },
+              {
+                "metric": "tokens",
+                "per": "minute",
+                "value": 6000000,
+                "plan": "tier_5",
+                "scope": "organisation",
+                "note": "Read by the vendor audit on the model page; the fact-check did not re-read the tier 5 figures for this model."
+              }
+            ],
+            "assumed_plan": "tier_1",
+            "ramp": true
+          },
+          "upload": {
+            "accepted": [
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "token_logprobs"
+          ],
+          "quality_signals_require": [
+            "response_format=json",
+            "include[]=logprobs"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/openai/client.rs:374 (flush_buffer, takes &mut self); gateway/src/core/stt/openai/config.rs:848-906 (transcription_text_fields)",
+            "notes": "No adapter exists. The request and response code lives inside the buffering client: flush_buffer wraps the whole buffered call in one WAV at the session sample rate, is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) and uses a 30 s timeout (client.rs:54). A stateless transcriber that takes one utterance has to be extracted from it. The tier 1 limit of 10,000 tokens per minute binds long before the 500 requests per minute; the limiter needs a token budget for this model. Token log-probabilities come back only with include[]=logprobs and the json format; the client's json response struct keeps only `text` today (gateway/src/core/stt/openai/messages.rs:15-19), so they are dropped. No timestamps, no no-speech probability, no detected language."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 30 s (gateway/src/core/stt/openai/client.rs:54), longer than a caller will wait; the vendor audit recommends 10 s, about five times the only published P99 for this endpoint (2.01 s). It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV), pre-roll, trailing silence, maximum segment and uploads in flight keep the defaults."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:651 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This model transcribes uploaded files and has no streaming interface. On this gateway it is not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_token",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Priced per token ($2.50 input and $10 output per million; the vendor estimates $0.006 per audio minute). Only uploaded segments are billed. No openai:gpt-4o-transcribe entry in gateway/src/config/pricing.rs, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/models/gpt-4o-transcribe",
+          "https://developers.openai.com/api/docs/guides/speech-to-text",
+          "https://developers.openai.com/api/docs/guides/transcription",
+          "https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/deprecations",
+          "https://developers.openai.com/api/docs/pricing",
+          "https://developers.openai.com/api/docs/guides/rate-limits",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:97-104",
+          "gateway/src/core/stt/openai/config.rs:651"
+        ],
+        "unverified": [
+          "transports[0].limits.max_audio_ms (no maximum duration is documented; community reports of about 1500 s are not official)",
+          "transports[0].limits.min_audio_ms (none documented)",
+          "transports[0].limits.rates (concurrent_requests) (none documented; limits are per minute)",
+          "transports[0].limits.rates (requests) (500 is usage tier 1, the lowest paid tier; higher tiers allow more)",
+          "transports[0].upload.preferred (OpenAI names no latency-preferred format; WAV is accepted)",
+          "billing.min_billed_ms (no minimum or rounding rule is documented)",
+          "transports[0].latency (no published figure for this model on the file endpoint)",
+          "whether a Realtime transcription session accepts this model (official pages conflict)",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)",
+          "transports[0].limits.rates (tier_5 entries) (10,000 requests and 6,000,000 tokens per minute were read by the vendor audit on the model page and not re-read by the fact-check)"
+        ],
+        "notes": "Vendor pages conflict on whether this model is accepted in a Realtime transcription session: its model page says Realtime transcription is not supported, while the session reference lists it as an option. The fact-check says not to add a socket transport without a live test, so none is listed. Third-party evidence exists: Pipecat's benchmark ran this model over the socket (median 637 ms, P99 1655 ms). Deprecated on 2026-08-26 and removed on 2027-02-26; the vendor names gpt-transcribe or gpt-live-transcribe as the replacement. The API reference sentence that json is the only supported response format for gpt-4o-transcribe and gpt-4o-mini-transcribe was re-read in the copy of the page the audit saved; the fact-check's own fetch had not returned that section."
+      }
+    },
+    {
+      "id": "openai:gpt-4o-mini-transcribe",
+      "match": {
+        "provider": "openai",
+        "model": "gpt-4o-mini-transcribe",
+        "model_aliases": [
+          "gpt4o-mini-transcribe"
+        ]
+      },
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_on": "2026-08-26",
+        "shutdown_on": "2027-02-26",
+        "replacement": [
+          "gpt-transcribe",
+          "gpt-live-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the OpenAI client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "post_commit",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 2010,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "measured_on": "2026-02-09",
+                "conditions": "Pipecat constant OPENAI_TTFS_P99 = 2.01 s: end of speech to final transcript for its voice-activity-segmented file service, including a 200 ms detector stop delay. The Pipecat benchmark harness builds that service with gpt-4o-mini-transcribe (https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/src/stt_benchmark/services.py, reported by the real-time levers research; the vendor audit could not attribute the model). The constant has not changed since 2026-02-09. No median is published.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 500,
+                "plan": "tier_1",
+                "scope": "organisation"
+              },
+              {
+                "metric": "tokens",
+                "per": "minute",
+                "value": 50000,
+                "plan": "tier_1",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "tier_1",
+            "ramp": true
+          },
+          "upload": {
+            "accepted": [
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "token_logprobs"
+          ],
+          "quality_signals_require": [
+            "response_format=json",
+            "include[]=logprobs"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/openai/client.rs:374 (flush_buffer, takes &mut self); gateway/src/core/stt/openai/config.rs:848-906 (transcription_text_fields)",
+            "notes": "No adapter exists. The request and response code lives inside the buffering client: flush_buffer wraps the whole buffered call in one WAV at the session sample rate, is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) and uses a 30 s timeout (client.rs:54). A stateless transcriber that takes one utterance has to be extracted from it. A tier 1 limit of 50,000 tokens per minute applies next to the 500 requests per minute. Token log-probabilities come back only with include[]=logprobs and the json format; the client's json response struct keeps only `text` today (gateway/src/core/stt/openai/messages.rs:15-19), so they are dropped."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 30 s (gateway/src/core/stt/openai/client.rs:54), longer than a caller will wait; the vendor audit recommends 10 s, about five times the only published P99 for this endpoint (2.01 s). It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV), pre-roll, trailing silence, maximum segment and uploads in flight keep the defaults."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:651 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This model transcribes uploaded files and has no streaming interface. On this gateway it is not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_token",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Priced per token ($1.25 input and $5 output per million; the vendor estimates $0.003 per audio minute). Only uploaded segments are billed. No openai:gpt-4o-mini-transcribe entry in gateway/src/config/pricing.rs, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/models/gpt-4o-mini-transcribe",
+          "https://developers.openai.com/api/docs/guides/speech-to-text",
+          "https://developers.openai.com/api/docs/guides/transcription",
+          "https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/deprecations",
+          "https://developers.openai.com/api/docs/pricing",
+          "https://developers.openai.com/api/docs/guides/rate-limits",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:97-104",
+          "gateway/src/core/stt/openai/config.rs:651"
+        ],
+        "unverified": [
+          "transports[0].limits.max_audio_ms (no maximum duration is documented; community reports of about 1500 s are not official)",
+          "transports[0].limits.min_audio_ms (none documented)",
+          "transports[0].limits.rates (concurrent_requests) (none documented; limits are per minute)",
+          "transports[0].limits.rates (requests) (500 is usage tier 1, the lowest paid tier; higher tiers allow more)",
+          "transports[0].upload.preferred (OpenAI names no latency-preferred format; WAV is accepted)",
+          "billing.min_billed_ms (no minimum or rounding rule is documented)",
+          "transports[0].latency (third-party P99 only; the model attribution comes from the benchmark harness, not from the vendor audit; no median exists)",
+          "whether a Realtime transcription session accepts this model (official pages conflict)",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)"
+        ],
+        "notes": "Vendor pages conflict on whether this model is accepted in a Realtime transcription session: its model page says Realtime transcription is not supported, while the session reference lists it as an option. The fact-check says not to add a socket transport without a live test, so none is listed. This id is an alias; the vendor's current snapshot behind it is gpt-4o-mini-transcribe-2025-12-15. Deprecated on 2026-08-26 and removed on 2027-02-26. The API reference sentence that json is the only supported response format for gpt-4o-transcribe and gpt-4o-mini-transcribe was re-read in the copy of the page the audit saved; the fact-check's own fetch had not returned that section."
+      }
+    },
+    {
+      "id": "openai:gpt-4o-mini-transcribe-2025-12-15",
+      "match": {
+        "provider": "openai",
+        "model": "gpt-4o-mini-transcribe-2025-12-15"
+      },
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_on": "2026-08-26",
+        "shutdown_on": "2027-02-26",
+        "dates_basis": "inferred",
+        "replacement": [
+          "gpt-transcribe",
+          "gpt-live-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the OpenAI client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "post_commit",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No published figure for this model on the file endpoint. The only OpenAI file-route number in the evidence is Pipecat's P99 of 2.01 s from end of speech to final transcript, attributed to gpt-4o-mini-transcribe. That figure was recorded against the alias, not this dated snapshot."
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 500,
+                "plan": "tier_1",
+                "scope": "organisation"
+              },
+              {
+                "metric": "tokens",
+                "per": "minute",
+                "value": 50000,
+                "plan": "tier_1",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "tier_1",
+            "ramp": true
+          },
+          "upload": {
+            "accepted": [
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "token_logprobs"
+          ],
+          "quality_signals_require": [
+            "response_format=json",
+            "include[]=logprobs"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/openai/client.rs:374 (flush_buffer, takes &mut self); gateway/src/core/stt/openai/config.rs:848-906 (transcription_text_fields)",
+            "notes": "No adapter exists. The request and response code lives inside the buffering client: flush_buffer wraps the whole buffered call in one WAV at the session sample rate, is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) and uses a 30 s timeout (client.rs:54). A stateless transcriber that takes one utterance has to be extracted from it. Dated snapshot; the gateway has no enum entry for it and sends the id verbatim (config.rs:671-693). The vendor names this snapshot explicitly in the file API model list and in the log-probabilities note. A tier 1 limit of 50,000 tokens per minute applies."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 30 s (gateway/src/core/stt/openai/client.rs:54), longer than a caller will wait; the vendor audit recommends 10 s, about five times the only published P99 for this endpoint (2.01 s). It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV), pre-roll, trailing silence, maximum segment and uploads in flight keep the defaults."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:651 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This model transcribes uploaded files and has no streaming interface. On this gateway it is not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_token",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Same token pricing as gpt-4o-mini-transcribe. Only uploaded segments are billed. No pricing entry in gateway/src/config/pricing.rs, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create",
+          "https://raw.githubusercontent.com/openai/openai-python/main/src/openai/types/audio_model.py",
+          "https://developers.openai.com/api/docs/models/gpt-4o-mini-transcribe",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/deprecations",
+          "https://developers.openai.com/api/docs/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:651",
+          "gateway/src/core/stt/openai/config.rs:671-693"
+        ],
+        "unverified": [
+          "transports[0].limits.max_audio_ms (no maximum duration is documented; community reports of about 1500 s are not official)",
+          "transports[0].limits.min_audio_ms (none documented)",
+          "transports[0].limits.rates (concurrent_requests) (none documented; limits are per minute)",
+          "transports[0].limits.rates (requests) (500 is usage tier 1, the lowest paid tier; higher tiers allow more)",
+          "transports[0].upload.preferred (OpenAI names no latency-preferred format; WAV is accepted)",
+          "billing.min_billed_ms (no minimum or rounding rule is documented)",
+          "lifecycle (the deprecation notice names the alias gpt-4o-mini-transcribe, not this snapshot; the row assumes the snapshot is removed with its alias on 2027-02-26)",
+          "transports[0].latency (no figure for the snapshot)",
+          "transports[0].dialect.response_formats (the API reference names gpt-4o-transcribe and gpt-4o-mini-transcribe in its 'json only' sentence, not this snapshot; applying it here is an inference)",
+          "whether a Realtime transcription session accepts this model (official pages conflict)",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)"
+        ],
+        "notes": "The snapshot that the alias gpt-4o-mini-transcribe points to. Vendor pages conflict on whether this model is accepted in a Realtime transcription session: its model page says Realtime transcription is not supported, while the session reference lists it as an option. The fact-check says not to add a socket transport without a live test, so none is listed."
+      }
+    },
+    {
+      "id": "openai:gpt-4o-mini-transcribe-2025-03-20",
+      "match": {
+        "provider": "openai",
+        "model": "gpt-4o-mini-transcribe-2025-03-20"
+      },
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_on": "2026-07-20",
+        "shutdown_on": "2027-01-20",
+        "replacement": [
+          "gpt-4o-mini-transcribe-2025-12-15"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the OpenAI client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No published figure for this model on the file endpoint. The only OpenAI file-route number in the evidence is Pipecat's P99 of 2.01 s from end of speech to final transcript, attributed to gpt-4o-mini-transcribe."
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 500,
+                "plan": "tier_1",
+                "scope": "organisation"
+              }
+            ],
+            "assumed_plan": "tier_1",
+            "ramp": true
+          },
+          "upload": {
+            "accepted": [
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/openai/client.rs:374 (flush_buffer, takes &mut self); gateway/src/core/stt/openai/config.rs:848-906 (transcription_text_fields)",
+            "notes": "No adapter exists. The request and response code lives inside the buffering client: flush_buffer wraps the whole buffered call in one WAV at the session sample rate, is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) and uses a 30 s timeout (client.rs:54). A stateless transcriber that takes one utterance has to be extracted from it. Older dated snapshot, still listed on the model page, sent verbatim by the gateway. The row is deliberately conservative: no log-probabilities and no streamed text are assumed, because the vendor's log-probabilities note names only the alias and the 2025-12-15 snapshot."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 30 s (gateway/src/core/stt/openai/client.rs:54), longer than a caller will wait; the vendor audit recommends 10 s, about five times the only published P99 for this endpoint (2.01 s). It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV), pre-roll, trailing silence, maximum segment and uploads in flight keep the defaults."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:651 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This model transcribes uploaded files and has no streaming interface. On this gateway it is not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_token",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Assumed to share the token pricing of gpt-4o-mini-transcribe. No pricing entry in gateway/src/config/pricing.rs, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/deprecations",
+          "https://developers.openai.com/api/docs/models/gpt-4o-mini-transcribe",
+          "https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:651",
+          "gateway/src/core/stt/openai/config.rs:671-693"
+        ],
+        "unverified": [
+          "transports[0].limits.max_audio_ms (no maximum duration is documented; community reports of about 1500 s are not official)",
+          "transports[0].limits.min_audio_ms (none documented)",
+          "transports[0].limits.rates (concurrent_requests) (none documented; limits are per minute)",
+          "transports[0].limits.rates (requests) (500 is usage tier 1, the lowest paid tier; higher tiers allow more)",
+          "transports[0].upload.preferred (OpenAI names no latency-preferred format; WAV is accepted)",
+          "billing.min_billed_ms (no minimum or rounding rule is documented)",
+          "whether the file endpoint still accepts this id (the model page lists it as an available snapshot, but it is absent from the model list in the file API reference; the deprecations page schedules its shutdown for 2027-01-20)",
+          "transports[0].interim_results and quality_signals (stream and log-probability support are unverified for this snapshot)",
+          "transports[0].latency (no figure)",
+          "billing.unit (inferred from the alias)",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)"
+        ],
+        "notes": "Listed as an available snapshot on the gpt-4o-mini-transcribe model page and scheduled on the deprecations page for shutdown on 2027-01-20, with gpt-4o-mini-transcribe-2025-12-15 as its replacement; that replacement is itself removed on 2027-02-26. The id is absent from the model list in the file API reference and from the Realtime session reference. New deployments should use gpt-transcribe. The announcement date comes from the deprecations page itself, whose entry dated 2026-07-20 lists this snapshot among the legacy audio, realtime and transcription models removed on 2027-01-20; it was read in the copy of that page the audit saved, because the audit and the fact-check quote only the shutdown date."
+      }
+    },
+    {
+      "id": "openai:gpt-4o-transcribe-diarize",
+      "match": {
+        "provider": "openai",
+        "model": "gpt-4o-transcribe-diarize"
+      },
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_on": "2026-08-26",
+        "shutdown_on": "2027-02-26",
+        "replacement": [
+          "gpt-transcribe",
+          "gpt-live-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the OpenAI client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No published figure for this model on the file endpoint. The only OpenAI file-route number in the evidence is Pipecat's P99 of 2.01 s from end of speech to final transcript, attributed to gpt-4o-mini-transcribe."
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 500,
+                "plan": "tier_1",
+                "scope": "organisation"
+              },
+              {
+                "metric": "tokens",
+                "per": "minute",
+                "value": 10000,
+                "plan": "tier_1",
+                "scope": "organisation",
+                "note": "Binds before the request limit."
+              }
+            ],
+            "assumed_plan": "tier_1",
+            "ramp": true
+          },
+          "upload": {
+            "accepted": [
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [],
+            "response_formats": [
+              "json",
+              "text",
+              "diarized_json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/openai/client.rs:374 (flush_buffer, takes &mut self); gateway/src/core/stt/openai/config.rs:848-906 (transcription_text_fields)",
+            "notes": "No adapter exists. The request and response code lives inside the buffering client: flush_buffer wraps the whole buffered call in one WAV at the session sample rate, is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) and uses a 30 s timeout (client.rs:54). A stateless transcriber that takes one utterance has to be extracted from it. max_audio_seconds is 30 because the vendor requires chunking_strategy for longer audio and the live adapter should not send it. The model takes no prompt and returns no log-probabilities; diarized_json adds speaker, start and end per segment. A tier 1 limit of 10,000 tokens per minute binds before the 500 requests per minute."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 30 s (gateway/src/core/stt/openai/client.rs:54), longer than a caller will wait; the vendor audit recommends 10 s, about five times the only published P99 for this endpoint (2.01 s). It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV), pre-roll, trailing silence, maximum segment and uploads in flight keep the defaults. Do not raise the 25 s maximum segment for this model: 25 s plus padding stays under the 30 s point where the vendor requires chunking_strategy."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:651 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This model transcribes uploaded files and has no streaming interface. On this gateway it is not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_token",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Priced per token ($2.50 input and $10 output per million; the vendor estimates $0.006 per audio minute). Only uploaded segments are billed. No pricing entry in gateway/src/config/pricing.rs, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/models/gpt-4o-transcribe-diarize",
+          "https://developers.openai.com/api/docs/guides/speech-to-text",
+          "https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/deprecations",
+          "https://developers.openai.com/api/docs/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:651",
+          "gateway/src/core/stt/openai/config.rs:671-693"
+        ],
+        "unverified": [
+          "transports[0].limits.min_audio_ms (none documented)",
+          "transports[0].limits.rates (concurrent_requests) (none documented)",
+          "transports[0].limits.rates (requests) (500 is usage tier 1, the lowest paid tier)",
+          "transports[0].interim_results (whether stream=true works with this model is not stated; none is the safe value)",
+          "transports[0].latency (no figure; speaker labelling may add time)",
+          "transports[0].upload.preferred (OpenAI names no latency-preferred format)",
+          "billing.min_billed_ms (none documented)",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)"
+        ],
+        "notes": "File endpoint only. The Realtime session reference lists this model as an option while the guide and the model page say speaker labelling is not supported in Realtime transcription sessions; no socket transport is listed. The vendor names gpt-live-transcribe or gpt-transcribe as the replacement; the evidence does not say that either labels speakers."
+      }
+    },
+    {
+      "id": "openai:whisper-1",
+      "match": {
+        "provider": "openai",
+        "model": "whisper-1",
+        "model_aliases": [
+          "whisper",
+          "whisper1"
+        ]
+      },
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_on": "2026-08-26",
+        "shutdown_on": "2027-02-26",
+        "replacement": [
+          "gpt-transcribe",
+          "gpt-live-transcribe"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the OpenAI client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No published figure for this model on the file endpoint. The only OpenAI file-route number in the evidence is Pipecat's P99 of 2.01 s from end of speech to final transcript, attributed to gpt-4o-mini-transcribe."
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "context_window_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 500,
+                "plan": "tier_1",
+                "scope": "organisation"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 10000,
+                "plan": "tier_5",
+                "scope": "organisation",
+                "note": "Read by the vendor audit on the model page; the fact-check did not re-read the tier 5 figures for this model."
+              }
+            ],
+            "assumed_plan": "tier_1",
+            "ramp": true
+          },
+          "upload": {
+            "accepted": [
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "wav",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "segment_no_speech_prob",
+            "segment_avg_logprob",
+            "segment_compression_ratio",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "response_format=verbose_json"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_tokens": 224
+              }
+            ],
+            "response_formats": [
+              "verbose_json",
+              "json",
+              "text",
+              "srt",
+              "vtt"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/openai/client.rs:374 (flush_buffer, takes &mut self); gateway/src/core/stt/openai/config.rs:848-906 (transcription_text_fields)",
+            "notes": "No adapter exists. The request and response code lives inside the buffering client: flush_buffer wraps the whole buffered call in one WAV at the session sample rate, is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) and uses a 30 s timeout (client.rs:54). A stateless transcriber that takes one utterance has to be extracted from it. The only OpenAI model with segment-level quality fields. The client already requests verbose_json for it and derives a confidence from avg_logprob, but parses no_speech_prob and compression_ratio without reading them (gateway/src/core/stt/openai/messages.rs:66-76). The prompt is limited to 224 tokens. stream=true is ignored by this model. Do not request word timestamps on live segments: the vendor says they add latency."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 30 s (gateway/src/core/stt/openai/client.rs:54), longer than a caller will wait; the vendor audit recommends 10 s, about five times the only published P99 for this endpoint (2.01 s). It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV), pre-roll, trailing silence, maximum segment and uploads in flight keep the defaults."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:651 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This model transcribes uploaded files and has no streaming interface. On this gateway it is not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "pricing_key": "openai:whisper-1",
+        "notes": "Only uploaded segments are billed. pricing_key exists at gateway/src/config/pricing.rs:164."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/models/whisper-1",
+          "https://developers.openai.com/api/docs/guides/speech-to-text",
+          "https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/deprecations",
+          "https://developers.openai.com/api/docs/pricing",
+          "https://developers.openai.com/api/docs/guides/rate-limits"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:63-67",
+          "gateway/src/core/stt/openai/config.rs:97-104",
+          "gateway/src/core/stt/openai/config.rs:651"
+        ],
+        "unverified": [
+          "transports[0].limits.max_audio_ms (no maximum duration is documented; community reports of about 1500 s are not official)",
+          "transports[0].limits.min_audio_ms (none documented)",
+          "transports[0].limits.rates (concurrent_requests) (none documented; limits are per minute)",
+          "transports[0].limits.rates (requests) (500 is usage tier 1, the lowest paid tier; higher tiers allow more)",
+          "transports[0].upload.preferred (OpenAI names no latency-preferred format; WAV is accepted)",
+          "billing.min_billed_ms (no minimum or rounding rule is documented)",
+          "transports[0].limits.context_window_ms (the 30 s Whisper window comes from the design brief and was not re-fetched)",
+          "transports[0].latency (no published figure for this model)",
+          "whether a Realtime transcription session accepts this model (the session reference and the costs guide list it; its model page says not supported)",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)",
+          "transports[0].limits.rates (requests, tier_5) (10,000 requests per minute was read by the vendor audit on the model page and not re-read by the fact-check)"
+        ],
+        "notes": "The model an empty model id resolves to today (gateway/src/core/stt/openai/config.rs:65-67 and :671-674). Deprecated on 2026-08-26 and removed on 2027-02-26. Also the only model on the English translation endpoint. No socket transport is listed because the documents conflict."
+      }
+    },
+    {
+      "id": "openai:gpt-live-transcribe",
+      "match": {
+        "provider": "openai",
+        "model": "gpt-live-transcribe"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "openai_realtime_transcription",
+          "enabled_from_release": 4,
+          "disabled_reason": "No gateway speech-to-text client speaks the OpenAI Realtime transcription socket (adapter commit_openai is not built). The /v1/realtime facade dials that socket only as a pass-through for customers who speak the Realtime protocol themselves.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No published figure for this model."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 500,
+                "plan": "tier_1",
+                "scope": "organisation",
+                "note": "What counts as a request on the socket is not stated. Read by the vendor audit on the model page; the fact-check did not re-confirm it."
+              },
+              {
+                "metric": "tokens",
+                "per": "minute",
+                "value": 60000,
+                "plan": "tier_1",
+                "scope": "organisation",
+                "note": "Read by the vendor audit on the model page; the fact-check did not re-confirm it."
+              }
+            ],
+            "assumed_plan": "tier_1"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              24000
+            ],
+            "channels": 1
+          },
+          "commit": {
+            "audio_gating": "speech_only"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "languages",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              },
+              {
+                "kind": "keywords",
+                "wire_name": "keywords"
+              }
+            ],
+            "wire": "openai_realtime_ga"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/openai_realtime/upstream.rs:113-141 (pass-through facade, dials ?intent=transcription; not a BaseSTT client); gateway/src/core/realtime/openai/protocol.rs:75-90 (reusable audio format types)",
+            "notes": "The socket accepts only 24 kHz PCM or G.711 (mu-law or A-law), base64 inside input_audio_buffer.append, so wire audio at any other rate must be resampled. Completion events for different turns can arrive out of order and must be matched by item_id. A commit on an empty buffer is an error. The official WebSocket URL for a transcription session is unconfirmed: the gateway facade, Pipecat and LiveKit dial ?intent=transcription, while the vendor model pages name v1/realtime/transcription_sessions. Text deltas arrive while the caller speaks; turn detection must be omitted or null. The model returns no word timestamps, speaker labels or confidence scores. The model page gives tier 1 limits of 500 requests and 60,000 tokens per minute (read by the audit and present in the copy of the page it saved; the fact-check did not re-confirm them). What counts as a request on a socket is not stated, so the field is null."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:671-693 (an id outside the client's model list is sent verbatim to the file endpoint, at hang-up or a client commit because of :651)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "OpenAI serves this model only over its live transcription socket, and this gateway does not yet have a client for that socket; the file endpoint the gateway uses for OpenAI today does not accept the model. Choose gpt-transcribe or a streaming transcription model from another provider."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Streaming transcription sessions are billed by audio duration; vendor price in the evidence is $0.017 per audio minute, 3.8 times gpt-transcribe. Whether silence streamed between commits is billed is unknown. No pricing entry in gateway/src/config/pricing.rs, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/models/gpt-live-transcribe",
+          "https://developers.openai.com/api/docs/guides/realtime-transcription",
+          "https://developers.openai.com/api/docs/guides/realtime-vad",
+          "https://developers.openai.com/api/docs/guides/realtime-costs",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/pricing",
+          "https://developers.openai.com/api/docs/guides/transcription"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:651",
+          "gateway/src/core/stt/openai/config.rs:671-693"
+        ],
+        "unverified": [
+          "transports[0].latency (no published figure)",
+          "transports[0].limits.max_session_ms (not on the pages fetched)",
+          "transports[0].limits.rates (requests and tokens) (the model page gives 500 requests and 60,000 tokens per minute at tier 1; the fact-check did not re-confirm them, and what counts as a request on a socket is not stated)",
+          "transports[0] socket URL (?intent=transcription is absent from official pages)",
+          "transports[0].quality_signals (the guide lists timestamps, speaker labels and confidence as absent; whether a detected language is returned is unconfirmed)",
+          "whether the `delay` setting applies to this model (the session reference says gpt-realtime-whisper only; the guide suggests otherwise)",
+          "billing.bills_silence and billing.min_billed_ms",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)"
+        ],
+        "notes": "The vendor's recommended model for live audio. Realtime-only: the file endpoint does not serve this model, so file-upload segmentation is not possible. It rejects server voice-activity detection, so the client must detect the end of speech and send input_audio_buffer.commit; the gateway's own detector therefore owns the utterance boundary while text deltas arrive during speech. Until the socket client exists a live call cannot use this model. Today the gateway accepts the id, posts it to the file endpoint and fails only at its first upload, which is normally at hang-up, because there is no model allow-list (gateway/src/core/stt/openai/config.rs:671-693)."
+      }
+    },
+    {
+      "id": "openai:gpt-live-transcribe-any",
+      "match": {
+        "provider": "openai",
+        "model_glob": "gpt-live-transcribe*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "openai_realtime_transcription",
+          "enabled_from_release": 4,
+          "disabled_reason": "No gateway speech-to-text client speaks the OpenAI Realtime transcription socket (adapter commit_openai is not built). The /v1/realtime facade dials that socket only as a pass-through for customers who speak the Realtime protocol themselves.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No published figure for this model."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 500,
+                "plan": "tier_1",
+                "scope": "organisation",
+                "note": "What counts as a request on the socket is not stated. Read by the vendor audit on the model page; the fact-check did not re-confirm it."
+              },
+              {
+                "metric": "tokens",
+                "per": "minute",
+                "value": 60000,
+                "plan": "tier_1",
+                "scope": "organisation",
+                "note": "Read by the vendor audit on the model page; the fact-check did not re-confirm it."
+              }
+            ],
+            "assumed_plan": "tier_1"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              24000
+            ],
+            "channels": 1
+          },
+          "commit": {
+            "audio_gating": "speech_only"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "languages",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              },
+              {
+                "kind": "keywords",
+                "wire_name": "keywords"
+              }
+            ],
+            "wire": "openai_realtime_ga"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/openai_realtime/upstream.rs:113-141 (pass-through facade, dials ?intent=transcription; not a BaseSTT client); gateway/src/core/realtime/openai/protocol.rs:75-90 (reusable audio format types)",
+            "notes": "The socket accepts only 24 kHz PCM or G.711 (mu-law or A-law), base64 inside input_audio_buffer.append, so wire audio at any other rate must be resampled. Completion events for different turns can arrive out of order and must be matched by item_id. A commit on an empty buffer is an error. The official WebSocket URL for a transcription session is unconfirmed: the gateway facade, Pipecat and LiveKit dial ?intent=transcription, while the vendor model pages name v1/realtime/transcription_sessions. Text deltas arrive while the caller speaks; turn detection must be omitted or null. The model returns no word timestamps, speaker labels or confidence scores. The model page gives tier 1 limits of 500 requests and 60,000 tokens per minute (read by the audit and present in the copy of the page it saved; the fact-check did not re-confirm them). What counts as a request on a socket is not stated, so the field is null."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:671-693 (an id outside the client's model list is sent verbatim to the file endpoint, at hang-up or a client commit because of :651)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "OpenAI serves this model only over its live transcription socket, and this gateway does not yet have a client for that socket; the file endpoint the gateway uses for OpenAI today does not accept the model. Choose gpt-transcribe or a streaming transcription model from another provider."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Streaming transcription sessions are billed by audio duration; vendor price in the evidence is $0.017 per audio minute, 3.8 times gpt-transcribe. Whether silence streamed between commits is billed is unknown. No pricing entry in gateway/src/config/pricing.rs, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/models/gpt-live-transcribe",
+          "https://developers.openai.com/api/docs/guides/realtime-transcription",
+          "https://developers.openai.com/api/docs/guides/realtime-vad",
+          "https://developers.openai.com/api/docs/guides/realtime-costs",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/pricing",
+          "https://developers.openai.com/api/docs/guides/transcription"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:651",
+          "gateway/src/core/stt/openai/config.rs:671-693"
+        ],
+        "unverified": [
+          "that every dated snapshot of gpt-live-transcribe behaves like the alias (inferred from OpenAI's naming practice; no snapshot of this model is listed in the evidence)",
+          "transports[0].latency (no published figure)",
+          "transports[0].limits.max_session_ms (not on the pages fetched)",
+          "transports[0].limits.rates (requests and tokens) (the model page gives 500 requests and 60,000 tokens per minute at tier 1; the fact-check did not re-confirm them, and what counts as a request on a socket is not stated)",
+          "transports[0] socket URL (?intent=transcription is absent from official pages)",
+          "transports[0].quality_signals (the guide lists timestamps, speaker labels and confidence as absent; whether a detected language is returned is unconfirmed)",
+          "whether the `delay` setting applies to this model (the session reference says gpt-realtime-whisper only; the guide suggests otherwise)",
+          "billing.bills_silence and billing.min_billed_ms",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)"
+        ],
+        "notes": "Family row for dated snapshots of gpt-live-transcribe, added 2026-10-04 after the reference resolver showed that such an id would otherwise fall to the provider default row and be uploaded to the file endpoint, which rejects live-only models. Same transports and refusal as the exact row. The vendor's recommended model for live audio. Realtime-only: the file endpoint does not serve this model, so file-upload segmentation is not possible. It rejects server voice-activity detection, so the client must detect the end of speech and send input_audio_buffer.commit; the gateway's own detector therefore owns the utterance boundary while text deltas arrive during speech. Until the socket client exists a live call cannot use this model. Today the gateway accepts the id, posts it to the file endpoint and fails only at its first upload, which is normally at hang-up, because there is no model allow-list (gateway/src/core/stt/openai/config.rs:671-693)."
+      }
+    },
+    {
+      "id": "openai:gpt-realtime-whisper",
+      "match": {
+        "provider": "openai",
+        "model": "gpt-realtime-whisper"
+      },
+      "lifecycle": {
+        "status": "legacy"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "openai_realtime_transcription",
+          "enabled_from_release": 4,
+          "disabled_reason": "No gateway speech-to-text client speaks the OpenAI Realtime transcription socket (adapter commit_openai is not built). The /v1/realtime facade dials that socket only as a pass-through for customers who speak the Realtime protocol themselves.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "fast",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1080,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Pipecat stt-benchmark, 1000 samples from pipecat-ai/smart-turn-data-v3.1-train, Pipecat's own Realtime client with a client-side commit; end of speech to final transcript including a 200 ms detector stop delay; P95 878 ms. Not measured through the gateway.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              },
+              {
+                "percentile": "p50",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 740,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Same Pipecat benchmark run as the p99 entry.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              },
+              {
+                "percentile": "p95",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 878,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Same Pipecat benchmark run as the p99 entry.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": [
+              {
+                "metric": "audio_seconds",
+                "per": "minute",
+                "value": 6000,
+                "plan": "tier_1",
+                "scope": "organisation",
+                "note": "100 minutes of audio per minute."
+              }
+            ],
+            "assumed_plan": "tier_1"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              24000
+            ],
+            "channels": 1
+          },
+          "commit": {
+            "audio_gating": "speech_only"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [],
+            "wire": "openai_realtime_ga"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/openai_realtime/upstream.rs:113-141 (pass-through facade, dials ?intent=transcription; not a BaseSTT client); gateway/src/core/realtime/openai/protocol.rs:75-90 (reusable audio format types)",
+            "notes": "The socket accepts only 24 kHz PCM or G.711 (mu-law or A-law), base64 inside input_audio_buffer.append, so wire audio at any other rate must be resampled. Completion events for different turns can arrive out of order and must be matched by item_id. A commit on an empty buffer is an error. The official WebSocket URL for a transcription session is unconfirmed: the gateway facade, Pipecat and LiveKit dial ?intent=transcription, while the vendor model pages name v1/realtime/transcription_sessions. Text deltas arrive while the caller speaks; turn detection must be null. The model takes no prompt and has a `delay` setting (minimal to xhigh). The tier 1 limit is 100 minutes of audio per minute, which the limits block cannot express. The gateway's family test is a prefix check for 'whisper' (gateway/src/core/stt/openai/config.rs:710-714), so today it would treat this id as a non-Whisper file model."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:671-693 (an id outside the client's model list is sent verbatim to the file endpoint, at hang-up or a client commit because of :651)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "OpenAI serves this model only over its live transcription socket, and this gateway does not yet have a client for that socket; the file endpoint the gateway uses for OpenAI today does not accept the model. Choose gpt-transcribe or a streaming transcription model from another provider."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Billed by audio duration; vendor price in the evidence is $0.017 per audio minute. Whether silence streamed between commits is billed is unknown. No pricing entry in gateway/src/config/pricing.rs, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/models/gpt-realtime-whisper",
+          "https://developers.openai.com/api/docs/guides/transcription",
+          "https://developers.openai.com/api/docs/guides/realtime-transcription",
+          "https://developers.openai.com/api/docs/guides/realtime-vad",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/guides/realtime-costs",
+          "https://developers.openai.com/api/docs/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:651",
+          "gateway/src/core/stt/openai/config.rs:671-693",
+          "gateway/src/core/stt/openai/config.rs:710-714"
+        ],
+        "unverified": [
+          "transports[0].latency (third-party figure measured with Pipecat's client)",
+          "transports[0].limits.max_session_ms (not on the pages fetched)",
+          "transports[0] socket URL (?intent=transcription is absent from official pages)",
+          "billing.bills_silence and billing.min_billed_ms",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)",
+          "transports[0].limits.rates (requests) (the model page gives only the audio limit, 100 minutes of audio per minute at tier 1; no request limit is published)"
+        ],
+        "notes": "The vendor says this is not the recommended starting model for a new integration (transcription overview); it is still served. Realtime-only: the file endpoint does not serve this model, so file-upload segmentation is not possible. It rejects server voice-activity detection, so the client must detect the end of speech and send input_audio_buffer.commit; the gateway's own detector therefore owns the utterance boundary while text deltas arrive during speech. Until the socket client exists a live call cannot use this model. Today the gateway accepts the id, posts it to the file endpoint and fails only at its first upload, which is normally at hang-up, because there is no model allow-list (gateway/src/core/stt/openai/config.rs:671-693)."
+      }
+    },
+    {
+      "id": "openai:gpt-realtime-whisper-any",
+      "match": {
+        "provider": "openai",
+        "model_glob": "gpt-realtime-whisper*"
+      },
+      "lifecycle": {
+        "status": "legacy"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "openai_realtime_transcription",
+          "enabled_from_release": 4,
+          "disabled_reason": "No gateway speech-to-text client speaks the OpenAI Realtime transcription socket (adapter commit_openai is not built). The /v1/realtime facade dials that socket only as a pass-through for customers who speak the Realtime protocol themselves.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "fast",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1080,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Pipecat stt-benchmark, 1000 samples from pipecat-ai/smart-turn-data-v3.1-train, Pipecat's own Realtime client with a client-side commit; end of speech to final transcript including a 200 ms detector stop delay; P95 878 ms. Not measured through the gateway.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              },
+              {
+                "percentile": "p50",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 740,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Same Pipecat benchmark run as the p99 entry.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              },
+              {
+                "percentile": "p95",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 878,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Same Pipecat benchmark run as the p99 entry.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": [
+              {
+                "metric": "audio_seconds",
+                "per": "minute",
+                "value": 6000,
+                "plan": "tier_1",
+                "scope": "organisation",
+                "note": "100 minutes of audio per minute."
+              }
+            ],
+            "assumed_plan": "tier_1"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              24000
+            ],
+            "channels": 1
+          },
+          "commit": {
+            "audio_gating": "speech_only"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [],
+            "wire": "openai_realtime_ga"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/handlers/openai_realtime/upstream.rs:113-141 (pass-through facade, dials ?intent=transcription; not a BaseSTT client); gateway/src/core/realtime/openai/protocol.rs:75-90 (reusable audio format types)",
+            "notes": "The socket accepts only 24 kHz PCM or G.711 (mu-law or A-law), base64 inside input_audio_buffer.append, so wire audio at any other rate must be resampled. Completion events for different turns can arrive out of order and must be matched by item_id. A commit on an empty buffer is an error. The official WebSocket URL for a transcription session is unconfirmed: the gateway facade, Pipecat and LiveKit dial ?intent=transcription, while the vendor model pages name v1/realtime/transcription_sessions. Text deltas arrive while the caller speaks; turn detection must be null. The model takes no prompt and has a `delay` setting (minimal to xhigh). The tier 1 limit is 100 minutes of audio per minute, which the limits block cannot express. The gateway's family test is a prefix check for 'whisper' (gateway/src/core/stt/openai/config.rs:710-714), so today it would treat this id as a non-Whisper file model."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:671-693 (an id outside the client's model list is sent verbatim to the file endpoint, at hang-up or a client commit because of :651)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "OpenAI serves this model only over its live transcription socket, and this gateway does not yet have a client for that socket; the file endpoint the gateway uses for OpenAI today does not accept the model. Choose gpt-transcribe or a streaming transcription model from another provider."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Billed by audio duration; vendor price in the evidence is $0.017 per audio minute. Whether silence streamed between commits is billed is unknown. No pricing entry in gateway/src/config/pricing.rs, so no pricing_key is set."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/models/gpt-realtime-whisper",
+          "https://developers.openai.com/api/docs/guides/transcription",
+          "https://developers.openai.com/api/docs/guides/realtime-transcription",
+          "https://developers.openai.com/api/docs/guides/realtime-vad",
+          "https://developers.openai.com/api/reference/resources/realtime/subresources/client_secrets",
+          "https://developers.openai.com/api/docs/guides/realtime-costs",
+          "https://developers.openai.com/api/docs/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:651",
+          "gateway/src/core/stt/openai/config.rs:671-693",
+          "gateway/src/core/stt/openai/config.rs:710-714"
+        ],
+        "unverified": [
+          "that every dated snapshot of gpt-realtime-whisper behaves like the alias (inferred from OpenAI's naming practice; no snapshot of this model is listed in the evidence)",
+          "transports[0].latency (third-party figure measured with Pipecat's client)",
+          "transports[0].limits.max_session_ms (not on the pages fetched)",
+          "transports[0] socket URL (?intent=transcription is absent from official pages)",
+          "billing.bills_silence and billing.min_billed_ms",
+          "transports[*].limits.rates[].scope (the vendor defines rate limits at organisation level and at project level; the row records organisation)",
+          "transports[0].limits.rates (requests) (the model page gives only the audio limit, 100 minutes of audio per minute at tier 1; no request limit is published)"
+        ],
+        "notes": "Family row for dated snapshots of gpt-realtime-whisper, added 2026-10-04 after the reference resolver showed that such an id would otherwise fall to the provider default row and be uploaded to the file endpoint, which rejects live-only models. Same transports and refusal as the exact row. The vendor says this is not the recommended starting model for a new integration (transcription overview); it is still served. Realtime-only: the file endpoint does not serve this model, so file-upload segmentation is not possible. It rejects server voice-activity detection, so the client must detect the end of speech and send input_audio_buffer.commit; the gateway's own detector therefore owns the utterance boundary while text deltas arrive during speech. Until the socket client exists a live call cannot use this model. Today the gateway accepts the id, posts it to the file endpoint and fails only at its first upload, which is normally at hang-up, because there is no model allow-list (gateway/src/core/stt/openai/config.rs:671-693)."
+      }
+    },
+    {
+      "id": "openai:any",
+      "match": {
+        "provider": "openai",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "The file-upload adapter for live calls (segmented_openai_compat) is not built yet. Today the OpenAI client buffers the caller audio and uploads it only at hang-up, when the client ends its audio by hand (audio_end, or a commit on the /v1/realtime cascade), or when its 20 MB buffer cap is reached, so a normal call gets no transcript while it is in progress.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 26214400,
+            "rates": [],
+            "ramp": true
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer",
+            "path": "/v1/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/openai/client.rs:374 (flush_buffer, takes &mut self); gateway/src/core/stt/openai/config.rs:848-906 (transcription_text_fields)",
+            "notes": "No adapter exists. The request and response code lives inside the buffering client: flush_buffer wraps the whole buffered call in one WAV at the session sample rate, is awaited on the audio path under the voice manager's speech-to-text write lock (gateway/src/core/voice_manager/manager.rs:636-639) and uses a 30 s timeout (client.rs:54). A stateless transcriber that takes one utterance has to be extracted from it. For an unknown id the adapter sends only the model, the file and response_format=json: the language field is `language` on some known models and `languages[]` on others, and json is the one format every known file model accepts."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. The existing client allows 30 s (gateway/src/core/stt/openai/client.rs:54), longer than a caller will wait; the vendor audit recommends 10 s, about five times the only published P99 for this endpoint (2.01 s). It is an estimate to be replaced by the gateway's own measurement. Container (16 kHz mono PCM16 WAV), pre-roll, trailing silence, maximum segment and uploads in flight keep the defaults."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/openai/config.rs:651 (the default flush strategy is OnDisconnect)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "OpenAI model ids that this gateway does not list are treated as file transcription models, which have no streaming interface. On this gateway they are not yet served to a voice agent that decides when the caller has finished speaking. Use a streaming transcription model, set the agent's turn detection to manual, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Known OpenAI file models are billed per audio minute or per token; an unknown id could be either."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://developers.openai.com/api/docs/guides/speech-to-text",
+          "https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/openai/config.rs:651",
+          "gateway/src/core/stt/openai/config.rs:671-693"
+        ],
+        "unverified": [
+          "everything except the 25 MB request limit, which the guide states for the endpoint",
+          "billing.unit",
+          "billing.min_billed_ms (no minimum or rounding rule is documented for the endpoint)",
+          "transports[0].latency (no figure can apply to an unknown model)"
+        ],
+        "notes": "Fail-slow default for an OpenAI model id the map has never seen: assume a file model. OpenAI has a file endpoint and the gateway has no streaming speech-to-text client for OpenAI, so a wrong guess here fails only for a realtime-only id, and it fails with the vendor naming the model. Dated snapshots of the two realtime-only models are not in the evidence; such an id lands here and should get its own row once confirmed. The client also honours an endpoint override and the OPENAI_BASE_URL environment variable (gateway/src/core/stt/openai/config.rs:28-49, :908-921), so an unknown id under this provider may be a model on an OpenAI-compatible server. File upload is the right guess for that case too, but this row sends no language hint, which costs accuracy and speed on a Whisper-family model; such a deployment should get its own row or a deployment override."
+      }
+    }
+  ]
+}

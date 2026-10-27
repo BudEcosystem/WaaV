@@ -58,20 +58,31 @@ export type MuteStrategy =
  * Built-in conversation-loop configuration for the gateway
  * (`ConversationWebSocketConfig`, config.rs:53-217).
  *
- * `baseUrl` and `model` are the only required fields (mirrors the gateway);
+ * `model` is the only required field (mirrors the gateway);
  * every other field is optional and only sent when set, so the gateway applies
  * its own documented defaults.
  */
 export interface ConversationConfig {
   // --- Core LLM ---
-  /** OpenAI-compatible base URL for the LLM (e.g. 'https://api.openai.com/v1'). */
-  baseUrl: string;
+  /**
+   * OpenAI-compatible base URL for the LLM (e.g. 'https://api.openai.com/v1'). Leave it out under
+   * the Bud control plane, where the LLM is a Bud chat deployment and the gateway refuses one.
+   */
+  baseUrl?: string;
   /** Model identifier — keep this a FAST model (e.g. 'gpt-4o-mini', 'llama3.2:1b'). */
   model: string;
   /** Optional system prompt seeding the conversation. */
   systemPrompt?: string;
-  /** API key (literal or '${ENV_VAR}'); falls back to OPENAI_API_KEY server-side. */
+  /**
+   * API key (literal or '${ENV_VAR}'). Without one the gateway uses its own key, but only for a
+   * base URL the operator approved (docs/egress-and-credentials.md).
+   */
   apiKey?: string;
+  /**
+   * Name of an operator credential to authenticate with; sent only if baseUrl is one of its
+   * hosts, otherwise the config is refused. Takes precedence over apiKey.
+   */
+  credentialRef?: string;
   /** Sampling temperature. */
   temperature?: number;
   /** Max tokens per completion. */
@@ -116,6 +127,11 @@ export interface ConversationConfig {
   reasoningBaseUrl?: string;
   /** Reasoning-tier API key (defaults to apiKey). */
   reasoningApiKey?: string;
+  /**
+   * Operator credential for the reasoning tier, bound to reasoningBaseUrl (else baseUrl).
+   * Takes precedence over reasoningApiKey.
+   */
+  reasoningCredentialRef?: string;
   /** Reasoning-tier vendor wire format (defaults to providerKind). */
   reasoningProviderKind?: AdapterKind;
   /** Route turns between tiers: 'auto' (default) or 'always'. */
@@ -128,19 +144,22 @@ export interface ConversationConfig {
   maxLlmCallsPerTurn?: number;
   /** Hard ceiling on the reasoning tier's output tokens. */
   maxReasoningTokens?: number;
+  /**
+   * LLM request timeout in ms (gateway default 60000, clamped to 1000 .. the server's maximum).
+   * Raise it for a self-hosted model that loads on its first request.
+   */
+  llmTimeoutMs?: number;
 }
 
 /**
  * Map a {@link ConversationConfig} (camelCase, SDK-facing) to the gateway
- * `conversation_config` wire block (snake_case). `base_url` + `model` are
- * always emitted; every other field is sent ONLY when explicitly set so the
+ * `conversation_config` wire block (snake_case). `model` is always emitted;
+ * `base_url` and every other field are sent ONLY when explicitly set so the
  * gateway applies its own defaults (a literal `undefined` is never serialized).
  */
 export function conversationConfigToWire(config: ConversationConfig): Record<string, unknown> {
-  const wire: Record<string, unknown> = {
-    base_url: config.baseUrl,
-    model: config.model,
-  };
+  const wire: Record<string, unknown> = { model: config.model };
+  if (config.baseUrl) wire.base_url = config.baseUrl;
 
   // [camelCase SDK field, snake_case wire key] pairs for the optional surface.
   const optional: Array<[keyof ConversationConfig, string]> = [
@@ -165,12 +184,15 @@ export function conversationConfigToWire(config: ConversationConfig): Record<str
     ['reasoningModel', 'reasoning_model'],
     ['reasoningBaseUrl', 'reasoning_base_url'],
     ['reasoningApiKey', 'reasoning_api_key'],
+    ['reasoningCredentialRef', 'reasoning_credential_ref'],
     ['reasoningProviderKind', 'reasoning_provider_kind'],
     ['reasoningRoute', 'reasoning_route'],
     ['reasoningBudgetMs', 'reasoning_budget_ms'],
     ['degradationMessage', 'degradation_message'],
     ['maxLlmCallsPerTurn', 'max_llm_calls_per_turn'],
     ['maxReasoningTokens', 'max_reasoning_tokens'],
+    ['credentialRef', 'credential_ref'],
+    ['llmTimeoutMs', 'llm_timeout_ms'],
   ];
 
   for (const [field, key] of optional) {

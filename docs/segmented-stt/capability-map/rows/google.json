@@ -1,0 +1,2722 @@
+{
+  "provider_id": "google",
+  "provider": {
+    "aliases": [],
+    "default_model": "latest_long",
+    "model_string": "wire_model",
+    "registered_in_gateway": true,
+    "notes": "Registered as google with no aliases (gateway/src/plugin/builtin/mod.rs:74-84, :1669-1671; gateway/src/core/stt/standard.rs:428). The client speaks only the gRPC StreamingRecognize method of Speech-to-Text V2 (gateway/src/core/stt/google/provider.rs:185) and copies the model string to the request unchanged (gateway/src/core/stt/google/streaming.rs:249); it has no model, region or language check. default_model is latest_long because that is the default the client declares (gateway/src/core/stt/google/config.rs:122). It is a lookup key only. The constructor paths pass an empty model to Google as an empty string (gateway/src/core/stt/google/provider.rs:464-477; gateway/src/core/stt/base.rs:592), so a session with no model does not send latest_long today, and what Google does with an empty model on the implicit recognizer is unverified (the audit inferred that Google rejects it). If the resolver writes this default into the request it changes the wire for those sessions and needs its own test. The client dials the recognizer location global unless the session supplies provider_extras.location on the standardized path (gateway/src/core/stt/google/config.rs:7, :126, :175-177); the flat constructor path cannot set a location. Model availability depends on the recognizer location (global, us, eu or a region) and, for chirp_2, on the language. The chirp_2 language limit is a constraint on its streaming transport; locations are not written as constraints, because Google's sources disagree and a wrong constraint would refuse sessions that work (Google names its Locations API as the live source). Every final from this client is marked speech-final, so Google's own finalization ends the utterance on the streaming path. The client has no handling for a model that ends the stream after every utterance (latest_short, and probably short): each close is treated as a dropped stream and uses up the reconnect budget, which is why the latest_short streaming client is marked known broken. Not listed as a transport: BatchRecognize, an asynchronous job that reads only from Cloud Storage."
+  },
+  "rows": [
+    {
+      "id": "google:chirp_3",
+      "match": {
+        "provider": "google",
+        "model": "chirp_3"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1570,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat GOOGLE_TTFS_P99 (1.57 s): end of speech to final transcript on Google streaming, measured with a voice-activity stop time of 200 ms. Pipecat does not state the model, so this is a provider-level figure applied to this model. Read on 2026-10-03; no measurement date is published.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets",
+                "note": "Sent as one inline phrase set (gateway/src/core/stt/google/streaming.rs:198-216)."
+              }
+            ],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed). The pinned protocol definitions (google-api-proto 1.678.0, gateway/Cargo.toml:279) lack this model's endpointing_sensitivity and custom_prompt_config fields, so neither can be sent. The client dials the recognizer location global unless the session supplies provider_extras.location (gateway/src/core/stt/google/config.rs:7, :175-177); the flat constructor path cannot set one (gateway/src/core/stt/google/provider.rs:464-477). Google's sources disagree on whether global serves this model, so a session that leaves the location unset may be rejected by Google; this has not been probed."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets"
+              }
+            ],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2). Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2)."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/models/chirp-3",
+          "https://docs.cloud.google.com/speech-to-text/docs/transcription-model",
+          "https://docs.cloud.google.com/speech-to-text/docs/release-notes",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rpc/google.cloud.speech.v2",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://cloud.google.com/speech-to-text/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/google/streaming.rs:198-216",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156",
+          "gateway/Cargo.toml:279",
+          "gateway/src/core/stt/google/config.rs:7",
+          "gateway/src/core/stt/google/config.rs:175-177",
+          "gateway/src/core/stt/google/provider.rs:464-477"
+        ],
+        "unverified": [
+          "transports[0].latency (provider-level Pipecat figure; the model it was measured with is not stated)",
+          "which recognizer locations serve this model (us and eu are confirmed; Google's release notes and a localized page add six regions; Google's own sample uses global; the English model page lists only us and eu)",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "Google documents this model on StreamingRecognize, Recognize and BatchRecognize, so it keeps the streaming client. Do not reject it by region without a Locations API lookup or a live probe. Word-level timestamps are returned only by Recognize and batch. Google says the confidence value on Chirp models is not a true confidence score, so none is recorded as a quality signal. The model accepts the language value 'auto'."
+      }
+    },
+    {
+      "id": "google:chirp_2",
+      "match": {
+        "provider": "google",
+        "model": "chirp_2"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "cmn-Hans-CN",
+                "cmn-Hant-TW",
+                "yue-Hant-HK",
+                "en-AU",
+                "en-IN",
+                "en-GB",
+                "en-US",
+                "fr-CA",
+                "fr-FR",
+                "de-DE",
+                "it-IT",
+                "ja-JP",
+                "ko-KR",
+                "pt-BR",
+                "es-ES",
+                "es-US"
+              ],
+              "note": "The 16 languages Google documents for chirp_2 on StreamingRecognize (Chirp 2 page, confirmed by the fact-check). Other languages need the Recognize transport."
+            }
+          },
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1570,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat GOOGLE_TTFS_P99 (1.57 s): end of speech to final transcript on Google streaming, measured with a voice-activity stop time of 200 ms. Pipecat does not state the model, so this is a provider-level figure applied to this model. Read on 2026-10-03; no measurement date is published.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets",
+                "note": "Sent as one inline phrase set (gateway/src/core/stt/google/streaming.rs:198-216)."
+              }
+            ],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed). The client dials the recognizer location global unless the session supplies provider_extras.location (gateway/src/core/stt/google/config.rs:7, :175-177); the flat constructor path cannot set one (gateway/src/core/stt/google/provider.rs:464-477). Google documents this model only in us-central1, europe-west4 and asia-southeast1; whether a session left at global is served has not been probed."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets"
+              }
+            ],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "pricing_key": "google:chirp_2",
+            "notes": "Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "pricing_key": "google:chirp_2"
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/models/chirp-2",
+          "https://docs.cloud.google.com/speech-to-text/docs/release-notes",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://cloud.google.com/speech-to-text/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/google/streaming.rs:198-216",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156",
+          "gateway/src/core/stt/google/config.rs:7",
+          "gateway/src/core/stt/google/config.rs:175-177",
+          "gateway/src/core/stt/google/provider.rs:464-477"
+        ],
+        "unverified": [
+          "transports[0].latency (provider-level Pipecat figure; the model it was measured with is not stated)",
+          "lifecycle.status (the model page shows 'Private GA' for its three regions; a release note says generally available)",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "Streaming is documented for 16 languages only, written as the language constraint of the streaming transport. Every other language this model supports needs the Recognize call, so for those languages this is a file-only model, served by the Recognize transport from Release 5 (decisions section 12). Offered in us-central1, europe-west4 and asia-southeast1."
+      }
+    },
+    {
+      "id": "google:chirp",
+      "match": {
+        "provider": "google",
+        "model": "chirp"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "unverified",
+            "defect": "Google's archived Chirp page says this model is not available on StreamingRecognize, only on Recognize (under one minute) and BatchRecognize. The fact-check could not re-open that page, so this needs one live probe.",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed)."
+          },
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": null,
+            "pricing_key": "google:chirp",
+            "notes": "The stream is sent all call audio; whether silence is billed was not confirmed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "pricing_key": "google:chirp"
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://web.archive.org/web/20251015064417id_/https://cloud.google.com/speech-to-text/v2/docs/chirp-model",
+          "https://docs.cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages",
+          "https://docs.cloud.google.com/speech-to-text/docs/transcription-model",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://cloud.google.com/speech-to-text/pricing",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156"
+        ],
+        "unverified": [
+          "transports[1] (that this model cannot stream rests on an archived Google page dated 2025-10-15 that the fact-check could not open; only secondary sources agree)",
+          "lifecycle.status (the model's own page is gone and it is off the models page, but it is still in the supported-languages table; no deprecation notice was found)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "File-only as documented: this is the Google model that needs segmentation. The streaming client stays usable with a warning until the Recognize transport is enabled (decisions section 15 and conversion rules section 9); if Google rejects the stream, the session fails as it does today. The row's billing describes the Recognize transport. The archived page says the model supports no speech adaptation and no language detection. Offered in us-central1, europe-west4 and asia-southeast1."
+      }
+    },
+    {
+      "id": "google:chirp_telephony",
+      "match": {
+        "provider": "google",
+        "model": "chirp_telephony"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed). Whether Google accepts this model on StreamingRecognize is unknown. The client dials the recognizer location global unless the session supplies provider_extras.location (gateway/src/core/stt/google/config.rs:7, :175-177); the flat constructor path cannot set one (gateway/src/core/stt/google/provider.rs:464-477). Google documents this model only in us-central1, europe-west4 and asia-southeast1; whether a session left at global is served has not been probed."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet. No Google page says which methods serve this model; probe both before relying on either, and move this transport in front of the streaming client only if StreamingRecognize rejects the model.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2). Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2)."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/release-notes",
+          "https://docs.cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156",
+          "gateway/src/core/stt/google/config.rs:7",
+          "gateway/src/core/stt/google/config.rs:175-177",
+          "gateway/src/core/stt/google/provider.rs:464-477"
+        ],
+        "unverified": [
+          "transports[0] and transports[1] (no official statement says which methods serve this model; a 2024-01-08 release note calls it a fine-tuned version of chirp, so it is expected to be file-only like chirp)",
+          "dialect.context_params and quality_signals on both transports (not established; recorded as empty)",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "The model is expected to behave like chirp, which Google documented as file-only, but no probe has settled it. The streaming client is listed first so that today's behaviour is unchanged (conversion rules section 9); the Recognize transport is reachable by asking for segmented transcription. Ten languages; offered in us-central1, europe-west4 and asia-southeast1."
+      }
+    },
+    {
+      "id": "google:long",
+      "match": {
+        "provider": "google",
+        "model": "long"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1570,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat GOOGLE_TTFS_P99 (1.57 s): end of speech to final transcript on Google streaming, measured with a voice-activity stop time of 200 ms. Pipecat does not state the model, so this is a provider-level figure applied to this model. Read on 2026-10-03; no measurement date is published.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets",
+                "note": "Sent as one inline phrase set (gateway/src/core/stt/google/streaming.rs:198-216)."
+              }
+            ],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed)."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets"
+              }
+            ],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2). Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2)."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/GoogleCloudPlatform/python-docs-samples/main/speech/snippets/transcribe_streaming_v2.py",
+          "https://docs.cloud.google.com/speech-to-text/docs/migration",
+          "https://docs.cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages",
+          "https://docs.cloud.google.com/speech-to-text/docs/streaming-recognize",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://cloud.google.com/speech-to-text/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/google/streaming.rs:198-216",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156"
+        ],
+        "unverified": [
+          "transports[0].latency (provider-level Pipecat figure; the model it was measured with is not stated)",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "Google's own streaming sample uses this model at location global, and its migration guide uses it with Recognize. Offered at global, us and eu."
+      }
+    },
+    {
+      "id": "google:latest_long",
+      "match": {
+        "provider": "google",
+        "model": "latest_long"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1570,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat GOOGLE_TTFS_P99 (1.57 s): end of speech to final transcript on Google streaming, measured with a voice-activity stop time of 200 ms. Pipecat does not state the model, so this is a provider-level figure applied to this model. Read on 2026-10-03; no measurement date is published.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets",
+                "note": "Sent as one inline phrase set (gateway/src/core/stt/google/streaming.rs:198-216)."
+              }
+            ],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed)."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets"
+              }
+            ],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "pricing_key": "google:latest_long",
+            "notes": "Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "pricing_key": "google:latest_long"
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/locations",
+          "https://docs.cloud.google.com/speech-to-text/docs/streaming-recognize",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://raw.githubusercontent.com/livekit/agents/main/livekit-plugins/livekit-plugins-google/livekit/plugins/google/stt.py",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/google/streaming.rs:198-216",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156",
+          "gateway/src/core/stt/google/config.rs:122",
+          "gateway/src/core/stt/google/provider.rs:464-477"
+        ],
+        "unverified": [
+          "transports[0] (no official per-method statement says Speech-to-Text V2 streams this model; the only evidence is third party: LiveKit's Google plugin defaults to it on V2 streaming at location global)",
+          "transports[1] (whether V2 Recognize accepts this model is not documented)",
+          "what Google does when the model field is empty, which is what a session with no model sends today (the audit inferred a rejection; not probed)",
+          "lifecycle.status (the id is named on V2 pages but is absent from the V2 supported-languages table)",
+          "transports[0].latency (provider-level Pipecat figure; the model it was measured with is not stated)",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "This is the default model the gateway's Google client declares (gateway/src/core/stt/google/config.rs:122) and the id an empty model resolves to in this map. Streaming is listed first so that sessions which work today keep their path. An empty model is not sent as latest_long today: the client passes the empty string to Google (gateway/src/core/stt/google/provider.rs:464-477), so this row describes the lookup result for such a session, not the model Google runs."
+      }
+    },
+    {
+      "id": "google:telephony",
+      "match": {
+        "provider": "google",
+        "model": "telephony"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1570,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat GOOGLE_TTFS_P99 (1.57 s): end of speech to final transcript on Google streaming, measured with a voice-activity stop time of 200 ms. Pipecat does not state the model, so this is a provider-level figure applied to this model. Read on 2026-10-03; no measurement date is published.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets",
+                "note": "Sent as one inline phrase set (gateway/src/core/stt/google/streaming.rs:198-216)."
+              }
+            ],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed)."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets"
+              }
+            ],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2). Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2)."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/transcription-model",
+          "https://docs.cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages",
+          "https://docs.cloud.google.com/speech-to-text/docs/best-practices",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://cloud.google.com/speech-to-text/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/google/streaming.rs:198-216",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156"
+        ],
+        "unverified": [
+          "transports[0] (the models page offers streaming for real-time use with no model excluded, but Google has no per-method table for this model)",
+          "transports[0].latency (provider-level Pipecat figure; the model it was measured with is not stated)",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "One of the three models on Google's current V2 models page. Offered at global, us and eu. Google advises against resampling and says telephone audio should be sent at its native 8 kHz; the Recognize transport therefore sets prefer_call_rate, so an 8 kHz call is uploaded at 8 kHz."
+      }
+    },
+    {
+      "id": "google:telephony_short",
+      "match": {
+        "provider": "google",
+        "model": "telephony_short"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets",
+                "note": "Sent as one inline phrase set (gateway/src/core/stt/google/streaming.rs:198-216)."
+              }
+            ],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed). Whether Google accepts this model on StreamingRecognize is unknown."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet. No Google page says which methods serve this model; probe both before relying on either, and move this transport in front of the streaming client only if StreamingRecognize rejects the model.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets"
+              }
+            ],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2). Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2)."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages",
+          "https://docs.cloud.google.com/speech-to-text/docs/best-practices",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/google/streaming.rs:198-216",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156"
+        ],
+        "unverified": [
+          "transports[0] and transports[1] (the model is in the V2 supported-languages table but no statement says which methods serve it; Recognize support is inferred because no model is documented as excluded from it)",
+          "the fact-check could not re-read the supported-languages table rows for this model",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "The streaming client is listed first so that today's behaviour is unchanged (conversion rules section 9); no Google statement says which methods serve this model, and the Recognize transport is reachable by asking for segmented transcription. Offered at global, us and eu, plus asia-south1 for en-US. The same 8 kHz guidance as the telephony model applies."
+      }
+    },
+    {
+      "id": "google:short",
+      "match": {
+        "provider": "google",
+        "model": "short"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets",
+                "note": "Sent as one inline phrase set (gateway/src/core/stt/google/streaming.rs:198-216)."
+              }
+            ],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed). Whether Google accepts this model on StreamingRecognize is unknown; it is expected to close the stream after each utterance, as latest_short does. If it does, the client has no single-utterance handling: each close is treated as a dropped stream and uses up the reconnect budget described on the latest_short row, so a call with many turns would lose transcription. Probe this before relying on the row."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet. No Google page says which methods serve this model; probe both before relying on either, and move this transport in front of the streaming client only if StreamingRecognize rejects the model.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets"
+              }
+            ],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2). Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "pricing.rs has no key for this model (keys exist for google:default, google:latest_long, google:latest_short, google:chirp and google:chirp_2)."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages",
+          "https://docs.cloud.google.com/speech-to-text/docs/single-utterance",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/google/streaming.rs:198-216",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156"
+        ],
+        "unverified": [
+          "transports[0] and transports[1] (the model is in the V2 supported-languages table but no statement says which methods serve it; Recognize support is inferred, and single-utterance stream behaviour is inferred from latest_short)",
+          "transports[0]: whether this model ends the stream after each utterance; if it does, the streaming client is broken for it in the same way as for latest_short and must be marked known broken with the same defect",
+          "the fact-check could not re-read the supported-languages table rows for this model",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "The streaming client is listed first so that today's behaviour is unchanged (conversion rules section 9); no Google statement says which methods serve this model, and the Recognize transport is reachable by asking for segmented transcription. Offered at global, us and eu."
+      }
+    },
+    {
+      "id": "google:latest_short",
+      "match": {
+        "provider": "google",
+        "model": "latest_short"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet. Whether Recognize accepts this model on Speech-to-Text V2 is not documented, so a live probe must confirm it, and its latency must be measured, before this transport is enabled. One Recognize call per utterance fits this model better than a stream that Google closes after every utterance.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets"
+              }
+            ],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "pricing_key": "google:latest_short",
+            "notes": "Only uploaded speech segments are billed."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "quality_signals_require": [
+            "features.enable_word_confidence=true"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "adaptation.phrase_sets",
+                "note": "Sent as one inline phrase set (gateway/src/core/stt/google/streaming.rs:198-216)."
+              }
+            ],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Google closes the stream on this model after every utterance, and the gateway's Google client has no single-utterance handling. It treats each close as a dropped stream, records a failure on the circuit breaker that every Google session shares, and reconnects after a delay that grows with each attempt. The retry budget is ten attempts and is cleared only when a stream has stayed open for 30 seconds, so a call whose caller speaks more often than that loses transcription after about ten utterances. Three closes in a row within 5 seconds of their connect put the shared breaker in its fatal state for 60 seconds, which also stops other Google sessions from connecting. All of this is read in the code and was never run against Google. Until the client treats the per-utterance close as normal, a model that keeps the stream open (long, latest_long, telephony) is the better choice.",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:219-228 (a stream that ends is returned as a reconnectable failure); gateway/src/core/stt/google/streaming.rs:267-271 (the streaming features sent have no single-utterance field); gateway/src/core/websocket/reconnectable_stream.rs:294, :353-361 and :387-405 (each cycle counts one attempt and one breaker failure, and the attempt counter is cleared only after a stream outlived reset_after_ms); gateway/src/core/websocket/reconnection.rs:99-108 (ten attempts, 30 000 ms); gateway/src/core/resilience/circuit_breaker.rs:101-112, :247-267 and :334-367 (three consecutive streams shorter than 5 seconds arm a fatal state that refuses connects for 60 seconds); gateway/src/core/resilience/registry.rs:103-108 (one breaker per provider, default settings); gateway/tests/mock_endpoint_e2e.rs:2301 (the only test, against a mock that does not close per utterance)",
+            "notes": "The adapter itself is exercised against an in-repo gRPC mock, but not with this model's behaviour. The vendor audit lists latest_short on a call with several turns among the combinations the client accepts and cannot serve. A single-utterance use (one spoken command, then hang up) works today; a conversation does not. The effect on the shared breaker is inferred from reading; because it also stops other Google sessions from connecting, the client fix matters beyond this model."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "pricing_key": "google:latest_short"
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/single-utterance",
+          "https://docs.cloud.google.com/speech-to-text/docs/locations",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/google/streaming.rs:198-216",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156",
+          "gateway/src/core/stt/google/provider.rs:219-228",
+          "gateway/src/core/stt/google/streaming.rs:267-271",
+          "gateway/src/core/websocket/reconnectable_stream.rs:294",
+          "gateway/src/core/websocket/reconnectable_stream.rs:353-361",
+          "gateway/src/core/websocket/reconnectable_stream.rs:387-405",
+          "gateway/src/core/websocket/reconnection.rs:99-108",
+          "gateway/src/core/resilience/circuit_breaker.rs:101-112",
+          "gateway/src/core/resilience/circuit_breaker.rs:247-267",
+          "gateway/src/core/resilience/circuit_breaker.rs:334-367",
+          "gateway/src/core/resilience/registry.rs:103-108"
+        ],
+        "unverified": [
+          "transports[0] (whether V2 Recognize accepts this model is not documented)",
+          "which recognizer locations serve this model",
+          "lifecycle.status (the id is named on V2 pages but is absent from the V2 supported-languages table)",
+          "transports[1]: the reconnect behaviour that makes the streaming client unusable for this model was read in the code and never run against Google; a mock that closes the stream after each final would confirm it without credentials",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the audit read per-minute pricing with each request rounded up to 1 second, which would make the effective minimum 1 second; the fact-check could not re-read the pricing page)"
+        ],
+        "notes": "Google documents that a stream on this model is closed automatically when the utterance ends. The model streams at the vendor, but the gateway's client cannot run it on a call with several turns: today such a session starts, transcribes the first utterances with a reconnect between each, and then stops transcribing. Following decisions section 15, the streaming client is marked known broken and stays usable with a warning, which keeps single-utterance uses working; it is listed behind the Recognize transport (conversion rules section 9), which takes over from Release 5 once a live probe confirms that Recognize accepts this model (its disabled_reason). The streaming method is the only one Google documents for this id."
+      }
+    },
+    {
+      "id": "google:medical_conversation",
+      "match": {
+        "provider": "google",
+        "model": "medical_conversation"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed). Whether Google accepts this model on StreamingRecognize is unknown."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet. No Google page says which methods serve this model; probe both before relying on either, and move this transport in front of the streaming client only if StreamingRecognize rejects the model.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "pricing.rs has no key for this model. The audit read 0.078 USD per minute for the medical models in a table that sits under the Speech-to-Text V1 heading; whether V2 charges the same is unverified, and the fact-check could not re-read the pricing page. Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "pricing.rs has no key for this model. The audit read 0.078 USD per minute for the medical models in a table that sits under the Speech-to-Text V1 heading; whether V2 charges the same is unverified, and the fact-check could not re-read the pricing page."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://cloud.google.com/speech-to-text/pricing",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156"
+        ],
+        "unverified": [
+          "match.model (the id comes from the audit's parse of the V2 supported-languages table; the fact-check could not re-read that table)",
+          "transports[0] and transports[1] (no statement says which methods serve this model; Recognize support is inferred because no model is documented as excluded from it)",
+          "dialect.context_params and quality_signals on both transports (not established; recorded as empty)",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the price of the medical models on V2 was not established)"
+        ],
+        "notes": "Google's model for a conversation between a clinician and a patient. US English (en-US) only; offered at global, us and eu per the audit's parse of the languages table. The streaming client is listed first so that today's behaviour is unchanged (conversion rules section 9); no Google statement says which methods serve this model, and the Recognize transport is reachable by asking for segmented transcription."
+      }
+    },
+    {
+      "id": "google:medical_dictation",
+      "match": {
+        "provider": "google",
+        "model": "medical_dictation"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed). Whether Google accepts this model on StreamingRecognize is unknown."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet. No Google page says which methods serve this model; probe both before relying on either, and move this transport in front of the streaming client only if StreamingRecognize rejects the model.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "ogg",
+              "webm",
+              "mp4",
+              "m4a",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_minute",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "pricing.rs has no key for this model. The audit read 0.078 USD per minute for the medical models in a table that sits under the Speech-to-Text V1 heading; whether V2 charges the same is unverified, and the fact-check could not re-read the pricing page. Only uploaded speech segments are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "pricing.rs has no key for this model. The audit read 0.078 USD per minute for the medical models in a table that sits under the Speech-to-Text V1 heading; whether V2 charges the same is unverified, and the fact-check could not re-read the pricing page."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://cloud.google.com/speech-to-text/pricing",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156"
+        ],
+        "unverified": [
+          "match.model (the id comes from the audit's parse of the V2 supported-languages table; the fact-check could not re-read that table)",
+          "transports[0] and transports[1] (no statement says which methods serve this model; Recognize support is inferred because no model is documented as excluded from it)",
+          "dialect.context_params and quality_signals on both transports (not established; recorded as empty)",
+          "billing.bills_silence (the gateway forwards every frame, including keep-alive silence, to the stream; whether silence is billed was not confirmed)",
+          "latency of the file transport (Google publishes none for V2 Recognize on short audio)",
+          "limits.min_audio_ms of the file transport (none documented)",
+          "billing.unit and billing.min_billed_ms (the price of the medical models on V2 was not established)"
+        ],
+        "notes": "Google's model for notes dictated by a clinician. US English (en-US) only; offered at global, us and eu per the audit's parse of the languages table. The streaming client is listed first so that today's behaviour is unchanged (conversion rules section 9); no Google statement says which methods serve this model, and the Recognize transport is reachable by asking for segmented transcription."
+      }
+    },
+    {
+      "id": "google:any",
+      "match": {
+        "provider": "google",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "Concurrent streaming sessions per Google Cloud project and per region."
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/google/provider.rs:185 (StreamingRecognize is the only call made); gateway/src/core/stt/google/streaming.rs:249 (model copied to the request unchanged), :352-358 and :518-523 (every final is also marked speech-final); gateway/tests/mock_endpoint_e2e.rs:2301 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo gRPC mock. The model string reaches Google unchanged, and a model Google rejects surfaces through the error callback after connect() has already reported success (provider.rs:96-104, inferred from reading), not as a setup failure. Google closes a stream after 5 minutes with the documented error '409 Max duration of 5 minutes reached for stream'; the client has no rotation timer and relies on a reactive reconnect. That error most likely arrives as the gRPC code ABORTED, which the client treats as reconnectable (provider.rs:251-264; the mapping from 409 to ABORTED is inferred and was not probed). On this row the model id is unknown to the map; it is still passed to Google as written."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "google_recognize",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Google's synchronous Recognize call exists yet.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 15000,
+                "basis": "vendor_claim",
+                "source": "https://docs.cloud.google.com/speech-to-text/docs/v1/speech-to-text-requests",
+                "conditions": "30 seconds of audio processed in 15 seconds on average, as the Speech-to-Text V1 overview states; no model is named, and the figure is not for 2 to 25 second segments."
+              }
+            ],
+            "notes": "Google publishes no latency for the V2 Recognize call on short audio. The only figure is the V1 overview's average for 30 seconds of audio, recorded as a mean request time; it must not seed a deadline, and the transport must be measured on short clips."
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 300,
+                "plan": null,
+                "scope": "project",
+                "note": "300 synchronous recognition requests per 60 seconds, per Google Cloud project and per region."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              11025,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "prefer_call_rate": true,
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "auto_decoding_config",
+                "value": "{}",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "google_speech_v2_recognize"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Google file builder); gateway/src/core/stt/google/streaming.rs:148-156 (the client always sends an explicit decoding config, never auto-detect)",
+            "notes": "Needs a Recognize request (REST :recognize with base64 content and a bearer token, or a gRPC unary call on the existing channel), auto-detect decoding for WAV, a response parser that treats an empty results list as no speech, and a shared limiter for the per-project quota."
+          },
+          "file_request_mode": "sync"
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize",
+          "https://docs.cloud.google.com/speech-to-text/docs/quotas",
+          "https://docs.cloud.google.com/speech-to-text/docs/locations",
+          "https://docs.cloud.google.com/speech-to-text/docs/troubleshooting"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/google/provider.rs:185",
+          "gateway/src/core/stt/google/provider.rs:96-104",
+          "gateway/src/core/stt/google/provider.rs:251-264",
+          "gateway/src/core/stt/google/streaming.rs:249",
+          "gateway/src/core/stt/google/streaming.rs:352-358",
+          "gateway/src/core/stt/google/streaming.rs:518-523",
+          "gateway/tests/mock_endpoint_e2e.rs:2301",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/google/streaming.rs:148-156"
+        ],
+        "unverified": [
+          "every field: this row describes a model id the map does not know"
+        ],
+        "notes": "Default for an unknown Google model id. The streaming client is listed first (conversion rules section 9), which is today's behaviour: the id is passed through and Google decides. The Recognize transport is reachable by asking for segmented transcription. A model that ends the stream after every utterance cannot be run by the streaming client on a call with several turns (see the latest_short row); an unknown id with that behaviour would fail in the same way."
+      }
+    }
+  ]
+}

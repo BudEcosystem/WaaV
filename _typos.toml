@@ -14,6 +14,7 @@ extend-exclude = [
   "**/target/**",
   "**/*.min.js",
   "inferv2/REVIEW/*.json",       # agent-run transcripts (truncated tool output), not prose
+  "gateway/vendor/**",           # vendored third-party crates (webrtc-sys, livekit-api): kept byte-close to upstream
 ]
 
 [default]
@@ -34,6 +35,7 @@ mut = "mut"
 crate = "crate"
 WaaV = "WaaV"
 waav = "waav"
+securty = "securty"  # the deliberately misspelled section in the unknown-YAML-key tests and docs
 # Acronyms and domain abbreviations.
 fpt = "fpt"          # FPT.AI, a Vietnamese speech provider
 ane = "ane"          # Apple Neural Engine
@@ -51,6 +53,7 @@ thr = "thr"          # threshold in formulas
 mis = "mis"          # mis- prefix (mis-routed, mis-detected)
 formant = "formant"  # acoustic resonance
 lasr = "lasr"        # Google lasr_ctc architecture
+speaches = "speaches"  # speaches, an open-source OpenAI-compatible Whisper server
 criticals = "criticals"
 datas = "datas"
 # Language codes (ISO 639), phonemes and non-English voice names.

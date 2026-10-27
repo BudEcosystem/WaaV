@@ -67,18 +67,63 @@ fn parse_cors_allowed_origins(origins: &str) -> anyhow::Result<Vec<HeaderValue>>
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Path to configuration file (YAML)
-    #[arg(short = 'c', long = "config", value_name = "FILE")]
+    #[arg(short = 'c', long = "config", value_name = "FILE", global = true)]
     config: Option<PathBuf>,
+
+    /// Environment file to load before configuration (`KEY=value` lines; variables already
+    /// set in the process environment win). Also `WAAV_ENV_FILE`. Default: `.env` in the
+    /// current directory only, when it exists. An empty value disables env-file loading.
+    #[arg(long = "env-file", value_name = "FILE", global = true)]
+    env_file: Option<PathBuf>,
 
     /// Subcommand to run
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
+/// Outcome of [`load_env_file`], reported once tracing is initialised.
+enum EnvFile {
+    Loaded(PathBuf),
+    /// Disabled, or no `./.env` present.
+    None,
+    /// An explicitly requested file could not be read or parsed: startup fails.
+    Failed(PathBuf, dotenvy::Error),
+    /// The default `./.env` exists but could not be parsed: warned, startup continues.
+    DefaultUnreadable(PathBuf, dotenvy::Error),
+}
+
+/// Load `explicit` if given (an empty path disables loading), else `./.env` if it exists.
+///
+/// Never searches parent directories. Existing process variables are not overridden.
+fn load_env_file(explicit: Option<&std::path::Path>) -> EnvFile {
+    match explicit {
+        Some(p) if p.as_os_str().is_empty() => EnvFile::None,
+        Some(p) => match dotenvy::from_path(p) {
+            Ok(()) => EnvFile::Loaded(p.to_path_buf()),
+            Err(e) => EnvFile::Failed(p.to_path_buf(), e),
+        },
+        None => {
+            let p = PathBuf::from(".env");
+            if !p.is_file() {
+                return EnvFile::None;
+            }
+            match dotenvy::from_path(&p) {
+                Ok(()) => EnvFile::Loaded(p),
+                Err(e) => EnvFile::DefaultUnreadable(p, e),
+            }
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize turn detection models
     Init,
+
+    /// Check the configuration without starting the server: the environment and env file, the
+    /// config file (`-c`, unknown keys included), operator credentials, DAG templates, and the
+    /// auth, metrics and segmented speech-to-text settings. Prints each problem; exits 1 if any.
+    Check,
 
     /// Generate OpenAPI specification
     #[cfg(feature = "openapi")]
@@ -93,10 +138,145 @@ enum Commands {
     },
 }
 
+/// Bind `WAAV_UNIX_SOCKET`. A socket file left by a previous run is removed when nothing is
+/// listening on it; anything else at that path (a live socket, a regular file) is refused, never
+/// deleted. The socket is made group-accessible (0660): access is the file's permissions.
+fn bind_unix_socket(path: &std::path::Path) -> anyhow::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_socket() {
+            anyhow::bail!(
+                "WAAV_UNIX_SOCKET={}: the path exists and is not a socket",
+                path.display()
+            );
+        }
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            anyhow::bail!(
+                "WAAV_UNIX_SOCKET={}: another process is listening on it",
+                path.display()
+            );
+        }
+        std::fs::remove_file(path)
+            .map_err(|e| anyhow!("WAAV_UNIX_SOCKET={}: {e}", path.display()))?;
+    }
+    let listener = tokio::net::UnixListener::bind(path)
+        .map_err(|e| anyhow!("WAAV_UNIX_SOCKET={}: {e}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+        .map_err(|e| anyhow!("WAAV_UNIX_SOCKET={}: {e}", path.display()))?;
+    Ok(listener)
+}
+
+/// Every check `main` makes before it binds, without binding, loading models or dialling
+/// anything: what `waav-gateway check` reports. Each entry names its source.
+fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let config = match config_path {
+        Some(path) => {
+            match ServerConfig::unknown_yaml_keys(path) {
+                Ok(keys) => problems.extend(
+                    keys.into_iter()
+                        .map(|k| format!("{}: unknown key `{k}`", path.display())),
+                ),
+                Err(e) => problems.push(e),
+            }
+            ServerConfig::from_file(path).map_err(|e| e.to_string())
+        }
+        None => ServerConfig::from_env().map_err(|e| e.to_string()),
+    };
+    let config = match config {
+        Ok(config) => Some(config),
+        Err(e) => {
+            problems.push(format!("configuration: {e}"));
+            None
+        }
+    };
+    if let Some(config) = config.as_ref()
+        && let Err(e) = waav_gateway::core::alias::validate_aliases(&config.aliases)
+    {
+        problems.push(format!("aliases: {e}"));
+    }
+    if let Err(e) = waav_gateway::core::credentials::initialize_credentials() {
+        problems.push(format!("credentials: {e}"));
+    }
+    #[cfg(feature = "dag-routing")]
+    if let Ok(dir) = std::env::var("WAAV_DAG_TEMPLATES_DIR")
+        && !dir.trim().is_empty()
+        && let Err(e) =
+            waav_gateway::dag::initialize_templates(&waav_gateway::dag::TemplatesConfig {
+                templates: Default::default(),
+                templates_dir: Some(PathBuf::from(dir)),
+                templates_dir_required: true,
+            })
+    {
+        problems.push(format!("DAG templates: {e}"));
+    }
+    if let Err(e) = waav_gateway::auth::AuthPolicy::from_env() {
+        problems.push(format!("auth: {e}"));
+    }
+    if let Err(e) = waav_gateway::middleware::auth::parse_query_token_policy(
+        std::env::var(waav_gateway::middleware::auth::QUERY_TOKEN_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        problems.push(format!(
+            "{e} (a malformed value refuses every query-string credential)"
+        ));
+    }
+    if let Err(e) = waav_gateway::livekit::ice::parse_ice_ips(
+        std::env::var(waav_gateway::livekit::ice::ICE_IPS_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        problems.push(format!(
+            "{e} (a malformed value gathers no ICE candidates, so LiveKit calls fail)"
+        ));
+    }
+    // A malformed value refuses every client endpoint at runtime (fail closed): say so here.
+    use waav_gateway::core::client_destination::{CLIENT_ENDPOINTS_ENV, parse_client_endpoints};
+    if let Err(e) = parse_client_endpoints(std::env::var(CLIENT_ENDPOINTS_ENV).ok().as_deref()) {
+        problems.push(format!(
+            "{e} (a malformed value refuses every client-chosen endpoint)"
+        ));
+    }
+    if let Some(config) = config.as_ref() {
+        let api_requires_auth = config.auth_required
+            || config.has_api_secret_auth()
+            || waav_gateway::auth::bud_mode::BudModeConfig::from_env().is_some();
+        if let Err(e) = waav_gateway::handlers::api::MetricsPolicy::from_env(api_requires_auth) {
+            problems.push(format!("metrics: {e}"));
+        }
+    }
+    if let Some(path) = std::env::var_os("WAAV_UNIX_SOCKET").filter(|p| !p.is_empty())
+        && let Some(dir) = std::path::Path::new(&path).parent()
+        && !dir.as_os_str().is_empty()
+        && !dir.is_dir()
+    {
+        problems.push(format!(
+            "WAAV_UNIX_SOCKET={}: the directory {} does not exist",
+            path.to_string_lossy(),
+            dir.display()
+        ));
+    }
+    if let Err(e) = waav_gateway::core::stt::segmented::live::SttLiveShared::from_env(None) {
+        problems.push(format!("segmented speech-to-text: {e}"));
+    }
+    problems
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load .env file if it exists (must be done before config loading)
-    let _ = dotenvy::dotenv();
+    // Parse CLI arguments first: `--env-file` decides which env file (if any) is loaded.
+    let cli = Cli::parse();
+
+    // Load the env file before tracing and config read the environment. Not
+    // `dotenvy::dotenv()`: that searches the current directory AND EVERY PARENT for a `.env`,
+    // so a gateway started in /srv/app/gateway silently picked up /srv/app/.env (or ~/.env)
+    // -- credentials and settings from an unrelated project.
+    let explicit_env_file = cli
+        .env_file
+        .clone()
+        .or_else(|| std::env::var_os("WAAV_ENV_FILE").map(PathBuf::from));
+    let env_file = load_env_file(explicit_env_file.as_deref());
 
     // Initialize tracing
     // Exports to OTLP when the chart supplies an endpoint, stdout otherwise. The guard is
@@ -110,8 +290,17 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .map_err(|_| anyhow!("Failed to install default crypto provider"))?;
 
-    // Parse CLI arguments
-    let cli = Cli::parse();
+    // Reported only now that tracing is up; values are never logged.
+    match env_file {
+        EnvFile::Loaded(path) => info!("Loaded environment file {}", path.display()),
+        EnvFile::None => {}
+        EnvFile::Failed(path, e) => {
+            anyhow::bail!("Failed to load environment file {}: {e}", path.display())
+        }
+        EnvFile::DefaultUnreadable(path, e) => {
+            warn!("Ignoring environment file {}: {e}", path.display())
+        }
+    }
 
     // Handle subcommands
     if let Some(command) = cli.command {
@@ -119,6 +308,18 @@ async fn main() -> anyhow::Result<()> {
             Commands::Init => {
                 init::run().await?;
                 return Ok(());
+            }
+            Commands::Check => {
+                let problems = check_configuration(cli.config.as_ref());
+                if problems.is_empty() {
+                    println!("configuration OK");
+                    return Ok(());
+                }
+                for problem in &problems {
+                    eprintln!("error: {problem}");
+                }
+                eprintln!("{} problem(s) found", problems.len());
+                std::process::exit(1);
             }
             #[cfg(feature = "openapi")]
             Commands::Openapi { format, output } => {
@@ -192,9 +393,42 @@ async fn main() -> anyhow::Result<()> {
     // only (SSRF-safe). A client may NAME an alias on its `config` message but never
     // DEFINE one. Done before serving so the first connection resolves correctly.
     {
+        // A leg's own server must pass the egress rules: a mistake stops the server here rather
+        // than failing every session that names the alias.
+        waav_gateway::core::alias::validate_aliases(&config.aliases)
+            .map_err(|e| anyhow!("aliases: {e}"))?;
         let n = waav_gateway::core::alias::initialize_aliases(&config.aliases);
         if n > 0 {
             info!("Registered {} server-side config alias(es)", n);
+        }
+    }
+
+    // Operator credentials (WAAV_CREDENTIALS_FILE / WAAV_CREDENTIALS_JSON): the ONLY secrets a
+    // client config may name, each bound to the hosts it may be sent to. A malformed file stops
+    // the server (it must never degrade to "no credentials" silently).
+    {
+        let n = waav_gateway::core::credentials::initialize_credentials()
+            .map_err(|e| anyhow!("credentials: {e}"))?;
+        if n > 0 {
+            info!("Registered {} operator credential(s)", n);
+        }
+    }
+
+    // Operator DAG templates (WAAV_DAG_TEMPLATES_DIR). `initialize_templates` existed but was
+    // never called, so a standalone gateway had NO templates and every DAG — with its
+    // `${VAR}` keys — had to arrive inline from the client.
+    #[cfg(feature = "dag-routing")]
+    {
+        if let Ok(dir) = std::env::var("WAAV_DAG_TEMPLATES_DIR")
+            && !dir.trim().is_empty()
+        {
+            let n = waav_gateway::dag::initialize_templates(&waav_gateway::dag::TemplatesConfig {
+                templates: Default::default(),
+                templates_dir: Some(std::path::PathBuf::from(dir)),
+                templates_dir_required: true,
+            })
+            .map_err(|e| anyhow!("DAG templates: {e}"))?;
+            info!("Registered {} operator DAG template(s)", n);
         }
     }
 
@@ -231,6 +465,22 @@ async fn main() -> anyhow::Result<()> {
     let rate_limit_burst = config.rate_limit_burst_size;
     let cors_origins = config.cors_allowed_origins.clone();
     println!("Starting server on {address}");
+
+    // `/metrics` exposure, resolved before `config` moves into the state. An API that
+    // authenticates its callers must not leave the exposition as the one open door.
+    let api_requires_auth = config.auth_required
+        || config.has_api_secret_auth()
+        || waav_gateway::auth::bud_mode::BudModeConfig::from_env().is_some();
+    let metrics_policy = waav_gateway::handlers::api::MetricsPolicy::from_env(api_requires_auth)
+        .map_err(|e| anyhow!("invalid metrics configuration: {e}"))?;
+    if metrics_policy.main == waav_gateway::handlers::api::MetricsAccess::Locked {
+        warn!(
+            "/metrics answers 403: the API requires authentication and no metrics access is \
+             configured. Set WAAV_METRICS_TOKEN (scrape with a bearer token), WAAV_METRICS_ADDR \
+             (a separate, unexposed listener), or WAAV_METRICS_PUBLIC=true"
+        );
+    }
+    metrics_policy.clone().install();
 
     // Create application state
     let mut app_state = AppState::try_new(config)
@@ -295,6 +545,10 @@ async fn main() -> anyhow::Result<()> {
     // process holds — so it starts here, after the control plane is installed.
     if waav_gateway::handlers::voice_catalog::spawn(app_state.clone()).is_some() {
         println!("Voice catalog publisher active: voice lists written to voice_catalog:*");
+    }
+    // How each transcription deployment is served on a live call, for budapp (Release 2).
+    if waav_gateway::handlers::stt_capability::spawn(app_state.clone()).is_some() {
+        println!("Speech-to-text capability publisher active: written to voice_capability:*");
     }
 
     // Create protected API routes with authentication middleware
@@ -512,14 +766,70 @@ async fn main() -> anyhow::Result<()> {
     // the SAME bucket as all real traffic. Counting probes against it means a busy pod fails
     // its own liveness check and is restarted for being popular, which is precisely backwards.
     // These are also the endpoints that must answer when the pod is in trouble.
-    let limited_routes = webhook_routes
+    let routed = webhook_routes
         .merge(protected_routes)
         .merge(ws_routes)
         .merge(realtime_routes)
         .merge(openai_realtime_routes)
         .merge(debug_profile_routes)
-        .with_state(app_state.clone())
+        .with_state(app_state.clone());
+    let limited_routes = routed
+        .clone()
         .layer(tower::util::option_layer(governor_layer));
+
+    // WAAV_UNIX_SOCKET: the same API (auth included) on a Unix socket, for callers on this host
+    // that address services by path (Gaia's local model registry). No rate limiter there: every
+    // such caller shares one peer, and they are processes on this machine; a stand-in loopback
+    // peer address keeps the per-peer connection limit working.
+    let unix_socket = std::env::var_os("WAAV_UNIX_SOCKET")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let unix_app = unix_socket.as_ref().map(|_| {
+        public_routes
+            .clone()
+            .merge(routed)
+            .with_state(app_state.clone())
+            .layer(cors_layer.clone())
+            .layer(security_headers.clone())
+            .layer(axum::middleware::from_fn(request_id_middleware))
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+            ))
+    });
+
+    // The operator listener (WAAV_METRICS_ADDR): Prometheus and the probes, bound to an address
+    // the ingress does not route to. `/readyz` there carries the per-provider breakdown, which the
+    // public port then omits (it named the vendor credentials this gateway holds). The probes stay
+    // on the public port too: the kubelet and the Bud chart poll them there.
+    if let Some((metrics_addr, _)) = metrics_policy.dedicated {
+        let metrics_app = Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get(waav_gateway::handlers::api::dedicated_metrics_handler),
+            )
+            .route(
+                "/livez",
+                axum::routing::get(waav_gateway::handlers::api::livez),
+            )
+            .route(
+                "/ready",
+                axum::routing::get(waav_gateway::handlers::api::readiness_check),
+            )
+            .route(
+                "/readyz",
+                axum::routing::get(waav_gateway::handlers::api::admin_readyz),
+            )
+            .with_state(app_state.clone());
+        let metrics_listener = TcpListener::bind(metrics_addr)
+            .await
+            .map_err(|e| anyhow!("Failed to bind metrics listener {metrics_addr}: {e}"))?;
+        info!("Operator listener on http://{metrics_addr}: /metrics, /livez, /ready, /readyz");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
+                error!(error = %e, "metrics listener stopped");
+            }
+        });
+    }
 
     let app = public_routes
         .merge(limited_routes)
@@ -530,6 +840,21 @@ async fn main() -> anyhow::Result<()> {
         // auth, rate-limiting, or any handler logs — every nested `tracing` event inherits it,
         // and it is echoed on the response `x-request-id` header (W-C1 / E13).
         .layer(axum::middleware::from_fn(request_id_middleware));
+
+    if let (Some(path), Some(unix_app)) = (unix_socket, unix_app) {
+        let listener = bind_unix_socket(&path)?;
+        info!("Also serving on unix:{}", path.display());
+        let shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            let served = axum::serve(listener, unix_app)
+                .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                .await;
+            if let Err(e) = served {
+                error!(error = %e, "unix socket listener stopped");
+            }
+            let _ = std::fs::remove_file(&path);
+        });
+    }
 
     // Parse socket address
     let socket_addr: SocketAddr = address
@@ -655,6 +980,31 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_env_file_is_loaded_without_overriding_the_process_env() {
+        let dir = std::env::temp_dir().join(format!("waav-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("custom.env");
+        std::fs::write(&file, "WAAV_TEST_ENV_FILE_A=from-file\n").unwrap();
+
+        assert!(matches!(load_env_file(Some(&file)), EnvFile::Loaded(p) if p == file));
+        assert_eq!(
+            std::env::var("WAAV_TEST_ENV_FILE_A").as_deref(),
+            Ok("from-file")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_explicit_env_file_fails_and_an_empty_one_disables_loading() {
+        let missing = std::path::Path::new("/nonexistent/waav/never.env");
+        assert!(matches!(load_env_file(Some(missing)), EnvFile::Failed(..)));
+        assert!(matches!(
+            load_env_file(Some(std::path::Path::new(""))),
+            EnvFile::None
+        ));
+    }
 
     #[test]
     fn parse_cors_allowed_origins_accepts_trimmed_origins() {

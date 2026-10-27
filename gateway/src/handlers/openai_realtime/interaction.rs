@@ -28,7 +28,7 @@ use crate::core::realtime::scaffold::{OutFrame, RealtimeProtocol};
 use crate::core::realtime::{RealtimeConfig, RealtimeError, RealtimeResult};
 use crate::handlers::realtime::interaction::plan;
 
-use super::cascade::{bud_event, event};
+use super::cascade::{bud_event_name, event};
 
 /// The session's verbs as GA frames for the relay to send to the vendor.
 struct RelayWire {
@@ -269,7 +269,7 @@ fn bud_frame(json: &str) -> Option<String> {
         "audio_segment" => "bud.audio.segment",
         "session_failed" => SESSION_FAILED,
         "agent_audio_stopped" => "bud.audio.stopped",
-        kind => bud_event(kind)?,
+        kind => bud_event_name(kind)?,
     };
     Some(event(name, Value::Object(body)))
 }

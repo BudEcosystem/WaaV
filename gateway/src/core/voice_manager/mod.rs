@@ -293,6 +293,7 @@ pub mod callbacks;
 pub mod config;
 pub mod errors;
 pub mod manager;
+pub mod segmented;
 pub mod state;
 pub mod stt_result;
 

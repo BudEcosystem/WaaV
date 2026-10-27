@@ -157,6 +157,52 @@ fn redact_value(value: &mut serde_json::Value) {
     }
 }
 
+/// Mask, in place, every value a `Debug` print of a config must never show: the values of
+/// [`SECRET_KEYS`] (recursively) and EVERY value of a `headers` map, whatever the header is
+/// called (`X-Custom-Auth`, `api-key`, `Ocp-Apim-Subscription-Key`, … carry credentials under
+/// names no list can enumerate). For `Debug` impls of client-supplied configs (DAG nodes, LLM
+/// configs) whose secrets are plain `String`s.
+pub fn redact_config_value(value: &mut serde_json::Value) {
+    redact_value(value);
+    redact_header_maps(value);
+}
+
+fn redact_header_maps(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if key.eq_ignore_ascii_case("headers")
+                    && let serde_json::Value::Object(headers) = val
+                {
+                    for header_value in headers.values_mut() {
+                        *header_value = serde_json::Value::String(REDACTED.to_string());
+                    }
+                } else {
+                    redact_header_maps(val);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_header_maps),
+        _ => {}
+    }
+}
+
+/// `Debug`-format a serializable config with [`redact_config_value`] applied. Falls back to a
+/// fixed placeholder (never the raw value) if serialization fails.
+pub fn redacted_debug<T: serde::Serialize>(
+    name: &str,
+    value: &T,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    match serde_json::to_value(value) {
+        Ok(mut v) => {
+            redact_config_value(&mut v);
+            write!(f, "{name} {v}")
+        }
+        Err(_) => write!(f, "{name} {{ <unprintable> }}"),
+    }
+}
+
 /// Redact secrets, then truncate. Redaction runs first so a secret is masked before any clipping
 /// could split it.
 pub fn sanitize_body(body: &str) -> String {
@@ -173,6 +219,23 @@ pub fn capture_json_body(capture: bool, body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_redaction_masks_keys_and_every_header_value() {
+        let mut v = serde_json::json!({
+            "type": "llm_endpoint",
+            "api_key": "sk-live-1",
+            "headers": {"X-Custom-Auth": "hdr-2", "Authorization": "Bearer t-3"},
+            "config": {"api_key": "dg-4"},
+            "model": "m"
+        });
+        redact_config_value(&mut v);
+        let s = v.to_string();
+        for secret in ["sk-live-1", "hdr-2", "t-3", "dg-4"] {
+            assert!(!s.contains(secret), "{secret} leaked: {s}");
+        }
+        assert!(s.contains("\"model\":\"m\""), "non-secrets stay: {s}");
+    }
 
     #[test]
     fn truncate_respects_byte_cap_ascii() {

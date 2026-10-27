@@ -1,0 +1,1527 @@
+{
+  "provider_id": "cartesia",
+  "provider": {
+    "aliases": [],
+    "default_model": "ink-whisper",
+    "model_string": "wire_model",
+    "key_normalisation": {
+      "placeholder_as_unset": true
+    },
+    "registered_in_gateway": true,
+    "notes": "Registered under the single id 'cartesia' (gateway/src/plugin/builtin/mod.rs:1683; gateway/src/core/stt/standard.rs:417-419); no aliases. An empty model resolves to ink-whisper (gateway/src/core/stt/cartesia/config.rs:145, 355-358). Today's client also reads the literal id 'nova-3' as no model chosen (config.rs:352-358), which placeholder_as_unset reproduces in the resolver; the Python client library and the dashboard send 'nova-3' for every provider when the caller chose no model (clients_sdk/python/bud_waav/ws/session.py:942; clients_sdk/dashboard/js/websocket.js:107). Every Cartesia model accepts a live stream on the manual socket, so no model needs the call cut into uploaded utterances; the synchronous file endpoint serves the ink-whisper family only and is a fallback no release builds. The change that matters for this vendor is a third way of working, between vendor-ended streaming and file upload: keep the socket and let the gateway's own voice detector send Cartesia's finalize command. The vendor designed the manual socket for that and calls it crucial for low latency; the gateway never sends it. That transport is enabled from Release 4, live-only models and low latency, and is listed first on every row. Two code paths build the client. Live sessions use the standardized path, which forwards the configured model (config.rs:346-358; gateway/src/handlers/ws/config_handler.rs:1921, 1947). The older flat path ignores the model and always uses ink-whisper (config.rs:320-329), and a configuration update goes through that flat path, so it resets the model to ink-whisper (gateway/src/core/stt/cartesia/client.rs:783-795). The streaming client has only been run against mocks and differs from Cartesia's current documentation in its authentication parameter, pinned API version and command format; a live probe is the first thing to do for this provider."
+  },
+  "rows": [
+    {
+      "id": "cartesia:ink-whisper",
+      "match": {
+        "provider": "cartesia",
+        "model": "ink-whisper"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "cartesia_manual_finalize",
+          "enabled_from_release": 4,
+          "disabled_reason": "Not implemented. The method that sends Cartesia's finalize command exists but nothing calls it, the command is written in a form that differs from the vendor's documentation, and the client does not join the vendor's delta chunks into one transcript per utterance.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "fast",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 898,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Pipecat's speech-to-text benchmark, model ink-whisper, 1000 samples, time from the end of speech to the final transcript, where the end of speech is the voice detector's stop event minus its 0.2 s hangover. Pipecat's Cartesia service sends finalize when its voice detector stops, which is this transport (that the benchmark used that service is inferred). Pipecat ships the constant CARTESIA_TTFS_P99 = 0.81 s for the same service. Cartesia's own blog reports a median of 66 ms from last audio to complete transcript, a different measure. Not measured by WaaV.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              },
+              {
+                "percentile": "p50",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 266,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+                "conditions": "Same benchmark and conditions as the 99th percentile entry above.",
+                "pause_ms_assumed": 200,
+                "sample_count": 1000
+              },
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 810,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat's shipped constant CARTESIA_TTFS_P99 = 0.81 s for its Cartesia service, which sends finalize when its voice detector stops; voice detector hangover 0.2 s.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "commit": {
+            "audio_gating": "continuous"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/cartesia/client.rs:592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+            "notes": "Cartesia built this socket for a client that decides where the utterance ends: the client streams audio and sends the text command finalize when its own voice detector says the caller stopped; the server returns the remaining transcript and then a flush_done acknowledgment. The vendor calls sending finalize crucial for low latency. Three things are missing. First, a caller for the existing finalize method (client.rs:592-608): it should be driven by the gateway's own detector reporting the end of speech. Second, the command must go out as bare text; the client serialises it as a JSON-quoted string (messages.rs:45-57). Third, final chunks are deltas and must be joined without trimming, and the turn should end on flush_done or on the turn controller's decision, not on every final chunk (messages.rs:104-111). The vendor warns that finalizing in the middle of speech causes transcription errors, and that the server waits for more audio rather than assuming silence when frames stop arriving."
+          },
+          "enable_requires": [
+            "live_probe"
+          ]
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No figure exists for this socket when the client never sends finalize. Cartesia says its silence fallback is slower by design because it waits out a pause."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "The client never sends finalize, so Cartesia's slower silence fallback ends each utterance, and it marks every final chunk as the end of the caller's turn although each chunk's text is a delta, so one utterance can end the turn more than once. It also differs from the current documentation in its authentication parameter, pinned API version and command format, with an effect nobody has probed.",
+            "code_ref": "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358; gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111; gateway/tests/mock_endpoint_e2e.rs:1339-1362; gateway/tests/chaos_reconnect.rs:589",
+            "notes": "Exercised only against in-repo mock sockets (a mock end-to-end test and a reconnect test); the evidence records no run against Cartesia. Each caller chunk is written at once as a raw binary frame (client.rs:115-121) and every transcript event is forwarded, interim or final (client.rs:386-392). The client never sends Cartesia's finalize command (the method that would is unused, client.rs:592-608), so Cartesia's silence fallback ends each utterance. Every final chunk is marked as the end of the caller's turn (messages.rs:104-111), although the vendor's text is a delta since the previous final chunk, so one utterance can end the turn more than once. Confidence is invented, 1.0 for a final and 0.0 for an interim, because Cartesia returns none (messages.rs:109). The client differs from Cartesia's current documentation in three ways whose effect is unknown: it authenticates with an api_key query parameter (config.rs:279-280) where the documentation now lists a header or an access-token parameter; it pins API version 2025-04-16 (config.rs:139) where the current version is 2026-08-14 and structured error codes start at 2026-03-01; and it ends the session with the JSON-quoted text \"done\" (client.rs:82-91, messages.rs:45-57) where the documentation specifies the bare text close. If Cartesia has stopped accepting any of these, this client does not work today; probe it against the vendor before relying on it."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway has no request builder or response parser for Cartesia's file endpoint. This model streams, so the file endpoint is a fallback, not a requirement.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Cartesia publishes no latency for the file endpoint. Must be measured before this transport is enabled."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every HTTP request and every open socket count against this one limit, so a session that uploads should close its socket; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "flac",
+              "m4a",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [],
+            "wire": "cartesia_stt_batch"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:102-123; gateway/src/core/stt/standard.rs:502-523",
+            "notes": "Cartesia's file endpoint is POST /stt: a multipart request with a file part, a model field that must name a model of the ink-whisper family and a language field (default en, no detection). It needs an Authorization header and a Cartesia-Version header and returns one JSON body with the text, the audio duration and, on request, word times. It is synchronous: no job and no polling. It returns no confidence of any kind, so a quality filter can use only an empty-transcript check, the gateway detector's own measure of speech and a list of phrases the model is known to invent. It takes no prompt and no vocabulary. The gateway has no Cartesia entry among its file-upload vendors (batch.rs:839-844; prerecorded.rs:116-123), so a file sent to the gateway's upload route for a Cartesia deployment is replayed over the streaming socket (standard.rs:514-522). Each HTTP request and each open socket counts against the same concurrency limit, so a session that falls back to uploads should close its socket."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "The 8 s request timeout is an engineering estimate from the vendor audit; Cartesia publishes no latency for this endpoint. Replace it with a deadline from measurement. Every other setting keeps the gateway default: the vendor accepts any length and splits long files itself, so the 25 s cap is a latency choice; no minimum billed duration is documented, so short segments are not merged; padding costs a quarter of a credit per segment."
+          },
+          "billing": {
+            "unit": "audio_second",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "bills_failed_requests": false,
+            "notes": "1 credit per 2 seconds of uploaded audio, half the streaming rate. No minimum billed duration is documented. No pricing_key: the gateway's only entry for this model holds a streaming rate."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": true,
+        "bills_failed_requests": false,
+        "pricing_key": "cartesia:ink-whisper",
+        "notes": "Billed in credits by audio duration: 1 credit per second on the streaming socket, silence included even when no transcript is produced. Failed requests are not billed. No minimum billed duration is documented. The entry cartesia:ink-whisper in gateway/src/config/pricing.rs prices this model at 24 US dollars per hour (pricing.rs:231-234), about two orders of magnitude above the vendor's stated rate of roughly 0.13 dollars per hour on its Scale plan; correct it before metering by it. The file transport carries its own billing block."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cartesia.ai/build-with-cartesia/stt/older-models.md",
+          "https://docs.cartesia.ai/use-the-api/stt/compare-endpoints.md",
+          "https://docs.cartesia.ai/api-reference/stt/websocket.md",
+          "https://docs.cartesia.ai/api-reference/stt/transcribe.md",
+          "https://docs.cartesia.ai/use-the-api/stt/troubleshooting/manual.md",
+          "https://docs.cartesia.ai/pricing.md",
+          "https://docs.cartesia.ai/use-the-api/concurrency-limits-and-timeouts.md",
+          "https://docs.cartesia.ai/use-the-api/api-conventions.md",
+          "https://docs.cartesia.ai/use-the-api/api-errors.md",
+          "https://docs.cartesia.ai/get-started/authenticate-your-client-applications.md",
+          "https://cartesia.ai/pricing",
+          "https://www.cartesia.ai/blog/introducing-ink-speech-to-text",
+          "https://raw.githubusercontent.com/pipecat-ai/stt-benchmark/main/README.md",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/cartesia/client.rs:592-608",
+          "gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+          "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358",
+          "gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608",
+          "gateway/tests/mock_endpoint_e2e.rs:1339-1362",
+          "gateway/tests/chaos_reconnect.rs:589",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/standard.rs:502-523",
+          "gateway/src/core/stt/cartesia/config.rs:30-67,75,185"
+        ],
+        "unverified": [
+          "the existing streaming client against the live vendor: whether Cartesia still accepts the api_key query parameter, the JSON-quoted commands and the done command, and what API version 2025-04-16 still selects; if any is rejected the client does not work today",
+          "transports[1].latency (no figure for the socket without finalize)",
+          "limits.rates (concurrency) on every transport (12 is the Pro plan, the lowest paid plan; Free is 8, Startup 20, Scale 60, Enterprise by agreement; open sockets, idle or not, and HTTP requests share the one limit)",
+          "limits.rates[].scope (the vendor ties the limit to the plan; recorded as account)",
+          "limits.rates (requests) (no figure is published; only concurrency limits are)",
+          "limits.max_session_ms (no session length limit is in the evidence; idle_timeout_ms records that Cartesia closes an idle socket after 3 minutes)",
+          "transports[2].limits.max_upload_bytes, max_audio_ms and min_audio_ms (the vendor says any length is accepted; an error code for an oversized file exists but no threshold is published)",
+          "transports[2].latency (none published)",
+          "billing.min_billed_ms (none documented)",
+          "lifecycle.status (listed under older models with status Stable and no retirement date)",
+          "transports[*].stream_audio (the sample rates are the list the gateway's client validates, gateway/src/core/stt/cartesia/config.rs:75 and :185; the vendor's own list of socket rates is not in the fetched evidence. The vendor also accepts pcm_s32le, pcm_f16le and pcm_f32le, which the map cannot express)"
+        ],
+        "notes": "Cartesia's Whisper-based model, 99 languages; the language must be given (default en) because this model does not detect it. It streams on the manual socket (/stt/websocket) only, and it is the only Cartesia model family with a file endpoint (POST /stt, synchronous). No Cartesia model needs the call cut into uploaded utterances; for this model the file endpoint is a fallback worth having because it costs half the streaming rate and holds no concurrency slot for the length of the call. The transports are listed in the order the vendor's guidance supports: gateway-driven finalize first, because Cartesia designed the manual socket for a client that sends finalize; then the existing client, which relies on the vendor's silence fallback and is what a live call uses today; then the file endpoint. The first transport is enabled from Release 4, live-only models and low latency, and from then on carries every Cartesia session on this model, so the live probe of the existing client should come first. Cartesia closes an idle socket after 3 minutes (limits.idle_timeout_ms). From Release 4 the gateway-driven finalize transport replaces today's client for covered sessions, behind WAAV_STT_CARTESIA_MANUAL_FINALIZE and only after a live probe (addendum B8); this is a deliberate change to a streaming session."
+      }
+    },
+    {
+      "id": "cartesia:ink-whisper-2025-06-04",
+      "match": {
+        "provider": "cartesia",
+        "model": "ink-whisper-2025-06-04"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "cartesia_manual_finalize",
+          "enabled_from_release": 4,
+          "disabled_reason": "Not implemented. The method that sends Cartesia's finalize command exists but nothing calls it, the command is written in a form that differs from the vendor's documentation, and the client does not join the vendor's delta chunks into one transcript per utterance.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured for this dated id; the benchmark used the id ink-whisper."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "commit": {
+            "audio_gating": "continuous"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/cartesia/client.rs:592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+            "notes": "Cartesia built this socket for a client that decides where the utterance ends: the client streams audio and sends the text command finalize when its own voice detector says the caller stopped; the server returns the remaining transcript and then a flush_done acknowledgment. The vendor calls sending finalize crucial for low latency. Three things are missing. First, a caller for the existing finalize method (client.rs:592-608): it should be driven by the gateway's own detector reporting the end of speech. Second, the command must go out as bare text; the client serialises it as a JSON-quoted string (messages.rs:45-57). Third, final chunks are deltas and must be joined without trimming, and the turn should end on flush_done or on the turn controller's decision, not on every final chunk (messages.rs:104-111). The vendor warns that finalizing in the middle of speech causes transcription errors, and that the server waits for more audio rather than assuming silence when frames stop arriving."
+          },
+          "enable_requires": [
+            "live_probe"
+          ]
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No figure exists for this socket when the client never sends finalize. Cartesia says its silence fallback is slower by design because it waits out a pause."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "The client never sends finalize, so Cartesia's slower silence fallback ends each utterance, and it marks every final chunk as the end of the caller's turn although each chunk's text is a delta, so one utterance can end the turn more than once. It also differs from the current documentation in its authentication parameter, pinned API version and command format, with an effect nobody has probed.",
+            "code_ref": "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358; gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111; gateway/tests/mock_endpoint_e2e.rs:1339-1362; gateway/tests/chaos_reconnect.rs:589",
+            "notes": "Exercised only against in-repo mock sockets (a mock end-to-end test and a reconnect test); the evidence records no run against Cartesia. Each caller chunk is written at once as a raw binary frame (client.rs:115-121) and every transcript event is forwarded, interim or final (client.rs:386-392). The client never sends Cartesia's finalize command (the method that would is unused, client.rs:592-608), so Cartesia's silence fallback ends each utterance. Every final chunk is marked as the end of the caller's turn (messages.rs:104-111), although the vendor's text is a delta since the previous final chunk, so one utterance can end the turn more than once. Confidence is invented, 1.0 for a final and 0.0 for an interim, because Cartesia returns none (messages.rs:109). The client differs from Cartesia's current documentation in three ways whose effect is unknown: it authenticates with an api_key query parameter (config.rs:279-280) where the documentation now lists a header or an access-token parameter; it pins API version 2025-04-16 (config.rs:139) where the current version is 2026-08-14 and structured error codes start at 2026-03-01; and it ends the session with the JSON-quoted text \"done\" (client.rs:82-91, messages.rs:45-57) where the documentation specifies the bare text close. If Cartesia has stopped accepting any of these, this client does not work today; probe it against the vendor before relying on it."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway has no request builder or response parser for Cartesia's file endpoint. This model streams, so the file endpoint is a fallback, not a requirement.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Cartesia publishes no latency for the file endpoint. Must be measured before this transport is enabled."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every HTTP request and every open socket count against this one limit, so a session that uploads should close its socket; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "flac",
+              "m4a",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "ogg",
+              "webm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [],
+            "wire": "cartesia_stt_batch"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:102-123; gateway/src/core/stt/standard.rs:502-523",
+            "notes": "Cartesia's file endpoint is POST /stt: a multipart request with a file part, a model field that must name a model of the ink-whisper family and a language field (default en, no detection). It needs an Authorization header and a Cartesia-Version header and returns one JSON body with the text, the audio duration and, on request, word times. It is synchronous: no job and no polling. It returns no confidence of any kind, so a quality filter can use only an empty-transcript check, the gateway detector's own measure of speech and a list of phrases the model is known to invent. It takes no prompt and no vocabulary. The gateway has no Cartesia entry among its file-upload vendors (batch.rs:839-844; prerecorded.rs:116-123), so a file sent to the gateway's upload route for a Cartesia deployment is replayed over the streaming socket (standard.rs:514-522). Each HTTP request and each open socket counts against the same concurrency limit, so a session that falls back to uploads should close its socket."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "The 8 s request timeout is an engineering estimate from the vendor audit; Cartesia publishes no latency for this endpoint. Replace it with a deadline from measurement. Every other setting keeps the gateway default: the vendor accepts any length and splits long files itself, so the 25 s cap is a latency choice; no minimum billed duration is documented, so short segments are not merged; padding costs a quarter of a credit per segment."
+          },
+          "billing": {
+            "unit": "audio_second",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "bills_failed_requests": false,
+            "notes": "1 credit per 2 seconds of uploaded audio, half the streaming rate. No minimum billed duration is documented. No pricing_key: the gateway's only entry for this model holds a streaming rate."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": true,
+        "bills_failed_requests": false,
+        "notes": "Assumed to bill as ink-whisper: 1 credit per second on the streaming socket, silence included. gateway/src/config/pricing.rs has no entry under this exact id and looks prices up by exact id (pricing.rs:466-469). The file transport carries its own billing block."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cartesia.ai/build-with-cartesia/stt/older-models.md",
+          "https://docs.cartesia.ai/api-reference/stt/websocket.md",
+          "https://docs.cartesia.ai/api-reference/stt/transcribe.md",
+          "https://docs.cartesia.ai/pricing.md",
+          "https://docs.cartesia.ai/use-the-api/concurrency-limits-and-timeouts.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/cartesia/client.rs:592-608",
+          "gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+          "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358",
+          "gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608",
+          "gateway/tests/mock_endpoint_e2e.rs:1339-1362",
+          "gateway/tests/chaos_reconnect.rs:589",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/standard.rs:502-523",
+          "gateway/src/core/stt/cartesia/config.rs:30-67,75,185"
+        ],
+        "unverified": [
+          "whether this dated id is accepted on the socket and on the file endpoint: it is in the vendor's model table as a stable snapshot dated 4 June 2025, but in neither documented model list (the socket lists ink-2, ink-preview and ink-whisper; the file endpoint lists ink-whisper and says the model must be in the ink-whisper family)",
+          "the existing streaming client against the live vendor: whether Cartesia still accepts the api_key query parameter, the JSON-quoted commands and the done command, and what API version 2025-04-16 still selects; if any is rejected the client does not work today",
+          "transports[1].latency (no figure for the socket without finalize)",
+          "limits.rates (concurrency) on every transport (12 is the Pro plan, the lowest paid plan; Free is 8, Startup 20, Scale 60, Enterprise by agreement; open sockets, idle or not, and HTTP requests share the one limit)",
+          "limits.rates[].scope (the vendor ties the limit to the plan; recorded as account)",
+          "limits.rates (requests) (no figure is published; only concurrency limits are)",
+          "limits.max_session_ms (no session length limit is in the evidence; idle_timeout_ms records that Cartesia closes an idle socket after 3 minutes)",
+          "transports[2].limits.max_upload_bytes, max_audio_ms and min_audio_ms (the vendor says any length is accepted; an error code for an oversized file exists but no threshold is published)",
+          "transports[2].latency (none published)",
+          "billing.min_billed_ms (none documented)",
+          "lifecycle.status (listed under older models with status Stable and no retirement date)",
+          "transports[*].stream_audio (the sample rates are the list the gateway's client validates, gateway/src/core/stt/cartesia/config.rs:75 and :185; the vendor's own list of socket rates is not in the fetched evidence. The vendor also accepts pcm_s32le, pcm_f16le and pcm_f32le, which the map cannot express)"
+        ],
+        "notes": "Dated snapshot of ink-whisper. The id is established by the vendor's model table; which transports accept it is assumed to match ink-whisper and has not been confirmed, so the row's confidence is 'assumed'. The existing client would send the id unchecked. From Release 4 the gateway-driven finalize transport replaces today's client for covered sessions, behind WAAV_STT_CARTESIA_MANUAL_FINALIZE and only after a live probe (addendum B8); this is a deliberate change to a streaming session."
+      }
+    },
+    {
+      "id": "cartesia:ink-2",
+      "match": {
+        "provider": "cartesia",
+        "model": "ink-2"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "cartesia_manual_finalize",
+          "enabled_from_release": 4,
+          "disabled_reason": "Not implemented. The method that sends Cartesia's finalize command exists but nothing calls it, the command is written in a form that differs from the vendor's documentation, and the client does not join the vendor's delta chunks into one transcript per utterance.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No benchmark for this model is in the evidence."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "commit": {
+            "audio_gating": "continuous"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterm",
+                "max_items": 100,
+                "note": "At most 1200 characters in all; ink-2 and ink-preview only."
+              }
+            ],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/cartesia/client.rs:592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+            "notes": "Cartesia built this socket for a client that decides where the utterance ends: the client streams audio and sends the text command finalize when its own voice detector says the caller stopped; the server returns the remaining transcript and then a flush_done acknowledgment. The vendor calls sending finalize crucial for low latency. Three things are missing. First, a caller for the existing finalize method (client.rs:592-608): it should be driven by the gateway's own detector reporting the end of speech. Second, the command must go out as bare text; the client serialises it as a JSON-quoted string (messages.rs:45-57). Third, final chunks are deltas and must be joined without trimming, and the turn should end on flush_done or on the turn controller's decision, not on every final chunk (messages.rs:104-111). The vendor warns that finalizing in the middle of speech causes transcription errors, and that the server waits for more audio rather than assuming silence when frames stop arriving."
+          },
+          "enable_requires": [
+            "live_probe"
+          ]
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No figure exists for this socket when the client never sends finalize. Cartesia says its silence fallback is slower by design because it waits out a pause."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterm",
+                "max_items": 100,
+                "note": "At most 1200 characters in all; ink-2 and ink-preview only."
+              }
+            ],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "The client never sends finalize, so Cartesia's slower silence fallback ends each utterance, and it marks every final chunk as the end of the caller's turn although each chunk's text is a delta, so one utterance can end the turn more than once. It also differs from the current documentation in its authentication parameter, pinned API version and command format, with an effect nobody has probed.",
+            "code_ref": "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358; gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111; gateway/tests/mock_endpoint_e2e.rs:1339-1362; gateway/tests/chaos_reconnect.rs:589",
+            "notes": "Exercised only against in-repo mock sockets (a mock end-to-end test and a reconnect test); the evidence records no run against Cartesia. Each caller chunk is written at once as a raw binary frame (client.rs:115-121) and every transcript event is forwarded, interim or final (client.rs:386-392). The client never sends Cartesia's finalize command (the method that would is unused, client.rs:592-608), so Cartesia's silence fallback ends each utterance. Every final chunk is marked as the end of the caller's turn (messages.rs:104-111), although the vendor's text is a delta since the previous final chunk, so one utterance can end the turn more than once. Confidence is invented, 1.0 for a final and 0.0 for an interim, because Cartesia returns none (messages.rs:109). The client differs from Cartesia's current documentation in three ways whose effect is unknown: it authenticates with an api_key query parameter (config.rs:279-280) where the documentation now lists a header or an access-token parameter; it pins API version 2025-04-16 (config.rs:139) where the current version is 2026-08-14 and structured error codes start at 2026-03-01; and it ends the session with the JSON-quoted text \"done\" (client.rs:82-91, messages.rs:45-57) where the documentation specifies the bare text close. If Cartesia has stopped accepting any of these, this client does not work today; probe it against the vendor before relying on it. For this model the gateway's endpointing setting has no effect: it becomes max_silence_duration_secs (config.rs:349-351), which Cartesia applies to ink-whisper only, so how long the silence fallback waits is unknown. The client also sends a language parameter whenever a language is configured (config.rs:288-292), which Cartesia documents for ink-whisper only; this model detects the language itself. The client does not send keyterm."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway has no client for Cartesia's turn-detecting socket (/stt/turns/websocket).",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "semantic",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 100,
+                "basis": "vendor_claim",
+                "source": "https://www.cartesia.ai/ink",
+                "conditions": "Cartesia's product page: 'Time to final transcript is 0.1s', shown as 88 ms; a marketing figure without a percentile."
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterm",
+                "max_items": 100,
+                "note": "At most 1200 characters in all; ink-2 and ink-preview only."
+              }
+            ],
+            "wire": "cartesia_stt_turns_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/cartesia/config.rs:158",
+            "notes": "The client knows one address, the manual socket (config.rs:158). The turn-detecting socket takes raw audio and JSON commands and reports the start of a turn, updates carrying the transcript so far, an early guess that the turn has ended, a resumed turn and the end of the turn; Cartesia decides where the turn ends. A client for it would map those events onto the gateway's turn controller."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": true,
+        "bills_failed_requests": false,
+        "notes": "Billed at 3 credits per second of audio on the streaming sockets, silence included even when no transcript is produced; failed requests are not billed. There is no file endpoint and so no file rate. gateway/src/config/pricing.rs has no entry for this model, so metering reports no price until one is added."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cartesia.ai/build-with-cartesia/stt/latest.md",
+          "https://docs.cartesia.ai/use-the-api/stt/compare-endpoints.md",
+          "https://docs.cartesia.ai/api-reference/stt/websocket.md",
+          "https://docs.cartesia.ai/api-reference/stt/turns/websocket.md",
+          "https://docs.cartesia.ai/use-the-api/stt/turns.md",
+          "https://docs.cartesia.ai/use-the-api/stt/troubleshooting/manual.md",
+          "https://docs.cartesia.ai/use-the-api/stt/keyterms.md",
+          "https://docs.cartesia.ai/pricing.md",
+          "https://docs.cartesia.ai/use-the-api/concurrency-limits-and-timeouts.md",
+          "https://docs.cartesia.ai/use-the-api/api-conventions.md",
+          "https://docs.cartesia.ai/get-started/authenticate-your-client-applications.md",
+          "https://www.cartesia.ai/ink"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/cartesia/client.rs:592-608",
+          "gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+          "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358",
+          "gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608",
+          "gateway/tests/mock_endpoint_e2e.rs:1339-1362",
+          "gateway/tests/chaos_reconnect.rs:589",
+          "gateway/src/core/stt/cartesia/config.rs:158",
+          "gateway/src/core/stt/cartesia/config.rs:30-67,75,185"
+        ],
+        "unverified": [
+          "the existing streaming client against the live vendor: whether Cartesia still accepts the api_key query parameter, the JSON-quoted commands and the done command, and what API version 2025-04-16 still selects; if any is rejected the client does not work today",
+          "transports[1] behaviour for this model: how it behaves on the manual socket when finalize is never sent, since its silence parameters are documented for ink-whisper only",
+          "latency on every transport (the vendor's product page claims about 0.1 s to the final transcript, a marketing figure without a percentile)",
+          "limits.rates (concurrency) on every transport (12 is the Pro plan, the lowest paid plan; Free is 8, Startup 20, Scale 60, Enterprise by agreement; open sockets, idle or not, and HTTP requests share the one limit)",
+          "limits.rates[].scope (the vendor ties the limit to the plan; recorded as account)",
+          "limits.rates (requests) (no figure is published; only concurrency limits are)",
+          "limits.max_session_ms (no session length limit is in the evidence; idle_timeout_ms records that Cartesia closes an idle socket after 3 minutes)",
+          "transports[0].vendor_turn_signal and transports[1].vendor_turn_signal (recorded as silence from the vendor's description of a silence-based fallback; unconfirmed for this model)",
+          "billing.min_billed_ms (none documented)",
+          "transports[*].stream_audio (the sample rates are the list the gateway's client validates, gateway/src/core/stt/cartesia/config.rs:75 and :185; the vendor's own list of socket rates is not in the fetched evidence. The vendor also accepts pcm_s32le, pcm_f16le and pcm_f32le, which the map cannot express)"
+        ],
+        "notes": "Cartesia's current speech-to-text model, released 2026-09-17 with status Stable. It streams on two sockets: the manual socket (/stt/websocket), where the client is expected to send finalize, and the turn-detecting socket (/stt/turns/websocket), where Cartesia decides the end of the turn. It has no file endpoint (the vendor's pricing table says 'Not available yet'), so cutting the call into uploaded utterances is neither possible nor needed. It covers English, French, Hindi, Japanese and Spanish with automatic detection, and takes vocabulary as keyterm (up to 100 terms). A live call today reaches it through the existing client on the manual socket without finalize, which the vendor describes as slower by design; the model id reaches the wire because live sessions use the standardized configuration path (gateway/src/handlers/ws/config_handler.rs:1921 and 1947; gateway/src/core/stt/cartesia/config.rs:355-358). The order among the two unbuilt transports follows the vendor audit, which ranks gateway-driven finalize as the main latency gain and a client for the turn-detecting socket as optional later work. Cartesia closes an idle socket after 3 minutes (limits.idle_timeout_ms). The gateway-driven finalize transport is enabled from Release 4, live-only models and low latency; no release builds a client for the turn-detecting socket. From Release 4 the gateway-driven finalize transport replaces today's client for covered sessions, behind WAAV_STT_CARTESIA_MANUAL_FINALIZE and only after a live probe (addendum B8); this is a deliberate change to a streaming session."
+      }
+    },
+    {
+      "id": "cartesia:ink-preview",
+      "match": {
+        "provider": "cartesia",
+        "model": "ink-preview"
+      },
+      "lifecycle": {
+        "status": "preview"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "cartesia_manual_finalize",
+          "enabled_from_release": 4,
+          "disabled_reason": "Not implemented. The method that sends Cartesia's finalize command exists but nothing calls it, the command is written in a form that differs from the vendor's documentation, and the client does not join the vendor's delta chunks into one transcript per utterance.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No benchmark for this model is in the evidence."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "commit": {
+            "audio_gating": "continuous"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterm",
+                "max_items": 100,
+                "note": "At most 1200 characters in all; ink-2 and ink-preview only."
+              }
+            ],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/cartesia/client.rs:592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+            "notes": "Cartesia built this socket for a client that decides where the utterance ends: the client streams audio and sends the text command finalize when its own voice detector says the caller stopped; the server returns the remaining transcript and then a flush_done acknowledgment. The vendor calls sending finalize crucial for low latency. Three things are missing. First, a caller for the existing finalize method (client.rs:592-608): it should be driven by the gateway's own detector reporting the end of speech. Second, the command must go out as bare text; the client serialises it as a JSON-quoted string (messages.rs:45-57). Third, final chunks are deltas and must be joined without trimming, and the turn should end on flush_done or on the turn controller's decision, not on every final chunk (messages.rs:104-111). The vendor warns that finalizing in the middle of speech causes transcription errors, and that the server waits for more audio rather than assuming silence when frames stop arriving."
+          },
+          "enable_requires": [
+            "live_probe"
+          ]
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No figure exists for this socket when the client never sends finalize. Cartesia says its silence fallback is slower by design because it waits out a pause."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterm",
+                "max_items": 100,
+                "note": "At most 1200 characters in all; ink-2 and ink-preview only."
+              }
+            ],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "The client never sends finalize, so Cartesia's slower silence fallback ends each utterance, and it marks every final chunk as the end of the caller's turn although each chunk's text is a delta, so one utterance can end the turn more than once. It also differs from the current documentation in its authentication parameter, pinned API version and command format, with an effect nobody has probed.",
+            "code_ref": "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358; gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111; gateway/tests/mock_endpoint_e2e.rs:1339-1362; gateway/tests/chaos_reconnect.rs:589",
+            "notes": "Exercised only against in-repo mock sockets (a mock end-to-end test and a reconnect test); the evidence records no run against Cartesia. Each caller chunk is written at once as a raw binary frame (client.rs:115-121) and every transcript event is forwarded, interim or final (client.rs:386-392). The client never sends Cartesia's finalize command (the method that would is unused, client.rs:592-608), so Cartesia's silence fallback ends each utterance. Every final chunk is marked as the end of the caller's turn (messages.rs:104-111), although the vendor's text is a delta since the previous final chunk, so one utterance can end the turn more than once. Confidence is invented, 1.0 for a final and 0.0 for an interim, because Cartesia returns none (messages.rs:109). The client differs from Cartesia's current documentation in three ways whose effect is unknown: it authenticates with an api_key query parameter (config.rs:279-280) where the documentation now lists a header or an access-token parameter; it pins API version 2025-04-16 (config.rs:139) where the current version is 2026-08-14 and structured error codes start at 2026-03-01; and it ends the session with the JSON-quoted text \"done\" (client.rs:82-91, messages.rs:45-57) where the documentation specifies the bare text close. If Cartesia has stopped accepting any of these, this client does not work today; probe it against the vendor before relying on it. For this model the gateway's endpointing setting has no effect: it becomes max_silence_duration_secs (config.rs:349-351), which Cartesia applies to ink-whisper only, so how long the silence fallback waits is unknown. The client also sends a language parameter whenever a language is configured (config.rs:288-292), which Cartesia documents for ink-whisper only; this model detects the language itself. The client does not send keyterm."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway has no client for Cartesia's turn-detecting socket (/stt/turns/websocket).",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "semantic",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 100,
+                "basis": "vendor_claim",
+                "source": "https://www.cartesia.ai/ink",
+                "conditions": "Cartesia's product page: 'Time to final transcript is 0.1s', shown as 88 ms; a marketing figure without a percentile. It is stated for ink-2, not for this preview model."
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterm",
+                "max_items": 100,
+                "note": "At most 1200 characters in all; ink-2 and ink-preview only."
+              }
+            ],
+            "wire": "cartesia_stt_turns_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/cartesia/config.rs:158",
+            "notes": "The client knows one address, the manual socket (config.rs:158). The turn-detecting socket takes raw audio and JSON commands and reports the start of a turn, updates carrying the transcript so far, an early guess that the turn has ended, a resumed turn and the end of the turn; Cartesia decides where the turn ends. A client for it would map those events onto the gateway's turn controller."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor's pricing page lists no credit rate for ink-preview. gateway/src/config/pricing.rs has no entry for it."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cartesia.ai/build-with-cartesia/stt/latest.md",
+          "https://docs.cartesia.ai/use-the-api/stt/compare-endpoints.md",
+          "https://docs.cartesia.ai/api-reference/stt/websocket.md",
+          "https://docs.cartesia.ai/api-reference/stt/turns/websocket.md",
+          "https://docs.cartesia.ai/use-the-api/stt/turns.md",
+          "https://docs.cartesia.ai/use-the-api/stt/troubleshooting/manual.md",
+          "https://docs.cartesia.ai/use-the-api/stt/keyterms.md",
+          "https://docs.cartesia.ai/pricing.md",
+          "https://docs.cartesia.ai/use-the-api/concurrency-limits-and-timeouts.md",
+          "https://www.cartesia.ai/ink"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/cartesia/client.rs:592-608",
+          "gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+          "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358",
+          "gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608",
+          "gateway/tests/mock_endpoint_e2e.rs:1339-1362",
+          "gateway/tests/chaos_reconnect.rs:589",
+          "gateway/src/core/stt/cartesia/config.rs:158",
+          "gateway/src/core/stt/cartesia/config.rs:30-67,75,185"
+        ],
+        "unverified": [
+          "the existing streaming client against the live vendor: whether Cartesia still accepts the api_key query parameter, the JSON-quoted commands and the done command, and what API version 2025-04-16 still selects; if any is rejected the client does not work today",
+          "transports[1] behaviour for this model: how it behaves on the manual socket when finalize is never sent, since its silence parameters are documented for ink-whisper only",
+          "latency on every transport (the vendor's product page claims about 0.1 s to the final transcript, a marketing figure without a percentile)",
+          "limits.rates (concurrency) on every transport (12 is the Pro plan, the lowest paid plan; Free is 8, Startup 20, Scale 60, Enterprise by agreement; open sockets, idle or not, and HTTP requests share the one limit)",
+          "limits.rates[].scope (the vendor ties the limit to the plan; recorded as account)",
+          "limits.rates (requests) (no figure is published; only concurrency limits are)",
+          "limits.max_session_ms (no session length limit is in the evidence; idle_timeout_ms records that Cartesia closes an idle socket after 3 minutes)",
+          "transports[0].vendor_turn_signal and transports[1].vendor_turn_signal (recorded as silence from the vendor's description of a silence-based fallback; unconfirmed for this model)",
+          "billing.min_billed_ms (none documented)",
+          "transports[2] for this model: Cartesia's API reference lists ink-preview for the turn-detecting socket, while its endpoint comparison says that socket supports ink-2 only; only the manual socket is certain for ink-preview",
+          "billing (no credit rate is published for this model)",
+          "transports[*].stream_audio (the sample rates are the list the gateway's client validates, gateway/src/core/stt/cartesia/config.rs:75 and :185; the vendor's own list of socket rates is not in the fetched evidence. The vendor also accepts pcm_s32le, pcm_f16le and pcm_f32le, which the map cannot express)"
+        ],
+        "notes": "Preview model released 2026-09-17 alongside ink-2, with the same languages; the vendor says a preview model may change. It streams on two sockets: the manual socket (/stt/websocket), where the client is expected to send finalize, and the turn-detecting socket (/stt/turns/websocket), where Cartesia decides the end of the turn. It has no file endpoint (the vendor's pricing table says 'Not available yet'), so cutting the call into uploaded utterances is neither possible nor needed. It covers English, French, Hindi, Japanese and Spanish with automatic detection, and takes vocabulary as keyterm (up to 100 terms). A live call today reaches it through the existing client on the manual socket without finalize, which the vendor describes as slower by design; the model id reaches the wire because live sessions use the standardized configuration path (gateway/src/handlers/ws/config_handler.rs:1921 and 1947; gateway/src/core/stt/cartesia/config.rs:355-358). The order among the two unbuilt transports follows the vendor audit, which ranks gateway-driven finalize as the main latency gain and a client for the turn-detecting socket as optional later work. Cartesia closes an idle socket after 3 minutes (limits.idle_timeout_ms). The gateway-driven finalize transport is enabled from Release 4, live-only models and low latency; no release builds a client for the turn-detecting socket. From Release 4 the gateway-driven finalize transport replaces today's client for covered sessions, behind WAAV_STT_CARTESIA_MANUAL_FINALIZE and only after a live probe (addendum B8); this is a deliberate change to a streaming session."
+      }
+    },
+    {
+      "id": "cartesia:any",
+      "match": {
+        "provider": "cartesia",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "cartesia_manual_finalize",
+          "enabled_from_release": 4,
+          "disabled_reason": "Not implemented. The method that sends Cartesia's finalize command exists but nothing calls it, the command is written in a form that differs from the vendor's documentation, and the client does not join the vendor's delta chunks into one transcript per utterance.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Unknown model id; nothing measured."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "commit": {
+            "audio_gating": "continuous"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/cartesia/client.rs:592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+            "notes": "Cartesia built this socket for a client that decides where the utterance ends: the client streams audio and sends the text command finalize when its own voice detector says the caller stopped; the server returns the remaining transcript and then a flush_done acknowledgment. The vendor calls sending finalize crucial for low latency. Three things are missing. First, a caller for the existing finalize method (client.rs:592-608): it should be driven by the gateway's own detector reporting the end of speech. Second, the command must go out as bare text; the client serialises it as a JSON-quoted string (messages.rs:45-57). Third, final chunks are deltas and must be joined without trimming, and the turn should end on flush_done or on the turn controller's decision, not on every final chunk (messages.rs:104-111). The vendor warns that finalizing in the middle of speech causes transcription errors, and that the server waits for more audio rather than assuming silence when frames stop arriving."
+          },
+          "enable_requires": [
+            "live_probe"
+          ]
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No figure exists for this socket when the client never sends finalize. Cartesia says its silence fallback is slower by design because it waits out a pause."
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 180000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 8,
+                "plan": "free",
+                "scope": "account",
+                "note": "Every open socket, idle or not, and every HTTP request count against this one limit; Cartesia answers HTTP 429 (concurrency_limited) beyond it."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 12,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "startup",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 60,
+                "plan": "scale",
+                "scope": "account",
+                "note": "Enterprise plans set the limit by agreement."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              44100,
+              48000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "cartesia_stt_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "The client never sends finalize, so Cartesia's slower silence fallback ends each utterance, and it marks every final chunk as the end of the caller's turn although each chunk's text is a delta, so one utterance can end the turn more than once. It also differs from the current documentation in its authentication parameter, pinned API version and command format, with an effect nobody has probed.",
+            "code_ref": "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358; gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608; gateway/src/core/stt/cartesia/messages.rs:45-57,104-111; gateway/tests/mock_endpoint_e2e.rs:1339-1362; gateway/tests/chaos_reconnect.rs:589",
+            "notes": "Exercised only against in-repo mock sockets (a mock end-to-end test and a reconnect test); the evidence records no run against Cartesia. Each caller chunk is written at once as a raw binary frame (client.rs:115-121) and every transcript event is forwarded, interim or final (client.rs:386-392). The client never sends Cartesia's finalize command (the method that would is unused, client.rs:592-608), so Cartesia's silence fallback ends each utterance. Every final chunk is marked as the end of the caller's turn (messages.rs:104-111), although the vendor's text is a delta since the previous final chunk, so one utterance can end the turn more than once. Confidence is invented, 1.0 for a final and 0.0 for an interim, because Cartesia returns none (messages.rs:109). The client differs from Cartesia's current documentation in three ways whose effect is unknown: it authenticates with an api_key query parameter (config.rs:279-280) where the documentation now lists a header or an access-token parameter; it pins API version 2025-04-16 (config.rs:139) where the current version is 2026-08-14 and structured error codes start at 2026-03-01; and it ends the session with the JSON-quoted text \"done\" (client.rs:82-91, messages.rs:45-57) where the documentation specifies the bare text close. If Cartesia has stopped accepting any of these, this client does not work today; probe it against the vendor before relying on it."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Nothing is known about how an unrecognised Cartesia id is billed. Known models are billed in credits per second of audio on the socket, silence included."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cartesia.ai/use-the-api/stt/compare-endpoints.md",
+          "https://docs.cartesia.ai/api-reference/stt/websocket.md",
+          "https://docs.cartesia.ai/api-reference/stt/transcribe.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/cartesia/client.rs:592-608",
+          "gateway/src/core/stt/cartesia/messages.rs:45-57,104-111",
+          "gateway/src/core/stt/cartesia/config.rs:139,145,158,279-292,320-329,346-358",
+          "gateway/src/core/stt/cartesia/client.rs:82-91,115-121,386-392,592-608",
+          "gateway/tests/mock_endpoint_e2e.rs:1339-1362",
+          "gateway/tests/chaos_reconnect.rs:589",
+          "gateway/src/core/stt/cartesia/config.rs:30-67,75,185"
+        ],
+        "unverified": [
+          "everything in this row: it is the assumption for a Cartesia id that no exact row matches",
+          "the existing streaming client against the live vendor: whether Cartesia still accepts the api_key query parameter, the JSON-quoted commands and the done command, and what API version 2025-04-16 still selects; if any is rejected the client does not work today",
+          "dialect.language_param (unknown for an unseen id: ink-whisper needs a language, the ink-2 family detects it; the existing client sends a language whenever one is configured)",
+          "transports[*].stream_audio (the sample rates are the list the gateway's client validates, gateway/src/core/stt/cartesia/config.rs:75 and :185; the vendor's own list of socket rates is not in the fetched evidence. The vendor also accepts pcm_s32le, pcm_f16le and pcm_f32le, which the map cannot express)"
+        ],
+        "notes": "Provider default, used for a Cartesia id with no exact row. Unlike most providers it lists streaming, not file upload. The general rule is to assume file upload for an unknown id, because that guess fails slow. Here it would fail outright: Cartesia's file endpoint accepts only the ink-whisper family, while its manual socket accepts every model the vendor offers, and the newest models have no file endpoint at all. So an unknown id is most likely a newer streaming model, and the socket is the only transport that can serve it. The first enabled transport is the existing client, which is today's behaviour: it sends any model id to the socket unchecked (gateway/src/core/stt/cartesia/config.rs:355-358). That client is tested against mocks only and differs from the vendor's current documentation, so 'the gateway streaming client is sound' has not been shown for this provider. From Release 4, live-only models and low latency, the first transport, the gateway-driven finalize on the same socket, takes over; it sends the session's model id as written, as today's client does. From Release 4 the gateway-driven finalize transport replaces today's client for covered sessions, behind WAAV_STT_CARTESIA_MANUAL_FINALIZE and only after a live probe (addendum B8); this is a deliberate change to a streaming session."
+      }
+    }
+  ]
+}

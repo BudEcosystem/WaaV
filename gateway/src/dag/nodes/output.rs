@@ -117,6 +117,9 @@ impl DAGNode for AudioOutputNode {
         // intentionally not delivered.
         if !matches!(self.destination, OutputDestination::Discard)
             && !audio_data.data.is_empty()
+            && !ctx
+                .metadata
+                .contains_key(crate::dag::context::STREAMING_DELIVERY_KEY)
             && !ctx.emit_output(DagOutput::Audio(audio_data.clone())).await
         {
             warn!(

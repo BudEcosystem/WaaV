@@ -1014,6 +1014,14 @@ components:
           - 'null'
           description: OpenAI-compatible base URL for the LLM.
           default: null
+        credential_ref:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Operator credential (`core::credentials`) the LLM leg uses when the client sends no key.
+            The NAME only — the secret stays in the credential's env var / file, bound to its hosts.
+          default: null
         model:
           type:
           - string
@@ -1059,6 +1067,21 @@ components:
         field always overrides. Mirrors the public, provider-agnostic shape of
         [`STTWebSocketConfig`].
       properties:
+        base_url:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The leg's own server (an OpenAI-compatible base such as `http://127.0.0.1:8080/v1`),
+            instead of the process-wide `OPENAI_BASE_URL`. SERVER-CONFIG-ONLY: never echoed and never
+            settable by a client; validated at startup with the egress rules (`validate_aliases`).
+          default: null
+        credential_ref:
+          type:
+          - string
+          - 'null'
+          description: Operator credential (`core::credentials`) the leg sends to `base_url`.
+          default: null
         language:
           type:
           - string
@@ -1086,6 +1109,18 @@ components:
         Mirrors the public, provider-agnostic shape of [`TTSWebSocketConfig`]. `emotion` is
         the canonical emotion token (resolved by the emotion mapper downstream).
       properties:
+        base_url:
+          type:
+          - string
+          - 'null'
+          description: The leg's own OpenAI-compatible speech server; see [`AliasStt::base_url`].
+          default: null
+        credential_ref:
+          type:
+          - string
+          - 'null'
+          description: Operator credential the leg sends to `base_url`.
+          default: null
         emotion:
           oneOf:
           - type: 'null'
@@ -1104,6 +1139,16 @@ components:
           - 'null'
           description: TTS provider name (e.g. `elevenlabs`).
           default: null
+        request_timeout_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The synthesis request's timeout, seconds, when the client names none (the default is
+            60 s; a model loading on demand can take longer). Clamped like a client's value.
+          default: null
+          minimum: 0
         voice:
           type:
           - string
@@ -1340,7 +1385,12 @@ components:
           type:
           - string
           - 'null'
-          description: API key (literal or `${ENV_VAR}`); falls back to `OPENAI_API_KEY`.
+          description: |-
+            Your own API key, sent as is. `${NAME}` is the legacy spelling of `credential_ref: NAME`
+            (an operator credential, see below) — the gateway never reads an arbitrary environment
+            variable for a client. Omitted: the vendor's key configured on the gateway is used only
+            toward that vendor's own host (`OPENAI_API_KEY` → `api.openai.com`); any other host gets
+            no key.
         barge_in_min_words:
           type:
           - integer
@@ -1358,6 +1408,14 @@ components:
             refused if present — under the Bud control plane, where the LLM leg is a Bud chat
             deployment reached through the Bud gateway (FRD-023 RT6).
           example: https://api.openai.com/v1
+        credential_ref:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Name of an operator credential (`WAAV_CREDENTIALS_FILE`) to authenticate with. It is sent
+            only if `base_url` is one of the credential's hosts; otherwise the config is refused.
+            Takes precedence over `api_key`.
         degradation_message:
           type:
           - string
@@ -1396,6 +1454,19 @@ components:
           description: |-
             D3: custom masking phrases (action wording, e.g. "Let me check that order").
             Empty = the built-in pool. Pre-rendered at session start at the call's rate.
+        llm_timeout_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            LLM request timeout in ms. Omit for the server default (`WAAV_LLM_TIMEOUT_MS`, else
+            60000); clamped to 1000 .. `WAAV_LLM_MAX_TIMEOUT_MS` (default 300000). Raise it for a
+            self-hosted model that loads on its first request. With the server's
+            `WAAV_LLM_STREAM_IDLE_TIMEOUT_MS` set, it bounds the first token of a streamed reply,
+            not the whole reply.
+          example: 120000
+          minimum: 0
         max_history:
           type: integer
           description: Max retained history messages (default 20).
@@ -1478,6 +1549,13 @@ components:
             the safe default (15000); `0` disables. Ignored without a `reasoning_model`.
           example: 15000
           minimum: 0
+        reasoning_credential_ref:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Operator credential for the reasoning tier (bound to `reasoning_base_url`, or `base_url`
+            when that is unset). Takes precedence over `reasoning_api_key`.
         reasoning_effort:
           oneOf:
           - type: 'null'
@@ -2116,7 +2194,9 @@ components:
             enum:
             - truncate
       - type: object
-        description: 'Voice-agent sessions (spec 025): a typed user turn — no speech, the same agent turn.'
+        description: |-
+          A typed user turn — no speech, the same turn — on a voice-agent (spec 025) or
+          conversation session. It interrupts the reply in progress.
         required:
         - text
         - type
@@ -2480,6 +2560,16 @@ components:
               Unique identifier for this WebSocket session.
               Either provided by the client in config or auto-generated by server (UUID v4).
             example: 550e8400-e29b-41d4-a716-446655440000
+          stt:
+            type:
+            - object
+            - 'null'
+            description: |-
+              What speech-to-text this session got: streaming, segmented (the gateway cuts the
+              caller's audio at pauses and uploads each utterance) or buffered, the kind of interim
+              results, who decides where an utterance ends, the expected latency and its basis, and
+              notices. The fields are defined in `docs/segmented-stt/customer-contract-reference.md`.
+              Absent when the rollout switch does not cover the session.
           type:
             type: string
             enum:
@@ -2602,6 +2692,134 @@ components:
             - error
       - type: object
         description: |-
+          An `error` with a stable code. Same `type` as [`Self::Error`]; an uncoded error keeps its
+          exact bytes. `recoverable: true` means the socket is still usable (a refusal made before
+          the session id is stored accepts a corrected `config`).
+        required:
+        - message
+        - code
+        - recoverable
+        - type
+        properties:
+          code:
+            type: string
+          details:
+            type:
+            - object
+            - 'null'
+          message:
+            type: string
+          recoverable:
+            type: boolean
+          type:
+            type: string
+            enum:
+            - error
+      - type: object
+        description: |-
+          Detector-timed speech events (segmented sessions) and the gateway's turn decisions.
+          `event`: `speech_start`, `speech_end`, `turn_start`, `turn_end`, `turn_closed`.
+        required:
+        - event
+        - turn_id
+        - type
+        properties:
+          audio_ms:
+            type:
+            - integer
+            - 'null'
+            format: int64
+            minimum: 0
+          discarded:
+            type:
+            - boolean
+            - 'null'
+          event:
+            type: string
+          had_transcript:
+            type:
+            - boolean
+            - 'null'
+          reason:
+            type:
+            - string
+            - 'null'
+          sustained_ms:
+            type:
+            - integer
+            - 'null'
+            format: int32
+            minimum: 0
+          turn_id:
+            type: integer
+            format: int64
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - vad_event
+      - type: object
+        description: |-
+          A speech-to-text problem that does not end the call (a lost segment, dropped audio). Never
+          sent as `error`, which deployed widgets treat as a disconnect.
+        required:
+        - code
+        - message
+        - type
+        properties:
+          code:
+            type: string
+          detail:
+            type:
+            - object
+            - 'null'
+          message:
+            type: string
+          type:
+            type: string
+            enum:
+            - stt_warning
+      - type: object
+        description: |-
+          A turn of the session's DAG failed. It is an `error` (a client that reads only `message`
+          sees it as before) that also names the node: the turn is abandoned, the session stays up
+          and the next utterance runs the graph again.
+        required:
+        - message
+        - code
+        - dag_id
+        - type
+        properties:
+          code:
+            type: string
+            description: |-
+              `dag_node_failed`, `dag_node_timeout` (a node ran past its timeout) or
+              `dag_turn_timeout` (the turn ran past `dag_config.timeout_ms`).
+            example: dag_node_timeout
+          dag_id:
+            type: string
+            description: The DAG's `id`.
+          message:
+            type: string
+            description: Human-readable error, naming the node.
+          node_id:
+            type:
+            - string
+            - 'null'
+            description: The node that failed, when one did.
+            example: tts
+          node_type:
+            type:
+            - string
+            - 'null'
+            description: The failed node's type (`tts_provider`, `llm_endpoint`, ...).
+            example: tts_provider
+          type:
+            type: string
+            enum:
+            - error
+      - type: object
+        description: |-
           Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
 
           Sent at config time when a setting is sub-optimal but the session still
@@ -2679,7 +2897,10 @@ components:
             enum:
             - auth_required
       - type: object
-        description: 'Voice agent (spec 025): an agent turn began (`kind`: `agent` or `greeting`).'
+        description: |-
+          A reply began: a voice-agent turn (spec 025; `kind` `agent`, `greeting` or `notice`) or a
+          conversation-loop turn (`kind` `agent`; `input` absent for the idle check-in and async-tool
+          follow-ups).
         required:
         - turn_index
         - kind
@@ -2718,7 +2939,9 @@ components:
             enum:
             - agent_response_created
       - type: object
-        description: 'Voice agent: the agent''s words, as they are spoken (or shown, in text mode).'
+        description: |-
+          The reply's words as they are handed to speech (or shown, in a voice agent's text mode).
+          Voice-agent and conversation sessions; their concatenation is what the caller heard.
         required:
         - turn_index
         - delta
@@ -2808,7 +3031,9 @@ components:
             enum:
             - agent_output
       - type: object
-        description: 'Voice agent: the turn ended (`completed`, `cancelled`, `failed`, `incomplete`).'
+        description: |-
+          The reply ended (`completed`, `cancelled`, `failed`, `incomplete`). Voice-agent and
+          conversation sessions.
         required:
         - turn_index
         - kind
@@ -2838,7 +3063,9 @@ components:
           usage:
             type: object
       - type: object
-        description: 'Voice agent: the reply was cut off; the agent''s history keeps `spoken`.'
+        description: |-
+          The reply was cut off by the caller; `spoken` is what had been sent to speech and
+          `audio_end_ms` the reply's audio delivered by then. Voice-agent and conversation sessions.
         required:
         - turn_index
         - spoken
@@ -3464,6 +3691,17 @@ components:
             Model to use for transcription. Optional — defaults to empty, letting the provider pick its
             own default model (each provider maps an empty model to its recommended default).
           example: nova-2
+        noise_suppression:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            WaaV's own denoiser (DeepFilterNet) on this session's uplink, ahead of the VAD / turn
+            models and the STT provider — the same `noise_suppression` a Bud deployment's `stt`
+            settings carry for REST transcription, which is the default here. Off unless asked for:
+            it costs CPU per session and adds ~30 ms. Mono `linear16` (or gateway-decoded opus)
+            only. A build without the `noise-filter` feature, or a server with no stream to give,
+            says so in a `config_warning` and goes on unfiltered.
         provider:
           type: string
           description: |-
@@ -3480,6 +3718,16 @@ components:
           description: Sample rate of the audio in Hz
           example: 16000
           minimum: 0
+        transcription_mode:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The kind of speech-to-text the client wants: `auto` (the default: whatever the model
+            supports), `streaming` (refuse a model that cannot stream) or `segmented` (the gateway cuts
+            the audio at pauses and uploads each utterance, even for a model that streams). A plain
+            session on a model whose today client buffers until `audio_end` moves to the segmented
+            engine only when it asks for `segmented`.
         translation:
           oneOf:
           - type: 'null'

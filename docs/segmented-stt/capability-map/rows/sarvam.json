@@ -1,0 +1,1311 @@
+{
+  "provider_id": "sarvam",
+  "provider": {
+    "aliases": [
+      "sarvam-ai",
+      "sarvam.ai",
+      "saarika"
+    ],
+    "default_model": "saarika:v2.5",
+    "model_string": "wire_model",
+    "registered_in_gateway": true,
+    "notes": "Aliases are the ones registered at gateway/src/plugin/builtin/mod.rs:1714-1715. The standard factory matches only the exact id 'sarvam' (gateway/src/core/stt/standard.rs:457), so a session that uses an alias falls to the flat factory. default_model records what the code does today: an empty model becomes saarika:v2.5 (gateway/src/core/stt/sarvam/config.rs:26, 141-145). That id is deprecated and absent from the legacy socket's documented model list; the audit recommends changing the default to saaras:v4, and this field must change in the same commit. Sarvam has two generations of socket: the legacy one the gateway speaks (one final per utterance, no interim text) and a realtime one with partial transcripts and manual endpointing, for which the gateway has no client. No Sarvam model on sale is file-only, so file upload is a fallback. Rate limits, not price, bind a segmented path here: 60 requests per minute per account on the Starter tier. The streaming client accepts only 8 kHz and 16 kHz sessions (gateway/src/core/stt/sarvam/config.rs:317-322), so a /v1/realtime voice agent, whose speech-to-text leg is set to 24 kHz (gateway/src/handlers/openai_realtime/cascade.rs:342), fails at setup with Sarvam today. The rows list two commit transports that no release builds, the realtime socket and a gateway-driven flush on the legacy socket. Both carry the adapter id planned_commit and are told apart by dialect.wire (sarvam_realtime_websocket and sarvam_legacy_websocket), because they differ in wire format and language notation."
+  },
+  "rows": [
+    {
+      "id": "sarvam:saaras-v4",
+      "match": {
+        "provider": "sarvam",
+        "model": "saaras:v4"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "none",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "fast",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1170,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat constant SARVAM_TTFS_P99 = 1.17 s, read from Pipecat main on 2026-10-03, for Sarvam's legacy streaming socket. The evidence does not say which model or which date Pipecat measured, so the figure is a seed for the segment deadline, not a per-model measurement."
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 60000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Published under one 'WebSocket Streaming' heading; whether the legacy and realtime sockets share one pool is not stated. The vendor's limiter also reacts to the burst rate of new connections and rejects with close code 1003."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language-code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms",
+                "max_items": 50,
+                "note": "saaras:v4 only. At most 50 terms of at most 64 characters each, sent as one JSON-encoded array in a single field. Today's client does not send key terms on this socket; it appends a prompt parameter the legacy socket does not document (config.rs:276-279)."
+              }
+            ],
+            "wire": "sarvam_legacy_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/sarvam/config.rs:23-53,139-166,235-346; gateway/src/core/stt/sarvam/provider.rs:150-157,218-262,421-460,538-550,610-625; gateway/tests/mock_endpoint_e2e.rs:1395-1419; gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs:122-141",
+            "notes": "The client has a mock end-to-end test and was verified live against this socket on 2026-06-04, but with the model saarika:v2.5, never with saaras:v4, so this row is recorded as wire-tested only. The vendor accepts keyterms for this model on this socket; the existing client does not send them, and instead appends a prompt parameter the legacy socket does not document (config.rs:276-279). This client dials the socket Sarvam now labels legacy (wss://api.sarvam.ai/speech-to-text/ws, config.rs:23). It returns one final transcript per utterance and no interim text. Each caller chunk is base64-encoded and sent at once as a JSON text frame (provider.rs:218-241); Sarvam's server-side voice detector ends the utterance; the gateway never sends a flush (flush_signal is fixed to false, config.rs:163). Differences from the vendor documentation, found by reading and not re-probed: the client matches voice-activity events named START and END while the vendor reference names them START_SPEECH and END_SPEECH, so every final is flagged end of speech (provider.rs:429, 447-460); the error frame is parsed for data.message while the vendor sends data.error (provider.rs:150-157); confidence is invented as 0.95 because the vendor sends none (provider.rs:430); finals are dropped if a 256-slot channel is full (provider.rs:433-444, 549); only 11 language codes are accepted and an empty language becomes hi-IN (config.rs:41-53, 146-150, 324-330); the codec check accepts 'pcm', which is not a vendor value, and rejects mu-law and A-law before any dial (config.rs:156-160, 333); no model id is checked (config.rs:315-346). The standard factory matches only the exact provider id 'sarvam' (gateway/src/core/stt/standard.rs:457). No vendor quality signal reaches the gateway on this transport, so none is listed. Sarvam returns language_probability on this socket only when it detects the language itself; this client cannot ask for that (an empty language becomes hi-IN, config.rs:146-150, and 'unknown' fails the language check, config.rs:41-53, 325-330), has no field for it in its response type (provider.rs:120-135), and reports a confidence that is the constant 0.95 (provider.rs:430). Validation rejects any session sample rate other than 8000 or 16000 Hz (config.rs:317-322). The /v1/realtime cascade sets the speech-to-text rate to 24000 (gateway/src/handlers/openai_realtime/cascade.rs:34, 342), so a voice-agent session on that route, and any session at 24 kHz or 48 kHz, fails at setup on this transport. For an 8 kHz session the client writes 8000 into every audio frame (provider.rs:544); the vendor reference lists 16000, 22050 and 24000 for that field and says 8 kHz is set only on the connection, while the vendor's guide says to set it in both places, so the outcome for a telephone leg is unknown. The vendor's best-practices page says this socket closes after 60 seconds of inactivity and recommends silent audio as keep-alive. The client instead sends a JSON ping after 30 seconds without audio (config.rs:32; provider.rs:291-312), which is not a client message the vendor documents for this socket, and it treats any vendor error frame as fatal with no reconnect (provider.rs:254-260).",
+            "defect": "Found by reading, not re-probed: voice-activity events are matched as START and END while the vendor sends START_SPEECH and END_SPEECH, so every final is flagged end of speech, and the error frame is parsed for data.message while the vendor sends data.error (provider.rs:429, 447-460, 150-157). Validation accepts only 8 kHz and 16 kHz linear PCM and 11 languages, so a 24 kHz /v1/realtime voice agent or a mu-law telephone leg fails at setup (config.rs:317-322, 324-333)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway has no client for Sarvam's realtime socket (wss://api.sarvam.ai/speech-to-text-realtime/ws). Enable only after that client exists and a live probe shows the account can open the socket: one vendor page calls the realtime model beta and close code 4000 covers 'account not enabled'.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Published under one 'WebSocket Streaming' heading; whether the legacy and realtime sockets share one pool is not stated. The vendor's limiter also reacts to the burst rate of new connections and rejects with close code 1003."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              },
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms",
+                "max_items": 50,
+                "note": "saaras:v4 only. At most 50 terms of at most 64 characters each, sent as one JSON-encoded array in a single field."
+              }
+            ],
+            "wire": "sarvam_realtime_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "This is the gateway-driven commit on a vendor socket. The realtime socket sends partial transcripts while the caller speaks and offers endpointing=manual, where the client sends speech_start, speech_end and flush; with endpointing=vad the vendor's own detector ends the utterance instead, which is why the owner is 'either'. With manual endpointing the gateway's detector decides the boundary and no upload round trip is needed, so the audit rates this the better investment for real-time quality than file upload. Wire differences from the legacy socket that the new client must handle: audio is sent as {\"event\":\"audio_input\",\"audio\":\"<base64>\"}; raw PCM only (linear16, linear32, mulaw, alaw at 8 or 16 kHz); auto-detect is 'auto' and Odia is 'or-IN' (the legacy socket and REST use 'unknown' and 'od-IN'); language_code is required; keep-alive is ping and pong; session.end reports the billed audio duration. The final transcript carries no confidence and no word list; language_confidence is the only quality signal. Pipecat's 1.00 s constant for this socket is marked provisional and is not a measurement, so the latency is recorded as unmeasured."
+          },
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": 1000,
+            "bills_silence": null,
+            "notes": "The vendor's session.end.audio_duration_s is the billed audio quantity. Whether silence on the open socket counts, and whether the 1 second minimum applies per session, is not stated."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. No Sarvam file-request code exists in the gateway (gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:102-123 do not include Sarvam). Useful only as a fallback when the socket is refused or its breaker is open; it unlocks no model.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 60,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Counted per Sarvam account across all keys (token bucket); excess is answered with 429 or 503. The gateway does not know the account's plan."
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 4000,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "flac",
+              "mp3",
+              "mp4",
+              "m4a",
+              "ogg",
+              "opus",
+              "webm",
+              "aac",
+              "aiff"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "quality_signals_require": [
+            "language_code=unknown"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms",
+                "max_items": 50,
+                "note": "saaras:v4 only. At most 50 terms of at most 64 characters each, sent as one JSON-encoded array in a single field."
+              }
+            ],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "sarvam_rest_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Synchronous request: POST https://api.sarvam.ai/speech-to-text, multipart/form-data, file part named 'file', header api-subscription-key (an invalid key returns 403, not 401). Audio longer than 30 seconds returns 422, so the 25 second default segment plus padding must be checked against that cap before upload. The limit recorded, 60 requests per minute, is the Starter tier (Pro 100, Business 4,000); it is shared by every call on the Sarvam account across all keys, so a limiter above the per-session cap of two uploads is required. Retry only on 429, 500 and 503. The response has no transcript confidence, no no-speech probability and no word timestamps; an empty transcript is the only no-speech signal, and language_probability is present only when the language was auto-detected. WAV is detected automatically and is the vendor's recommended format; raw PCM needs input_audio_codec and must be 16 kHz. The vendor also accepts AMR and WMA, which the map's format list cannot name. Sarvam's batch job API (POST /speech-to-text/job/v1, then upload, start, poll, download) is answered in minutes and is not a live transport, so it is not listed. keyterms: up to 50 terms of at most 64 characters each, sent as one JSON-encoded array in a single form field, this model only."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": 1000,
+            "increment_ms": 1000,
+            "bills_silence": false,
+            "notes": "Each upload is billed per second of uploaded audio, rounded up, with a 1 second minimum (vendor FAQ); only uploaded segments are billed. No pricing_key exists for Sarvam speech-to-text."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 1000,
+        "increment_ms": 1000,
+        "bills_silence": null,
+        "notes": "Priced per hour of audio and billed per second, rounded up to the next second, with a 1 second minimum charge (vendor FAQ). The FAQ does not say whether the minimum applies per REST request or per socket session. Whether silence on an open socket is billed is not stated. There is no Sarvam speech-to-text entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.sarvam.ai/api/getting-started/models/saaras.md",
+          "https://docs.sarvam.ai/api/getting-started/models/saarika.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/which-api-to-use.md",
+          "https://docs.sarvam.ai/changelog",
+          "https://docs.sarvam.ai/api-reference/legacy/speech-to-text/transcribe/ws.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/streaming-api.md",
+          "https://docs.sarvam.ai/api-reference/speech-to-text/transcribe/realtime/ws.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/realtime-streaming.md",
+          "https://docs.sarvam.ai/changelog/2026/8/18.md",
+          "https://docs.sarvam.ai/api-reference/speech-to-text/transcribe.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/rest-api.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/how-to/keyterms.md",
+          "https://docs.sarvam.ai/api/getting-started/errors-troubleshooting.md",
+          "https://docs.sarvam.ai/api/getting-started/ratelimits.md",
+          "https://docs.sarvam.ai/api/getting-started/pricing.md",
+          "https://docs.sarvam.ai/api/speech-to-text/faq.md",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/best-practices.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/sarvam/config.rs:23-53,139-166,235-346",
+          "gateway/src/core/stt/sarvam/provider.rs:150-157,218-262,421-460,538-550,610-625",
+          "gateway/tests/mock_endpoint_e2e.rs:1395-1419",
+          "gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs:122-141",
+          "gateway/src/core/stt/standard.rs:457",
+          "gateway/src/handlers/openai_realtime/cascade.rs:34,342",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/sarvam/config.rs:249-252"
+        ],
+        "unverified": [
+          "billing.bills_silence",
+          "transports[native].latency (Pipecat does not state the model or date measured)",
+          "transports[native].limits.idle_timeout_ms (60 s is the idle close stated on Sarvam's speech-to-text best-practices page, which the audit fetched; the fact-check looked for the keep-alive advice that accompanies it on two other pages, did not find it there, and does not list the best-practices page among its sources)",
+          "transports[native].limits.rates (concurrency) (20 is the Starter tier; Pro and Business allow 100; whether the legacy and realtime sockets share one pool is not stated)",
+          "the real wire values of the legacy socket's voice-activity signal and error field (documentation and two other clients agree with each other and disagree with the gateway; not re-probed)",
+          "transports[planned_file].limits.max_upload_bytes (no size limit is published; only the 30 second cap)",
+          "transports[planned_file].limits.rates (concurrency) (no REST concurrency limit is published)",
+          "transports[planned_file].latency (Sarvam publishes no REST latency and says there is no official round-trip figure)",
+          "transports[planned_commit] (whether every account may open the realtime socket)",
+          "transports[planned_commit].latency",
+          "transports[native].gateway_client (whether the legacy socket tolerates the client's JSON ping and a per-frame sample rate of 8000; the fact-check could verify neither)",
+          "transports[planned_file].limits.rates (requests) (60 is the Starter tier; Pro allows 100 and Business 4,000; the limit is counted per Sarvam account across all keys and the gateway does not know the account's tier)",
+          "transports[planned_file].limits.min_audio_ms and vendor_timeout_ms (neither a minimum audio length nor a request time limit is published)",
+          "transports[native, planned_commit].limits.max_session_ms (no maximum session length is published in the evidence)",
+          "transports[native].stream_audio.sample_rates_hz (8000 and 16000 are what today's client accepts and what the legacy socket documents; whether an 8 kHz session works depends on the per-frame sample rate, which is unverified)"
+        ],
+        "notes": "Sarvam's default and recommended model. It is the only id served on all four interfaces: the legacy socket (default there), the realtime socket (since 2026-09-03), synchronous REST (default there) and the batch job API. No Sarvam model is file-only, so file upload is a fallback here, not a requirement. The existing streaming client stays first so that today's path is unchanged. The audit recommends making this id the gateway's default model in place of saarika:v2.5."
+      }
+    },
+    {
+      "id": "sarvam:saaras-v3",
+      "match": {
+        "provider": "sarvam",
+        "model": "saaras:v3"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "none",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "fast",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1170,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat constant SARVAM_TTFS_P99 = 1.17 s, read from Pipecat main on 2026-10-03, for Sarvam's legacy streaming socket. The evidence does not say which model or which date Pipecat measured, so the figure is a seed for the segment deadline, not a per-model measurement."
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 60000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Published under one 'WebSocket Streaming' heading; whether the legacy and realtime sockets share one pool is not stated. The vendor's limiter also reacts to the burst rate of new connections and rejects with close code 1003."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language-code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "sarvam_legacy_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/sarvam/config.rs:23-53,139-166,235-346; gateway/src/core/stt/sarvam/provider.rs:150-157,218-262,421-460,538-550,610-625; gateway/tests/mock_endpoint_e2e.rs:1395-1419; gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs:122-141",
+            "notes": "The client has a mock end-to-end test and was verified live against this socket on 2026-06-04, but with the model saarika:v2.5, never with saaras:v3, so this row is recorded as wire-tested only. This client dials the socket Sarvam now labels legacy (wss://api.sarvam.ai/speech-to-text/ws, config.rs:23). It returns one final transcript per utterance and no interim text. Each caller chunk is base64-encoded and sent at once as a JSON text frame (provider.rs:218-241); Sarvam's server-side voice detector ends the utterance; the gateway never sends a flush (flush_signal is fixed to false, config.rs:163). Differences from the vendor documentation, found by reading and not re-probed: the client matches voice-activity events named START and END while the vendor reference names them START_SPEECH and END_SPEECH, so every final is flagged end of speech (provider.rs:429, 447-460); the error frame is parsed for data.message while the vendor sends data.error (provider.rs:150-157); confidence is invented as 0.95 because the vendor sends none (provider.rs:430); finals are dropped if a 256-slot channel is full (provider.rs:433-444, 549); only 11 language codes are accepted and an empty language becomes hi-IN (config.rs:41-53, 146-150, 324-330); the codec check accepts 'pcm', which is not a vendor value, and rejects mu-law and A-law before any dial (config.rs:156-160, 333); no model id is checked (config.rs:315-346). The standard factory matches only the exact provider id 'sarvam' (gateway/src/core/stt/standard.rs:457). No vendor quality signal reaches the gateway on this transport, so none is listed. Sarvam returns language_probability on this socket only when it detects the language itself; this client cannot ask for that (an empty language becomes hi-IN, config.rs:146-150, and 'unknown' fails the language check, config.rs:41-53, 325-330), has no field for it in its response type (provider.rs:120-135), and reports a confidence that is the constant 0.95 (provider.rs:430). Validation rejects any session sample rate other than 8000 or 16000 Hz (config.rs:317-322). The /v1/realtime cascade sets the speech-to-text rate to 24000 (gateway/src/handlers/openai_realtime/cascade.rs:34, 342), so a voice-agent session on that route, and any session at 24 kHz or 48 kHz, fails at setup on this transport. For an 8 kHz session the client writes 8000 into every audio frame (provider.rs:544); the vendor reference lists 16000, 22050 and 24000 for that field and says 8 kHz is set only on the connection, while the vendor's guide says to set it in both places, so the outcome for a telephone leg is unknown. The vendor's best-practices page says this socket closes after 60 seconds of inactivity and recommends silent audio as keep-alive. The client instead sends a JSON ping after 30 seconds without audio (config.rs:32; provider.rs:291-312), which is not a client message the vendor documents for this socket, and it treats any vendor error frame as fatal with no reconnect (provider.rs:254-260).",
+            "defect": "Found by reading, not re-probed: voice-activity events are matched as START and END while the vendor sends START_SPEECH and END_SPEECH, so every final is flagged end of speech, and the error frame is parsed for data.message while the vendor sends data.error (provider.rs:429, 447-460, 150-157). Validation accepts only 8 kHz and 16 kHz linear PCM and 11 languages, so a 24 kHz /v1/realtime voice agent or a mu-law telephone leg fails at setup (config.rs:317-322, 324-333)."
+          }
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The existing client fixes flush_signal to false and has no flush message (gateway/src/core/stt/sarvam/config.rs:163). saaras:v3 is not served on the realtime socket, so a gateway-driven commit for this model would have to use the legacy socket's flush.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 60000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Published under one 'WebSocket Streaming' heading; whether the legacy and realtime sockets share one pool is not stated. The vendor's limiter also reacts to the burst rate of new connections and rejects with close code 1003."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ]
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "quality_signals_require": [
+            "language-code=unknown"
+          ],
+          "dialect": {
+            "language_param": "language-code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "sarvam_legacy_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "The legacy socket documents a second client message besides audio: with flush_signal=true on the connect URL the client may send {\"type\":\"flush\"} to make the vendor finalise the audio it holds. Driving that from the gateway's detector would give gateway-owned segment boundaries with no upload. It yields no interim text. Whether the vendor's own detector still finalises on its own when flush_signal is true is not documented in the evidence. It shares the adapter id planned_commit with the realtime socket's commit transport; dialect.wire tells the two apart, because the realtime socket has a different wire format and language notation."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. No Sarvam file-request code exists in the gateway (gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:102-123 do not include Sarvam). Useful only as a fallback when the socket is refused or its breaker is open; it unlocks no model.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 60,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Counted per Sarvam account across all keys (token bucket); excess is answered with 429 or 503. The gateway does not know the account's plan."
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 4000,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "flac",
+              "mp3",
+              "mp4",
+              "m4a",
+              "ogg",
+              "opus",
+              "webm",
+              "aac",
+              "aiff"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "quality_signals_require": [
+            "language_code=unknown"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "sarvam_rest_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Synchronous request: POST https://api.sarvam.ai/speech-to-text, multipart/form-data, file part named 'file', header api-subscription-key (an invalid key returns 403, not 401). Audio longer than 30 seconds returns 422, so the 25 second default segment plus padding must be checked against that cap before upload. The limit recorded, 60 requests per minute, is the Starter tier (Pro 100, Business 4,000); it is shared by every call on the Sarvam account across all keys, so a limiter above the per-session cap of two uploads is required. Retry only on 429, 500 and 503. The response has no transcript confidence, no no-speech probability and no word timestamps; an empty transcript is the only no-speech signal, and language_probability is present only when the language was auto-detected. WAV is detected automatically and is the vendor's recommended format; raw PCM needs input_audio_codec and must be 16 kHz. The vendor also accepts AMR and WMA, which the map's format list cannot name. Sarvam's batch job API (POST /speech-to-text/job/v1, then upload, start, poll, download) is answered in minutes and is not a live transport, so it is not listed."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": 1000,
+            "increment_ms": 1000,
+            "bills_silence": false,
+            "notes": "Each upload is billed per second of uploaded audio, rounded up, with a 1 second minimum (vendor FAQ); only uploaded segments are billed. No pricing_key exists for Sarvam speech-to-text."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 1000,
+        "increment_ms": 1000,
+        "bills_silence": null,
+        "notes": "Priced per hour of audio and billed per second, rounded up to the next second, with a 1 second minimum charge (vendor FAQ). The FAQ does not say whether the minimum applies per REST request or per socket session. Whether silence on an open socket is billed is not stated. There is no Sarvam speech-to-text entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.sarvam.ai/api/getting-started/models/saaras.md",
+          "https://docs.sarvam.ai/api/getting-started/models/saarika.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/which-api-to-use.md",
+          "https://docs.sarvam.ai/changelog",
+          "https://docs.sarvam.ai/api-reference/legacy/speech-to-text/transcribe/ws.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/streaming-api.md",
+          "https://docs.sarvam.ai/api-reference/speech-to-text/transcribe.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/rest-api.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/how-to/keyterms.md",
+          "https://docs.sarvam.ai/api/getting-started/errors-troubleshooting.md",
+          "https://docs.sarvam.ai/api/getting-started/ratelimits.md",
+          "https://docs.sarvam.ai/api/getting-started/pricing.md",
+          "https://docs.sarvam.ai/api/speech-to-text/faq.md",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/best-practices.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/sarvam/config.rs:23-53,139-166,235-346",
+          "gateway/src/core/stt/sarvam/provider.rs:150-157,218-262,421-460,538-550,610-625",
+          "gateway/tests/mock_endpoint_e2e.rs:1395-1419",
+          "gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs:122-141",
+          "gateway/src/core/stt/standard.rs:457",
+          "gateway/src/handlers/openai_realtime/cascade.rs:34,342",
+          "gateway/src/core/stt/sarvam/config.rs:163",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/sarvam/config.rs:249-252"
+        ],
+        "unverified": [
+          "billing.bills_silence",
+          "transports[native].latency (Pipecat does not state the model or date measured)",
+          "transports[native].limits.idle_timeout_ms (60 s is the idle close stated on Sarvam's speech-to-text best-practices page, which the audit fetched; the fact-check looked for the keep-alive advice that accompanies it on two other pages, did not find it there, and does not list the best-practices page among its sources)",
+          "transports[native].limits.rates (concurrency) (20 is the Starter tier; Pro and Business allow 100; whether the legacy and realtime sockets share one pool is not stated)",
+          "the real wire values of the legacy socket's voice-activity signal and error field (documentation and two other clients agree with each other and disagree with the gateway; not re-probed)",
+          "transports[planned_file].limits.max_upload_bytes (no size limit is published; only the 30 second cap)",
+          "transports[planned_file].limits.rates (concurrency) (no REST concurrency limit is published)",
+          "transports[planned_file].latency (Sarvam publishes no REST latency and says there is no official round-trip figure)",
+          "transports[planned_commit].endpointing_owner (whether the vendor detector still ends utterances when flush_signal=true)",
+          "transports[native].gateway_client (whether the legacy socket tolerates the client's JSON ping and a per-frame sample rate of 8000; the fact-check could verify neither)",
+          "transports[planned_file].limits.rates (requests) (60 is the Starter tier; Pro allows 100 and Business 4,000; the limit is counted per Sarvam account across all keys and the gateway does not know the account's tier)",
+          "transports[planned_file].limits.min_audio_ms and vendor_timeout_ms (neither a minimum audio length nor a request time limit is published)",
+          "transports[native, planned_commit].limits.max_session_ms (no maximum session length is published in the evidence)",
+          "transports[native].stream_audio.sample_rates_hz (8000 and 16000 are what today's client accepts and what the legacy socket documents; whether an 8 kHz session works depends on the per-frame sample rate, which is unverified)"
+        ],
+        "notes": "Served on the legacy socket, synchronous REST and the batch job API. It is not in the realtime socket's model list (that socket takes saaras:v3-realtime and saaras:v4), and it has no keyterms support. File upload is a fallback only."
+      }
+    },
+    {
+      "id": "sarvam:saaras-v3-realtime",
+      "match": {
+        "provider": "sarvam",
+        "model": "saaras:v3-realtime"
+      },
+      "lifecycle": {
+        "status": "preview"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway has no client for Sarvam's realtime socket (wss://api.sarvam.ai/speech-to-text-realtime/ws). Enable only after that client exists and a live probe shows the account can open the socket: one vendor page calls the realtime model beta and close code 4000 covers 'account not enabled'.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Published under one 'WebSocket Streaming' heading; whether the legacy and realtime sockets share one pool is not stated. The vendor's limiter also reacts to the burst rate of new connections and rejects with close code 1003."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt"
+              }
+            ],
+            "wire": "sarvam_realtime_websocket"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "This is the gateway-driven commit on a vendor socket. The realtime socket sends partial transcripts while the caller speaks and offers endpointing=manual, where the client sends speech_start, speech_end and flush; with endpointing=vad the vendor's own detector ends the utterance instead, which is why the owner is 'either'. With manual endpointing the gateway's detector decides the boundary and no upload round trip is needed, so the audit rates this the better investment for real-time quality than file upload. Wire differences from the legacy socket that the new client must handle: audio is sent as {\"event\":\"audio_input\",\"audio\":\"<base64>\"}; raw PCM only (linear16, linear32, mulaw, alaw at 8 or 16 kHz); auto-detect is 'auto' and Odia is 'or-IN' (the legacy socket and REST use 'unknown' and 'od-IN'); language_code is required; keep-alive is ping and pong; session.end reports the billed audio duration. The final transcript carries no confidence and no word list; language_confidence is the only quality signal. Pipecat's 1.00 s constant for this socket is marked provisional and is not a measurement, so the latency is recorded as unmeasured."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "unknown",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 1000,
+        "increment_ms": 1000,
+        "bills_silence": null,
+        "notes": "Priced per hour of audio and billed per second, rounded up to the next second, with a 1 second minimum charge (vendor FAQ). The FAQ does not say whether the minimum applies per REST request or per socket session. On the realtime socket the vendor's session.end.audio_duration_s is the billed quantity. Whether silence on an open socket is billed is not stated. There is no Sarvam speech-to-text entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.sarvam.ai/api-reference/speech-to-text/transcribe/realtime/ws.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/realtime-streaming.md",
+          "https://docs.sarvam.ai/changelog/2026/8/18.md",
+          "https://docs.sarvam.ai/api/getting-started/models/saaras.md",
+          "https://docs.sarvam.ai/api/getting-started/models/saarika.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/which-api-to-use.md",
+          "https://docs.sarvam.ai/changelog",
+          "https://docs.sarvam.ai/api/getting-started/ratelimits.md",
+          "https://docs.sarvam.ai/api/getting-started/pricing.md",
+          "https://docs.sarvam.ai/api/speech-to-text/faq.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/sarvam/config.rs:249-250"
+        ],
+        "unverified": [
+          "lifecycle.status (one vendor guide labels the realtime model beta; the realtime reference lists it as that socket's default with no such label)",
+          "billing.bills_silence",
+          "transports[planned_commit] (whether every account may open the realtime socket)",
+          "transports[planned_commit].latency",
+          "transports[planned_commit].limits.max_session_ms (no maximum session length is published in the evidence)"
+        ],
+        "notes": "Exists only on the realtime socket, where it is the default. It is absent from the REST and batch model lists, so it has no file interface and can never be served by file upload. The gateway has no client for the realtime socket and no release builds one, so this model has no enabled transport. Today the gateway sends the id to the legacy socket, whose documented model list does not contain it (gateway/src/core/stt/sarvam/config.rs:249-250 URL-encodes any model string). What the vendor then does has not been established, so when_unusable.today is unknown and the session keeps today's client with a warning instead of being refused; a live probe should settle it, and saaras:v4 is the model to suggest."
+      }
+    },
+    {
+      "id": "sarvam:saaras-v2.5",
+      "match": {
+        "provider": "sarvam",
+        "model": "saaras:v2.5"
+      },
+      "lifecycle": {
+        "status": "retiring"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "unknown",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "disabled",
+          "text": "saaras:v2.5 is Sarvam's older speech-to-English translation model, served only on translation interfaces this gateway does not use. Choose saaras:v4 in translation mode instead."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 1000,
+        "increment_ms": 1000,
+        "bills_silence": null,
+        "notes": "Not billable through the gateway because there is no live path. Priced per hour of audio and billed per second, rounded up to the next second, with a 1 second minimum charge (vendor FAQ). The FAQ does not say whether the minimum applies per REST request or per socket session. On the realtime socket the vendor's session.end.audio_duration_s is the billed quantity. Whether silence on an open socket is billed is not stated. There is no Sarvam speech-to-text entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.sarvam.ai/api/getting-started/models/saaras.md",
+          "https://docs.sarvam.ai/api-reference/legacy/speech-to-text-translate/translate/ws.md",
+          "https://docs.sarvam.ai/api-reference/legacy/speech-to-text/transcribe/ws.md",
+          "https://docs.sarvam.ai/api-reference/speech-to-text/transcribe.md"
+        ],
+        "code_refs": [
+          "gateway/src/plugin/builtin/mod.rs:182"
+        ],
+        "unverified": [
+          "lifecycle.status (recorded as retiring: the vendor says the model 'will be deprecated soon' and gives no date; the LiveKit plugin already treats it as sunset)",
+          "which models the legacy translate socket accepts (its reference lists saaras:v2.5 only; the streaming guide says it defaults to Saaras v3 and also accepts v4 and v2.5)"
+        ],
+        "notes": "The gateway registry advertises this id for speech-to-text (gateway/src/plugin/builtin/mod.rs:182) and the client would pass it to the transcription socket unchecked. This row turns that into a refusal. Earlier refusal wording (engineering note, replaced 2026-10-04 by customer text): saaras:v2.5 is Sarvam's older speech-to-English translation model. It is served only on the translate endpoints (POST /speech-to-text-translate and wss://api.sarvam.ai/speech-to-text-translate/ws), which the gateway does not implement, and it is not in the model list of the transcription socket or of the transcription REST endpoint. Use saaras:v4 with mode=translate instead. Refusal moved to Release 3 on 2026-10-04 (addendum B13): today's behaviour for this id is not established, so Release 0 keeps today's path."
+      }
+    },
+    {
+      "id": "sarvam:saarika-v2.5",
+      "match": {
+        "provider": "sarvam",
+        "model": "saarika:v2.5"
+      },
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_on": "2026-06-29",
+        "dates_basis": "inferred",
+        "replacement": [
+          "saaras:v4",
+          "saaras:v3"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "none",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "fast",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1170,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat constant SARVAM_TTFS_P99 = 1.17 s, read from Pipecat main on 2026-10-03, for Sarvam's legacy streaming socket. The evidence does not say which model or which date Pipecat measured, so the figure is a seed for the segment deadline, not a per-model measurement."
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 60000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Published under one 'WebSocket Streaming' heading; whether the legacy and realtime sockets share one pool is not stated. The vendor's limiter also reacts to the burst rate of new connections and rejects with close code 1003."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language-code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "sarvam_legacy_websocket"
+          },
+          "gateway_client": {
+            "status": "verified_live",
+            "last_verified_on": "2026-06-04",
+            "code_ref": "gateway/src/core/stt/sarvam/config.rs:23-53,139-166,235-346; gateway/src/core/stt/sarvam/provider.rs:150-157,218-262,421-460,538-550,610-625; gateway/tests/mock_endpoint_e2e.rs:1395-1419; gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs:122-141",
+            "notes": "Verified live against this socket with this model by the gateway's own test on 2026-06-04 (the commit that made gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs pass). That was before Sarvam changed its defaults on 2026-06-29 and removed the id from the socket's documented model list, so the accurate status is 'worked on 2026-06-04, not re-probed since'. If Sarvam now rejects the id, every session that relies on the gateway default fails at connect. This client dials the socket Sarvam now labels legacy (wss://api.sarvam.ai/speech-to-text/ws, config.rs:23). It returns one final transcript per utterance and no interim text. Each caller chunk is base64-encoded and sent at once as a JSON text frame (provider.rs:218-241); Sarvam's server-side voice detector ends the utterance; the gateway never sends a flush (flush_signal is fixed to false, config.rs:163). Differences from the vendor documentation, found by reading and not re-probed: the client matches voice-activity events named START and END while the vendor reference names them START_SPEECH and END_SPEECH, so every final is flagged end of speech (provider.rs:429, 447-460); the error frame is parsed for data.message while the vendor sends data.error (provider.rs:150-157); confidence is invented as 0.95 because the vendor sends none (provider.rs:430); finals are dropped if a 256-slot channel is full (provider.rs:433-444, 549); only 11 language codes are accepted and an empty language becomes hi-IN (config.rs:41-53, 146-150, 324-330); the codec check accepts 'pcm', which is not a vendor value, and rejects mu-law and A-law before any dial (config.rs:156-160, 333); no model id is checked (config.rs:315-346). The standard factory matches only the exact provider id 'sarvam' (gateway/src/core/stt/standard.rs:457). No vendor quality signal reaches the gateway on this transport, so none is listed. Sarvam returns language_probability on this socket only when it detects the language itself; this client cannot ask for that (an empty language becomes hi-IN, config.rs:146-150, and 'unknown' fails the language check, config.rs:41-53, 325-330), has no field for it in its response type (provider.rs:120-135), and reports a confidence that is the constant 0.95 (provider.rs:430). Validation rejects any session sample rate other than 8000 or 16000 Hz (config.rs:317-322). The /v1/realtime cascade sets the speech-to-text rate to 24000 (gateway/src/handlers/openai_realtime/cascade.rs:34, 342), so a voice-agent session on that route, and any session at 24 kHz or 48 kHz, fails at setup on this transport. For an 8 kHz session the client writes 8000 into every audio frame (provider.rs:544); the vendor reference lists 16000, 22050 and 24000 for that field and says 8 kHz is set only on the connection, while the vendor's guide says to set it in both places, so the outcome for a telephone leg is unknown. The vendor's best-practices page says this socket closes after 60 seconds of inactivity and recommends silent audio as keep-alive. The client instead sends a JSON ping after 30 seconds without audio (config.rs:32; provider.rs:291-312), which is not a client message the vendor documents for this socket, and it treats any vendor error frame as fatal with no reconnect (provider.rs:254-260).",
+            "defect": "Found by reading, not re-probed: voice-activity events are matched as START and END while the vendor sends START_SPEECH and END_SPEECH, so every final is flagged end of speech, and the error frame is parsed for data.message while the vendor sends data.error (provider.rs:429, 447-460, 150-157). Validation accepts only 8 kHz and 16 kHz linear PCM and 11 languages, so a 24 kHz /v1/realtime voice agent or a mu-law telephone leg fails at setup (config.rs:317-322, 324-333)."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. No Sarvam file-request code exists in the gateway (gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:102-123 do not include Sarvam). Useful only as a fallback when the socket is refused or its breaker is open; it unlocks no model.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 60,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Counted per Sarvam account across all keys (token bucket); excess is answered with 429 or 503. The gateway does not know the account's plan."
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 4000,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "flac",
+              "mp3",
+              "mp4",
+              "m4a",
+              "ogg",
+              "opus",
+              "webm",
+              "aac",
+              "aiff"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "quality_signals_require": [
+            "language_code=unknown"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "sarvam_rest_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Synchronous request: POST https://api.sarvam.ai/speech-to-text, multipart/form-data, file part named 'file', header api-subscription-key (an invalid key returns 403, not 401). Audio longer than 30 seconds returns 422, so the 25 second default segment plus padding must be checked against that cap before upload. The limit recorded, 60 requests per minute, is the Starter tier (Pro 100, Business 4,000); it is shared by every call on the Sarvam account across all keys, so a limiter above the per-session cap of two uploads is required. Retry only on 429, 500 and 503. The response has no transcript confidence, no no-speech probability and no word timestamps; an empty transcript is the only no-speech signal, and language_probability is present only when the language was auto-detected. WAV is detected automatically and is the vendor's recommended format; raw PCM needs input_audio_codec and must be 16 kHz. The vendor also accepts AMR and WMA, which the map's format list cannot name. Sarvam's batch job API (POST /speech-to-text/job/v1, then upload, start, poll, download) is answered in minutes and is not a live transport, so it is not listed. For this model the REST path rests on one changelog sentence: the id is absent from the current REST model list."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": 1000,
+            "increment_ms": 1000,
+            "bills_silence": false,
+            "notes": "Each upload is billed per second of uploaded audio, rounded up, with a 1 second minimum (vendor FAQ); only uploaded segments are billed. No pricing_key exists for Sarvam speech-to-text."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 1000,
+        "increment_ms": 1000,
+        "bills_silence": null,
+        "notes": "Priced per hour of audio and billed per second, rounded up to the next second, with a 1 second minimum charge (vendor FAQ). The FAQ does not say whether the minimum applies per REST request or per socket session. Whether silence on an open socket is billed is not stated. There is no Sarvam speech-to-text entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.sarvam.ai/api/getting-started/models/saarika.md",
+          "https://docs.sarvam.ai/changelog",
+          "https://docs.sarvam.ai/api-reference/legacy/speech-to-text/transcribe/ws.md",
+          "https://docs.sarvam.ai/api-reference/speech-to-text/transcribe.md",
+          "https://raw.githubusercontent.com/livekit/agents/main/livekit-plugins/livekit-plugins-sarvam/livekit/plugins/sarvam/stt.py",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://docs.sarvam.ai/api/getting-started/ratelimits.md",
+          "https://docs.sarvam.ai/api/getting-started/pricing.md",
+          "https://docs.sarvam.ai/api/speech-to-text/faq.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/best-practices.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/sarvam/config.rs:23-53,139-166,235-346",
+          "gateway/src/core/stt/sarvam/provider.rs:150-157,218-262,421-460,538-550,610-625",
+          "gateway/tests/mock_endpoint_e2e.rs:1395-1419",
+          "gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs:122-141",
+          "gateway/src/core/stt/standard.rs:457",
+          "gateway/src/handlers/openai_realtime/cascade.rs:34,342",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/sarvam/config.rs:26",
+          "gateway/src/plugin/builtin/mod.rs:182",
+          "gateway/src/core/stt/sarvam/config.rs:249-252"
+        ],
+        "unverified": [
+          "lifecycle.deprecated_on (Sarvam calls the model deprecated but publishes no deprecation date; 2026-06-29 is the changelog entry that removed it as the REST default and called it a legacy model)",
+          "lifecycle.shutdown_on (none published)",
+          "whether Sarvam's servers still accept saarika:v2.5 on the legacy socket, on REST or on the batch API today",
+          "billing.bills_silence",
+          "transports[native].latency (Pipecat does not state the model or date measured)",
+          "transports[native].limits.idle_timeout_ms (60 s is the idle close stated on Sarvam's speech-to-text best-practices page, which the audit fetched; the fact-check looked for the keep-alive advice that accompanies it on two other pages, did not find it there, and does not list the best-practices page among its sources)",
+          "transports[native].limits.rates (concurrency) (20 is the Starter tier; Pro and Business allow 100; whether the legacy and realtime sockets share one pool is not stated)",
+          "the real wire values of the legacy socket's voice-activity signal and error field (documentation and two other clients agree with each other and disagree with the gateway; not re-probed)",
+          "transports[planned_file].limits.max_upload_bytes (no size limit is published; only the 30 second cap)",
+          "transports[planned_file].limits.rates (concurrency) (no REST concurrency limit is published)",
+          "transports[planned_file].latency (Sarvam publishes no REST latency and says there is no official round-trip figure)",
+          "transports[native].gateway_client (whether the legacy socket tolerates the client's JSON ping and a per-frame sample rate of 8000; the fact-check could verify neither)",
+          "transports[planned_file].limits.rates (requests) (60 is the Starter tier; Pro allows 100 and Business 4,000; the limit is counted per Sarvam account across all keys and the gateway does not know the account's tier)",
+          "transports[planned_file].limits.min_audio_ms and vendor_timeout_ms (neither a minimum audio length nor a request time limit is published)",
+          "transports[native].limits.max_session_ms (no maximum session length is published in the evidence)",
+          "transports[native].stream_audio.sample_rates_hz (8000 and 16000 are what today's client accepts and what the legacy socket documents; whether an 8 kHz session works depends on the per-frame sample rate, which is unverified)"
+        ],
+        "notes": "This is the gateway's default Sarvam model today (gateway/src/core/stt/sarvam/config.rs:26) and one of the two ids the registry advertises (gateway/src/plugin/builtin/mod.rs:182). Sarvam has removed it from every current model list (legacy socket, realtime socket, REST, the vendor's software kit) and removed its code examples; the 2026-06-29 changelog says it 'remains available as a legacy model' on REST and batch when named explicitly. The verification date above is the date the documents were read; the last live evidence is from 2026-06-04. A live probe with a real key is the first action the audit recommends."
+      }
+    },
+    {
+      "id": "sarvam:any",
+      "match": {
+        "provider": "sarvam",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "none",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 60000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 20,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Published under one 'WebSocket Streaming' heading; whether the legacy and realtime sockets share one pool is not stated. The vendor's limiter also reacts to the burst rate of new connections and rejects with close code 1003."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 100,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language-code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "sarvam_legacy_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/sarvam/config.rs:23-53,139-166,235-346; gateway/src/core/stt/sarvam/provider.rs:150-157,218-262,421-460,538-550,610-625; gateway/tests/mock_endpoint_e2e.rs:1395-1419; gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs:122-141",
+            "notes": "For an unknown id the client URL-encodes the string into the connect URL without any check (config.rs:249-250, 315-346), so the vendor decides whether it is accepted. This client dials the socket Sarvam now labels legacy (wss://api.sarvam.ai/speech-to-text/ws, config.rs:23). It returns one final transcript per utterance and no interim text. Each caller chunk is base64-encoded and sent at once as a JSON text frame (provider.rs:218-241); Sarvam's server-side voice detector ends the utterance; the gateway never sends a flush (flush_signal is fixed to false, config.rs:163). Differences from the vendor documentation, found by reading and not re-probed: the client matches voice-activity events named START and END while the vendor reference names them START_SPEECH and END_SPEECH, so every final is flagged end of speech (provider.rs:429, 447-460); the error frame is parsed for data.message while the vendor sends data.error (provider.rs:150-157); confidence is invented as 0.95 because the vendor sends none (provider.rs:430); finals are dropped if a 256-slot channel is full (provider.rs:433-444, 549); only 11 language codes are accepted and an empty language becomes hi-IN (config.rs:41-53, 146-150, 324-330); the codec check accepts 'pcm', which is not a vendor value, and rejects mu-law and A-law before any dial (config.rs:156-160, 333); no model id is checked (config.rs:315-346). The standard factory matches only the exact provider id 'sarvam' (gateway/src/core/stt/standard.rs:457). No vendor quality signal reaches the gateway on this transport, so none is listed. Sarvam returns language_probability on this socket only when it detects the language itself; this client cannot ask for that (an empty language becomes hi-IN, config.rs:146-150, and 'unknown' fails the language check, config.rs:41-53, 325-330), has no field for it in its response type (provider.rs:120-135), and reports a confidence that is the constant 0.95 (provider.rs:430). Validation rejects any session sample rate other than 8000 or 16000 Hz (config.rs:317-322). The /v1/realtime cascade sets the speech-to-text rate to 24000 (gateway/src/handlers/openai_realtime/cascade.rs:34, 342), so a voice-agent session on that route, and any session at 24 kHz or 48 kHz, fails at setup on this transport. For an 8 kHz session the client writes 8000 into every audio frame (provider.rs:544); the vendor reference lists 16000, 22050 and 24000 for that field and says 8 kHz is set only on the connection, while the vendor's guide says to set it in both places, so the outcome for a telephone leg is unknown. The vendor's best-practices page says this socket closes after 60 seconds of inactivity and recommends silent audio as keep-alive. The client instead sends a JSON ping after 30 seconds without audio (config.rs:32; provider.rs:291-312), which is not a client message the vendor documents for this socket, and it treats any vendor error frame as fatal with no reconnect (provider.rs:254-260).",
+            "defect": "Found by reading, not re-probed: voice-activity events are matched as START and END while the vendor sends START_SPEECH and END_SPEECH, so every final is flagged end of speech, and the error frame is parsed for data.message while the vendor sends data.error (provider.rs:429, 447-460, 150-157). Validation accepts only 8 kHz and 16 kHz linear PCM and 11 languages, so a 24 kHz /v1/realtime voice agent or a mu-law telephone leg fails at setup (config.rs:317-322, 324-333)."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. No Sarvam file-request code exists in the gateway (gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:102-123 do not include Sarvam). Useful only as a fallback when the socket is refused or its breaker is open; it unlocks no model.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 60,
+                "plan": "starter",
+                "scope": "account",
+                "note": "Counted per Sarvam account across all keys (token bucket); excess is answered with 429 or 503. The gateway does not know the account's plan."
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 100,
+                "plan": "pro",
+                "scope": "account"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 4000,
+                "plan": "business",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "starter"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm",
+              "flac",
+              "mp3",
+              "mp4",
+              "m4a",
+              "ogg",
+              "opus",
+              "webm",
+              "aac",
+              "aiff"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000
+            ],
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "quality_signals_require": [
+            "language_code=unknown"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "response_formats": [
+              "json"
+            ],
+            "wire": "sarvam_rest_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Synchronous request: POST https://api.sarvam.ai/speech-to-text, multipart/form-data, file part named 'file', header api-subscription-key (an invalid key returns 403, not 401). Audio longer than 30 seconds returns 422, so the 25 second default segment plus padding must be checked against that cap before upload. The limit recorded, 60 requests per minute, is the Starter tier (Pro 100, Business 4,000); it is shared by every call on the Sarvam account across all keys, so a limiter above the per-session cap of two uploads is required. Retry only on 429, 500 and 503. The response has no transcript confidence, no no-speech probability and no word timestamps; an empty transcript is the only no-speech signal, and language_probability is present only when the language was auto-detected. WAV is detected automatically and is the vendor's recommended format; raw PCM needs input_audio_codec and must be 16 kHz. The vendor also accepts AMR and WMA, which the map's format list cannot name. Sarvam's batch job API (POST /speech-to-text/job/v1, then upload, start, poll, download) is answered in minutes and is not a live transport, so it is not listed."
+          },
+          "file_request_mode": "sync",
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": 1000,
+            "increment_ms": 1000,
+            "bills_silence": false,
+            "notes": "Each upload is billed per second of uploaded audio, rounded up, with a 1 second minimum (vendor FAQ); only uploaded segments are billed. No pricing_key exists for Sarvam speech-to-text."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 1000,
+        "increment_ms": 1000,
+        "bills_silence": null,
+        "notes": "Priced per hour of audio and billed per second, rounded up to the next second, with a 1 second minimum charge (vendor FAQ). The FAQ does not say whether the minimum applies per REST request or per socket session. Whether silence on an open socket is billed is not stated. There is no Sarvam speech-to-text entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.sarvam.ai/api-reference/speech-to-text/transcribe.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/rest-api.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/how-to/keyterms.md",
+          "https://docs.sarvam.ai/api/getting-started/errors-troubleshooting.md",
+          "https://docs.sarvam.ai/api-reference/legacy/speech-to-text/transcribe/ws.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/streaming-api.md",
+          "https://docs.sarvam.ai/api/getting-started/ratelimits.md",
+          "https://docs.sarvam.ai/api/getting-started/pricing.md",
+          "https://docs.sarvam.ai/api/speech-to-text/faq.md",
+          "https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/best-practices.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/sarvam/config.rs:23-53,139-166,235-346",
+          "gateway/src/core/stt/sarvam/provider.rs:150-157,218-262,421-460,538-550,610-625",
+          "gateway/tests/mock_endpoint_e2e.rs:1395-1419",
+          "gateway/tests/sarvam_elevenlabs_stt_live_e2e.rs:122-141",
+          "gateway/src/core/stt/standard.rs:457",
+          "gateway/src/handlers/openai_realtime/cascade.rs:34,342",
+          "gateway/src/core/stt/sarvam/config.rs:249-252"
+        ],
+        "unverified": [
+          "the whole row: which interface an unknown Sarvam model id is served on",
+          "billing.bills_silence",
+          "transports[planned_file].limits.max_upload_bytes (no size limit is published; only the 30 second cap)",
+          "transports[planned_file].limits.rates (concurrency) (no REST concurrency limit is published)",
+          "transports[planned_file].latency (Sarvam publishes no REST latency and says there is no official round-trip figure)",
+          "transports[native].limits.idle_timeout_ms (60 s is the idle close stated on Sarvam's speech-to-text best-practices page, which the audit fetched; the fact-check looked for the keep-alive advice that accompanies it on two other pages, did not find it there, and does not list the best-practices page among its sources)",
+          "transports[native].gateway_client (whether the legacy socket tolerates the client's JSON ping and a per-frame sample rate of 8000; the fact-check could verify neither)",
+          "transports[planned_file].limits.rates (requests) (60 is the Starter tier; Pro allows 100 and Business 4,000; the limit is counted per Sarvam account across all keys and the gateway does not know the account's tier)",
+          "transports[planned_file].limits.min_audio_ms and vendor_timeout_ms (neither a minimum audio length nor a request time limit is published)",
+          "transports[native].limits.max_session_ms (no maximum session length is published in the evidence)",
+          "transports[native].stream_audio.sample_rates_hz (8000 and 16000 are what today's client accepts and what the legacy socket documents; whether an 8 kHz session works depends on the per-frame sample rate, which is unverified)"
+        ],
+        "notes": "Default for a Sarvam model id the map has never seen. The existing legacy-socket client is listed first, as on every Sarvam row with a working streaming client, so such a session gets what it gets today. Sarvam's synchronous file endpoint is listed behind it as a fallback, but no release builds a Sarvam file transcriber, so that transport is never enabled. The resolver must attach a warning that the capability was assumed. The one known id for which this guess would be wrong, the socket-only saaras:v3-realtime, has its own row."
+      }
+    }
+  ]
+}

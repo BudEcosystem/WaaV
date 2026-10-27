@@ -3,114 +3,29 @@
 //! This module contains serde types for parsing API responses,
 //! including simple JSON, verbose JSON with timestamps, and error responses.
 
-use serde::{Deserialize, Serialize};
-
 /// Default confidence value when actual confidence is unavailable.
 /// Using 0.5 (neutral) to avoid overconfidence in systems that rely on this value.
 /// This indicates "unknown confidence" rather than "high confidence".
 pub const DEFAULT_UNKNOWN_CONFIDENCE: f64 = 0.5;
 
 // =============================================================================
-// Simple Transcription Response
+// Response types: the shared OpenAI-compatible set
 // =============================================================================
 
-/// Simple JSON transcription response.
-///
-/// Returned when `response_format` is `json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptionResponse {
-    /// The transcribed text.
-    pub text: String,
+pub use waav_segmented_stt::vendor::openai::{
+    ErrorBody as GroqError, ErrorResponse as GroqErrorResponse, GroqMetadata, Segment,
+    TranscriptionResponse, VerboseTranscriptionResponse, Word,
+};
 
-    /// Groq-specific metadata.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub x_groq: Option<GroqMetadata>,
+/// Groq's reading of a segment: a confidence from its `avg_logprob`, and whether it holds speech.
+pub trait SegmentScore {
+    /// Calculate confidence score (0.0 to 1.0) from avg_logprob.
+    fn confidence(&self) -> f64;
+    /// Whether this segment likely contains speech: false when `no_speech_prob` is above 0.5.
+    fn is_speech(&self) -> bool;
 }
 
-/// Groq-specific metadata in responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroqMetadata {
-    /// Unique request ID for debugging/tracking.
-    pub id: String,
-}
-
-// =============================================================================
-// Verbose Transcription Response
-// =============================================================================
-
-/// Verbose JSON transcription response with timestamps and metadata.
-///
-/// Returned when `response_format` is `verbose_json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerboseTranscriptionResponse {
-    /// The full transcribed text.
-    pub text: String,
-
-    /// Detected language of the audio.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language: Option<String>,
-
-    /// Total duration of the audio in seconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<f64>,
-
-    /// Transcription segments with timestamps.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub segments: Vec<Segment>,
-
-    /// Word-level timestamps (if requested).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub words: Vec<Word>,
-
-    /// Groq-specific metadata.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub x_groq: Option<GroqMetadata>,
-}
-
-/// A transcription segment with timing and confidence information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Segment {
-    /// Segment index (0-based).
-    pub id: u32,
-
-    /// Audio position in milliseconds (seek position).
-    #[serde(default)]
-    pub seek: u32,
-
-    /// Start time in seconds.
-    pub start: f64,
-
-    /// End time in seconds.
-    pub end: f64,
-
-    /// Transcribed text for this segment.
-    pub text: String,
-
-    /// Average log probability (confidence metric).
-    /// Closer to 0 = higher confidence.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avg_logprob: Option<f64>,
-
-    /// Probability that this segment contains no speech.
-    /// 0-1 scale; higher = less likely to be speech.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub no_speech_prob: Option<f64>,
-
-    /// Compression ratio indicator.
-    /// Unusual values suggest clarity issues.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compression_ratio: Option<f64>,
-
-    /// Token IDs for this segment.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tokens: Vec<i64>,
-
-    /// Temperature used for this segment.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-}
-
-impl Segment {
+impl SegmentScore for Segment {
     /// Calculate confidence score (0.0 to 1.0) from avg_logprob.
     ///
     /// The log probability is typically negative, with values closer to 0
@@ -122,7 +37,7 @@ impl Segment {
     ///
     /// This implementation uses exponential mapping to preserve precision
     /// across the full range of log probabilities.
-    pub fn confidence(&self) -> f64 {
+    fn confidence(&self) -> f64 {
         self.avg_logprob
             .map(|lp| {
                 // Use exponential transformation: e^(logprob) gives probability
@@ -151,52 +66,9 @@ impl Segment {
     /// Check if this segment likely contains actual speech.
     ///
     /// Returns false if no_speech_prob is high (> 0.5).
-    pub fn is_speech(&self) -> bool {
+    fn is_speech(&self) -> bool {
         self.no_speech_prob.map(|p| p < 0.5).unwrap_or(true)
     }
-}
-
-/// Word-level timing information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Word {
-    /// The word text.
-    pub word: String,
-
-    /// Start time in seconds.
-    pub start: f64,
-
-    /// End time in seconds.
-    pub end: f64,
-}
-
-// =============================================================================
-// Error Response
-// =============================================================================
-
-/// Error response from Groq API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroqErrorResponse {
-    /// The error details.
-    pub error: GroqError,
-}
-
-/// Error details from Groq API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroqError {
-    /// Human-readable error message.
-    pub message: String,
-
-    /// Error type classification.
-    #[serde(rename = "type")]
-    pub error_type: String,
-
-    /// Optional error code.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-
-    /// Optional parameter that caused the error.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub param: Option<String>,
 }
 
 // =============================================================================
@@ -296,133 +168,6 @@ impl TranscriptionResult {
     }
 }
 
-// =============================================================================
-// WAV File Generation
-// =============================================================================
-
-/// WAV file generation utilities.
-///
-/// Since Groq's API expects audio files, we need to package raw PCM
-/// data into a WAV container.
-pub mod wav {
-    /// WAV creation error.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum WavError {
-        /// Sample rate cannot be zero.
-        ZeroSampleRate,
-        /// Channels cannot be zero.
-        ZeroChannels,
-        /// WAV header arithmetic overflowed before a valid header could be written.
-        HeaderArithmeticOverflow(&'static str),
-        /// PCM data size exceeds maximum WAV file size (4GB limit).
-        DataTooLarge,
-    }
-
-    impl std::fmt::Display for WavError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::ZeroSampleRate => write!(f, "Sample rate cannot be zero"),
-                Self::ZeroChannels => write!(f, "Number of channels cannot be zero"),
-                Self::HeaderArithmeticOverflow(field) => {
-                    write!(f, "WAV header arithmetic overflow for {field}")
-                }
-                Self::DataTooLarge => write!(f, "PCM data exceeds maximum WAV file size (4GB)"),
-            }
-        }
-    }
-
-    impl std::error::Error for WavError {}
-
-    /// Create a WAV file from raw PCM data.
-    ///
-    /// # Arguments
-    /// * `pcm_data` - Raw PCM samples (16-bit signed little-endian)
-    /// * `sample_rate` - Sample rate in Hz (typically 16000). Must be > 0.
-    /// * `channels` - Number of audio channels (1 for mono, 2 for stereo). Must be > 0.
-    ///
-    /// # Returns
-    /// A Vec<u8> containing the complete WAV file.
-    ///
-    /// # Panics
-    /// This function panics if sample_rate or channels is zero.
-    /// Use `try_create_wav` for a non-panicking version.
-    pub fn create_wav(pcm_data: &[u8], sample_rate: u32, channels: u16) -> Vec<u8> {
-        try_create_wav(pcm_data, sample_rate, channels).expect("Invalid WAV parameters")
-    }
-
-    /// Create a WAV file from raw PCM data (fallible version).
-    ///
-    /// # Arguments
-    /// * `pcm_data` - Raw PCM samples (16-bit signed little-endian)
-    /// * `sample_rate` - Sample rate in Hz (typically 16000). Must be > 0.
-    /// * `channels` - Number of audio channels (1 for mono, 2 for stereo). Must be > 0.
-    ///
-    /// # Returns
-    /// * `Ok(Vec<u8>)` - The complete WAV file
-    /// * `Err(WavError)` - If validation fails
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// use waav_gateway::core::stt::groq::messages::wav::try_create_wav;
-    ///
-    /// let pcm_data = vec![0u8; 100];
-    /// let wav = try_create_wav(&pcm_data, 16000, 1)?;
-    /// ```
-    pub fn try_create_wav(
-        pcm_data: &[u8],
-        sample_rate: u32,
-        channels: u16,
-    ) -> Result<Vec<u8>, WavError> {
-        if sample_rate == 0 {
-            return Err(WavError::ZeroSampleRate);
-        }
-        if channels == 0 {
-            return Err(WavError::ZeroChannels);
-        }
-
-        let bits_per_sample: u16 = 16;
-        let block_align = channels
-            .checked_mul(bits_per_sample)
-            .and_then(|n| n.checked_div(8))
-            .ok_or(WavError::HeaderArithmeticOverflow("block_align"))?;
-        let byte_rate = sample_rate
-            .checked_mul(u32::from(block_align))
-            .ok_or(WavError::HeaderArithmeticOverflow("byte_rate"))?;
-        let data_size = u32::try_from(pcm_data.len()).map_err(|_| WavError::DataTooLarge)?;
-        let file_size = 36u32.checked_add(data_size).ok_or(WavError::DataTooLarge)?;
-        let capacity = HEADER_SIZE
-            .checked_add(pcm_data.len())
-            .ok_or(WavError::DataTooLarge)?;
-
-        let mut wav = Vec::with_capacity(capacity);
-
-        // RIFF header
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&file_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-
-        // fmt subchunk
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes()); // Subchunk1Size (16 for PCM)
-        wav.extend_from_slice(&1u16.to_le_bytes()); // AudioFormat (1 = PCM)
-        wav.extend_from_slice(&channels.to_le_bytes());
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&byte_rate.to_le_bytes());
-        wav.extend_from_slice(&block_align.to_le_bytes());
-        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data subchunk
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(pcm_data);
-
-        Ok(wav)
-    }
-
-    /// Get the WAV header size (44 bytes).
-    pub const HEADER_SIZE: usize = 44;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,7 +225,7 @@ mod tests {
     fn test_segment_confidence() {
         let segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "Test".to_string(),
@@ -500,7 +245,7 @@ mod tests {
     fn test_segment_no_speech() {
         let segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "".to_string(),
@@ -545,45 +290,12 @@ mod tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(verbose.text(), "World");
 
         let plain = TranscriptionResult::PlainText("Plain".to_string());
         assert_eq!(plain.text(), "Plain");
-    }
-
-    #[test]
-    fn test_wav_creation() {
-        let pcm_data = vec![0u8; 100];
-        let wav = wav::create_wav(&pcm_data, 16000, 1);
-
-        // Check WAV header
-        assert_eq!(&wav[0..4], b"RIFF");
-        assert_eq!(&wav[8..12], b"WAVE");
-        assert_eq!(&wav[12..16], b"fmt ");
-        assert_eq!(&wav[36..40], b"data");
-
-        // Check total size
-        assert_eq!(wav.len(), wav::HEADER_SIZE + pcm_data.len());
-    }
-
-    #[test]
-    fn try_wav_rejects_header_arithmetic_overflow_without_panicking() {
-        let pcm_data = vec![0u8; 4];
-
-        assert_eq!(
-            wav::try_create_wav(&pcm_data, u32::MAX, 1).unwrap_err(),
-            wav::WavError::HeaderArithmeticOverflow("byte_rate")
-        );
-        assert_eq!(
-            wav::try_create_wav(&pcm_data, 16_000, u16::MAX).unwrap_err(),
-            wav::WavError::HeaderArithmeticOverflow("block_align")
-        );
-    }
-
-    #[test]
-    fn test_wav_header_size() {
-        assert_eq!(wav::HEADER_SIZE, 44);
     }
 
     #[test]
@@ -594,7 +306,7 @@ mod tests {
             duration: None,
             segments: vec![Segment {
                 id: 0,
-                seek: 0,
+                seek: Some(0),
                 start: 0.0,
                 end: 1.0,
                 text: "Test".to_string(),
@@ -606,6 +318,7 @@ mod tests {
             }],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
 
         let confidence = verbose.confidence();

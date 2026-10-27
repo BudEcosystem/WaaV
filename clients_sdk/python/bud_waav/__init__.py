@@ -45,6 +45,7 @@ from .types import (
     language_capabilities,
     # Configuration types
     STTConfig,
+    TranscriptionMode,
     TTSConfig,
     TranslationConfig,
     LiveKitConfig,
@@ -55,6 +56,11 @@ from .types import (
     Voice,
     WordInfo,
     Translation,
+    # Segmented speech-to-text (ready.stt, vad_event, stt_warning)
+    ReadySTT,
+    SttNotice,
+    VadEvent,
+    SttWarning,
     PercentileStats,
     STTMetrics,
     TTSMetrics,
@@ -76,6 +82,7 @@ from .types import (
     VoiceGender,
     VoiceAge,
     # Conversation / agent-loop types (built-in LLM loop + reasoning)
+    VoiceAgentConfig,
     ConversationConfig,
     ReasoningEffort,
     LatencyFiller,
@@ -164,6 +171,7 @@ from .errors import (
     ReconnectError,
     FatalConnectionError,
     ProtocolVersionError,
+    GatewayError,
     APIError,
     RateLimitError,
     STTError,
@@ -233,6 +241,7 @@ __all__ = [
     "language_capabilities",
     # Configuration types
     "STTConfig",
+    "TranscriptionMode",
     "TTSConfig",
     "TranslationConfig",
     "LiveKitConfig",
@@ -248,6 +257,7 @@ __all__ = [
     "VoiceGender",
     "VoiceAge",
     # Conversation / agent-loop types (built-in LLM loop + reasoning)
+    "VoiceAgentConfig",
     "ConversationConfig",
     "ReasoningEffort",
     "LatencyFiller",
@@ -313,6 +323,10 @@ __all__ = [
     "Voice",
     "WordInfo",
     "Translation",
+    "ReadySTT",
+    "SttNotice",
+    "VadEvent",
+    "SttWarning",
     # Metrics types
     "PercentileStats",
     "STTMetrics",
@@ -334,6 +348,7 @@ __all__ = [
     "ReconnectError",
     "FatalConnectionError",
     "ProtocolVersionError",
+    "GatewayError",
     "APIError",
     "RateLimitError",
     "STTError",

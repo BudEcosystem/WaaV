@@ -427,7 +427,8 @@ async fn start(
             resolved_alias: None,
             audio_in_codec: None,
             audio_out_codec: None,
-            interaction: Some(echo),
+            interaction: Some(Box::new(echo)),
+            stt: None,
         }),
     )
     .await;

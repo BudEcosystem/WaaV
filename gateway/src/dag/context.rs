@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Set in a node's context metadata when the streaming executor delivers that node's outputs to the
+/// client itself (terminal forwarder), so an output node does not report a missing sink.
+pub const STREAMING_DELIVERY_KEY: &str = "dag.streaming_delivery";
+
 use super::nodes::TTSAudioData;
 
 /// An output produced by a DAG terminal/output node, delivered out-of-band over
@@ -71,6 +75,19 @@ pub struct DAGContext {
     /// these to LiveKit / WS binary. `None` means outputs are only returned as the
     /// executor's result (e.g. unit tests, non-streaming callers).
     pub output_tx: Option<mpsc::Sender<DagOutput>>,
+
+    /// The first node whose execution failed in this context (set by the executor), so a
+    /// caller can tell the client WHICH node failed: a node's own error rarely names it.
+    pub failed_node: Option<FailedNode>,
+}
+
+/// Which node of the graph failed a run (see [`DAGContext::failed_node`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedNode {
+    /// The node's id in the definition.
+    pub id: String,
+    /// The node's type (`tts_provider`, `llm_endpoint`, ...).
+    pub node_type: String,
 }
 
 /// Resource keys for external resources stored in DAGContext
@@ -97,6 +114,7 @@ impl DAGContext {
             cancel_token: CancellationToken::new(),
             deadline: None,
             output_tx: None,
+            failed_node: None,
         }
     }
 
@@ -117,6 +135,7 @@ impl DAGContext {
             cancel_token: CancellationToken::new(),
             deadline: None,
             output_tx: None,
+            failed_node: None,
         }
     }
 
@@ -136,6 +155,7 @@ impl DAGContext {
             cancel_token: CancellationToken::new(),
             deadline: None,
             output_tx: None,
+            failed_node: None,
         }
     }
 
@@ -291,6 +311,17 @@ impl DAGContext {
             cancel_token: self.cancel_token.clone(), // Share cancellation
             deadline: self.deadline,
             output_tx: self.output_tx.clone(), // Branches deliver to the same sink
+            failed_node: None,                 // Each run/branch records its own failure
+        }
+    }
+
+    /// Record `id` as the node that failed this run, unless an earlier failure is recorded.
+    pub fn record_failed_node(&mut self, id: &str, node_type: &str) {
+        if self.failed_node.is_none() {
+            self.failed_node = Some(FailedNode {
+                id: id.to_string(),
+                node_type: node_type.to_string(),
+            });
         }
     }
 

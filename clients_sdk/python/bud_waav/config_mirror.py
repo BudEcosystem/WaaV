@@ -70,6 +70,14 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "conversation_config",
         "alias",  # P3 server-side alias name (ws/session.py::_send_config)
         "interaction",  # protocol 1.1 interaction mode, sent as-is (WebSocketSession.interaction)
+        "agent",  # spec 025 voice agent (VoiceAgentConfig; ws/session.py::_send_config)
+    },
+    # ---- AgentWebSocketConfig (spec 025 voice agent) --------------------------
+    "AgentWebSocketConfig": {
+        "id",  # VoiceAgentConfig.id
+        "version",  # VoiceAgentConfig.version
+        "text_only",  # VoiceAgentConfig.text_only
+        "variables",  # VoiceAgentConfig.variables
     },
     # ---- STTWebSocketConfig (config.rs:296) -----------------------------------
     "STTWebSocketConfig": {
@@ -80,6 +88,8 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "punctuation",  # STTConfig.punctuate (SDK alias)
         "encoding",  # STTConfig.encoding
         "audio_in_codec",  # D8 STTConfig.audio_in_codec (uplink transport codec)
+        "transcription_mode",  # segmented STT: STTConfig.transcription_mode (auto|streaming|segmented)
+        "noise_suppression",  # STTConfig.noise_suppression (WaaV's uplink denoiser)
         "model",  # STTConfig.model
         "api_key",  # session api_key override
         "features",  # nested SttFeatures (see SttFeatures below)
@@ -215,6 +225,9 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "degradation_message",
         "max_llm_calls_per_turn",
         "max_reasoning_tokens",
+        "credential_ref",  # operator credential name (ConversationConfig.credential_ref)
+        "reasoning_credential_ref",  # ConversationConfig.reasoning_credential_ref
+        "llm_timeout_ms",  # ConversationConfig.llm_timeout_ms
     },
 }
 

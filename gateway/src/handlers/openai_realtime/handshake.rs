@@ -98,6 +98,8 @@ pub struct HandshakeError {
     pub message: String,
     pub param: Option<&'static str>,
     pub retry_after: Option<u64>,
+    /// Bud's structured detail (`stt_live_unsupported`'s `reason`, …); absent from OpenAI's errors.
+    pub details: Option<serde_json::Value>,
 }
 
 impl HandshakeError {
@@ -115,7 +117,13 @@ impl HandshakeError {
             message: message.into(),
             param: None,
             retry_after: None,
+            details: None,
         }
+    }
+
+    pub fn details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     pub fn param(mut self, param: &'static str) -> Self {
@@ -131,7 +139,7 @@ impl HandshakeError {
 
 impl IntoResponse for HandshakeError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "error": {
                 "message": self.message,
                 "type": self.kind,
@@ -139,6 +147,9 @@ impl IntoResponse for HandshakeError {
                 "code": self.code,
             }
         });
+        if let Some(d) = self.details {
+            body["error"]["details"] = d;
+        }
         let mut resp = (self.status, axum::Json(body)).into_response();
         if let Some(secs) = self.retry_after
             && let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string())
@@ -206,6 +217,26 @@ fn invalid_credential() -> HandshakeError {
 
 /// Apply the §5.2 handshake rules, in this order: the beta shape, the query, the credential.
 pub fn parse(query: Option<&str>, headers: &HeaderMap) -> Result<Handshake, HandshakeError> {
+    let model = parse_model(query, headers)?;
+    let Some(credential) = extract_credential(headers)? else {
+        return Err(missing_credential());
+    };
+    Ok(Handshake { model, credential })
+}
+
+/// "You didn't provide a credential."
+pub fn missing_credential() -> HandshakeError {
+    HandshakeError::new(
+        StatusCode::UNAUTHORIZED,
+        "missing_api_key",
+        "You didn't provide a credential. Send `Authorization: Bearer <key>`, an `api-key` \
+         header, or the `openai-insecure-api-key.<key>` subprotocol.",
+    )
+}
+
+/// [`parse`]'s checks and `?model`, without requiring a credential: a standalone gateway with
+/// authentication off takes a session without one.
+pub fn parse_model(query: Option<&str>, headers: &HeaderMap) -> Result<String, HandshakeError> {
     let beta_subprotocol = offered_subprotocols(headers)
         .iter()
         .any(|p| p.eq_ignore_ascii_case(BETA_SUBPROTOCOL));
@@ -254,17 +285,7 @@ pub fn parse(query: Option<&str>, headers: &HeaderMap) -> Result<Handshake, Hand
         )
         .param("model"));
     };
-
-    let Some(credential) = extract_credential(headers)? else {
-        return Err(HandshakeError::new(
-            StatusCode::UNAUTHORIZED,
-            "missing_api_key",
-            "You didn't provide a credential. Send `Authorization: Bearer <key>`, an `api-key` \
-             header, or the `openai-insecure-api-key.<key>` subprotocol.",
-        ));
-    };
-
-    Ok(Handshake { model, credential })
+    Ok(model)
 }
 
 #[cfg(test)]

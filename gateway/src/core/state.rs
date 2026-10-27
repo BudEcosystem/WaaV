@@ -59,6 +59,9 @@ pub struct CoreState {
     pub profiler: Arc<LatencyProfiler>,
     /// Profiling runtime config (env-driven gates for the system + the `/debug/profile*` routes).
     pub profiling: ProfilingConfig,
+    /// Segmented speech-to-text: the capability map, the rollout switch, the latency store, the
+    /// limiters, breakers and upload clients every segmented session shares.
+    pub stt_live: Arc<crate::core::stt::segmented::live::SttLiveShared>,
 }
 
 impl CoreState {
@@ -164,6 +167,41 @@ impl CoreState {
         let profiling = ProfilingConfig::try_from_env()?;
         let profiler = Arc::new(LatencyProfiler::from_config(&profiling));
 
+        // Segmented speech-to-text: read and checked at start-up, so a malformed switch fails the
+        // process instead of the first call. The detector and end-of-turn models load in the
+        // background; a session reads their state at admission.
+        let stt_live = Arc::new(crate::core::stt::segmented::live::SttLiveShared::from_env(
+            turn_detector.clone(),
+        )?);
+        crate::core::stt::segmented::models::warm_up();
+        // Under the Bud control plane the control record can switch a row or deployment off on
+        // a running gateway; a standalone gateway has only the process switch.
+        if let Some(url) = std::env::var("WAAV_REDIS_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            let db = std::env::var("WAAV_REDIS_DB")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            crate::core::stt::segmented::live::spawn_control_refresh(
+                Arc::clone(&stt_live),
+                url,
+                db,
+            );
+        }
+        tracing::info!(stt_live = ?stt_live, "segmented speech-to-text configured");
+        if stt_live.rollout.mode == waav_segmented_stt::rollout::SwitchMode::Allowlist
+            && stt_live.rollout.allowlist.is_empty()
+        {
+            tracing::warn!(
+                "segmented speech-to-text: WAAV_SEGMENTED_STT is `allowlist` (the default) and \
+                 WAAV_SEGMENTED_STT_ALLOWLIST is empty, so no deployment and no voice agent is \
+                 covered; only standalone sessions that ask for transcription_mode \"segmented\" \
+                 get it. Set WAAV_SEGMENTED_STT=on to cover every session, or list deployments."
+            );
+        }
+
         Ok(Arc::new(Self {
             tts_req_managers: Arc::new(RwLock::new(tts_req_managers)),
             deployment_tts_req_managers: Arc::new(DeploymentReqManagers::new()),
@@ -174,6 +212,7 @@ impl CoreState {
             resilience: Arc::new(ResilienceRegistry::new(reconnect_cap)),
             profiler,
             profiling,
+            stt_live,
         }))
     }
 
@@ -367,8 +406,39 @@ impl CoreState {
     }
 }
 
+/// A runtime setting from the environment. Test builds look at [`set_test_env_override`] first: a
+/// value for the calling THREAD only, so a test can hand its own `AppState` a malformed setting
+/// without exposing it to the tests running beside it. Set in the shared process environment, a
+/// parallel test's `AppState` read `WAAV_EAGER_WARMUP=sometimes` and panicked (TC-WS-13).
+fn runtime_env(name: &str) -> Result<String, std::env::VarError> {
+    #[cfg(test)]
+    if let Some(value) = TEST_ENV_OVERRIDES.with(|o| o.borrow().get(name).cloned()) {
+        return Ok(value);
+    }
+    std::env::var(name)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV_OVERRIDES: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::default();
+}
+
+/// Test builds: `name=value` for the runtime settings read on THIS thread; `None` removes it.
+#[cfg(test)]
+pub(crate) fn set_test_env_override(name: &str, value: Option<&str>) {
+    TEST_ENV_OVERRIDES.with(|o| match value {
+        Some(v) => {
+            o.borrow_mut().insert(name.to_string(), v.to_string());
+        }
+        None => {
+            o.borrow_mut().remove(name);
+        }
+    });
+}
+
 fn parse_env_bool(name: &str) -> Result<Option<bool>, String> {
-    match std::env::var(name) {
+    match runtime_env(name) {
         Ok(value) => parse_bool(&value).map(Some).ok_or_else(|| {
             format!("Invalid {name} environment variable: expected true/false/1/0/yes/no")
         }),
@@ -380,7 +450,7 @@ fn parse_env_bool(name: &str) -> Result<Option<bool>, String> {
 }
 
 fn parse_env_positive_usize(name: &str) -> Result<Option<usize>, String> {
-    match std::env::var(name) {
+    match runtime_env(name) {
         Ok(value) => value
             .parse::<usize>()
             .map_err(|e| format!("Invalid {name} environment variable: {e}"))
@@ -457,7 +527,6 @@ pub fn tts_account_permits(provider: &str) -> Option<Arc<tokio::sync::Semaphore>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
     fn the_account_concurrency_list_names_each_vendors_limit() {
@@ -469,19 +538,30 @@ mod tests {
     }
 
     fn cleanup_runtime_env() {
-        unsafe {
-            std::env::remove_var("WAAV_EAGER_WARMUP");
-            std::env::remove_var("WAAV_MAX_CONCURRENT_RECONNECTS");
-        }
+        set_test_env_override("WAAV_EAGER_WARMUP", None);
+        set_test_env_override("WAAV_MAX_CONCURRENT_RECONNECTS", None);
+    }
+
+    /// A malformed setting a test hands its own `AppState` must not reach a test running beside it.
+    #[test]
+    fn a_test_override_is_seen_only_by_its_own_thread() {
+        set_test_env_override("WAAV_EAGER_WARMUP", Some("sometimes"));
+        assert!(parse_env_bool("WAAV_EAGER_WARMUP").is_err());
+        let beside = std::thread::spawn(|| parse_env_bool("WAAV_EAGER_WARMUP"))
+            .join()
+            .unwrap();
+        assert!(
+            beside.is_ok(),
+            "another thread saw the override: {beside:?}"
+        );
+        cleanup_runtime_env();
+        assert!(parse_env_bool("WAAV_EAGER_WARMUP").is_ok());
     }
 
     #[test]
-    #[serial]
     fn runtime_bool_env_rejects_malformed_value() {
         cleanup_runtime_env();
-        unsafe {
-            std::env::set_var("WAAV_EAGER_WARMUP", "sometimes");
-        }
+        set_test_env_override("WAAV_EAGER_WARMUP", Some("sometimes"));
 
         let err = parse_env_bool("WAAV_EAGER_WARMUP").expect_err("malformed bool must fail");
         assert!(
@@ -493,12 +573,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn runtime_reconnect_cap_rejects_malformed_or_zero_value() {
         cleanup_runtime_env();
-        unsafe {
-            std::env::set_var("WAAV_MAX_CONCURRENT_RECONNECTS", "wide");
-        }
+        set_test_env_override("WAAV_MAX_CONCURRENT_RECONNECTS", Some("wide"));
 
         let err = parse_env_positive_usize("WAAV_MAX_CONCURRENT_RECONNECTS")
             .expect_err("malformed cap must fail");
@@ -507,9 +584,7 @@ mod tests {
             "error should name bad env var: {err}"
         );
 
-        unsafe {
-            std::env::set_var("WAAV_MAX_CONCURRENT_RECONNECTS", "0");
-        }
+        set_test_env_override("WAAV_MAX_CONCURRENT_RECONNECTS", Some("0"));
         let err = parse_env_positive_usize("WAAV_MAX_CONCURRENT_RECONNECTS")
             .expect_err("zero cap must fail");
         assert!(

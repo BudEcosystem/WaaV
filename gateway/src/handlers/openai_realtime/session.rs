@@ -174,6 +174,56 @@ fn not_found(model: &str) -> HandshakeError {
     .param("model")
 }
 
+/// A name that is not a realtime deployment: a file-only transcription deployment the caller can
+/// reach is refused as `stt_live_unsupported` (`realtime_needs_agent`), with today's status; any
+/// other name keeps `model_not_found`.
+fn needs_agent_or_not_found(state: &AppState, model: &str, credential: &str) -> HandshakeError {
+    let stt = crate::handlers::ws::bud_legs::STT_CAPABILITY;
+    let file_only = state
+        .resolve_voice_endpoint(model, stt, Some(credential))
+        .and_then(|r| {
+            state
+                .bud_mode
+                .as_ref()
+                .and_then(|b| b.plane().voice_endpoint(&r.endpoint_id))
+        })
+        .filter(|ep| ep.serves(stt))
+        .map(|ep| {
+            let settings = ep.config.stt();
+            let m = settings
+                .model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .or_else(|| ep.model.clone())
+                .unwrap_or_default();
+            (ep.vendor.clone(), m)
+        })
+        .filter(|(vendor, m)| {
+            crate::core::stt::segmented::live::is_file_only(&state.core_state.stt_live, vendor, m)
+        });
+    match file_only {
+        Some((provider, m)) => realtime_needs_agent(model, &provider, &m),
+        None => not_found(model),
+    }
+}
+
+fn realtime_needs_agent(name: &str, provider: &str, model: &str) -> HandshakeError {
+    HandshakeError::new(
+        StatusCode::NOT_FOUND,
+        "stt_live_unsupported",
+        format!(
+            "'{name}' is a speech-to-text deployment whose model transcribes files, not a live stream. Realtime sessions need a voice agent (model=prompt:<agent>) to take turns on it, or use /ws."
+        ),
+    )
+    .param("model")
+    .details(serde_json::json!({
+        "reason": "realtime_needs_agent",
+        "provider": provider,
+        "model": model,
+        "deployment": name,
+    }))
+}
+
 /// Authenticate a Bud key or JWT.
 pub async fn authenticate(
     state: &AppState,
@@ -230,8 +280,9 @@ fn bud_mode_required() -> HandshakeError {
     HandshakeError::new(
         StatusCode::NOT_FOUND,
         "bud_mode_required",
-        "/v1/realtime serves Bud deployments and this gateway has no Bud control plane; \
-         WaaV's native realtime protocol is at /realtime.",
+        "This needs the Bud control plane, which this gateway does not run. Without it, \
+         /v1/realtime serves server aliases marked `openai_compatible: true` (no client \
+         secrets), and WaaV's native realtime protocol is at /realtime.",
     )
 }
 
@@ -374,7 +425,7 @@ pub async fn prepare(
         let caller = authenticate(state, &hs.credential).await?;
         let resolved = state
             .resolve_voice_endpoint(&hs.model, REALTIME_CAPABILITY, Some(hs.credential.expose()))
-            .ok_or_else(|| not_found(&hs.model))?;
+            .ok_or_else(|| needs_agent_or_not_found(state, &hs.model, hs.credential.expose()))?;
         (caller, resolved.endpoint_id, resolved.alias)
     };
 
@@ -461,11 +512,19 @@ pub async fn realtime_ws_handler(
     slot: Option<Extension<ConnectionSlot>>,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
-    // Spec 025: `?model=prompt:<agent>` is a voice agent — the Cascade engine.
-    if handshake::parse(uri.query(), &headers)
+    // The Cascade engine: a Bud voice agent (`?model=prompt:<agent>`, spec 025) or, on a gateway
+    // without the Bud control plane, a server alias run by the conversation loop.
+    let cascade = if state.bud_mode.is_none() {
+        Some(super::cascade::prepare_alias(&state, uri.query(), &headers, uri.path()).await)
+    } else if handshake::parse(uri.query(), &headers)
         .is_ok_and(|hs| super::cascade::is_agent_model(&hs.model))
     {
-        let prepared = match super::cascade::prepare(&state, uri.query(), &headers).await {
+        Some(super::cascade::prepare(&state, uri.query(), &headers).await)
+    } else {
+        None
+    };
+    if let Some(prepared) = cascade {
+        let prepared = match prepared {
             Ok(p) => p,
             Err(e) => {
                 metrics::counter!("waav_realtime_refusals_total", "code" => e.code).increment(1);
@@ -1014,7 +1073,7 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
                     .record_failure(&p.endpoint_id, &p.vkey, &verdict);
             }
             let end = End::new("upstream_error", 1011).with_error("upstream_error", e.to_string());
-            finish(meter, end, &client_tx, writer, None, &vendor).await;
+            finish(meter, end, &client_tx, writer, client_rx, None, &vendor).await;
             return;
         }
     };
@@ -1174,7 +1233,16 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
         ))),
     )
     .await;
-    finish(meter, end, &client_tx, writer, Some(&session_id), &vendor).await;
+    finish(
+        meter,
+        end,
+        &client_tx,
+        writer,
+        client_rx,
+        Some(&session_id),
+        &vendor,
+    )
+    .await;
     drop(p);
 }
 
@@ -1186,12 +1254,25 @@ async fn recv<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
     }
 }
 
+/// How long the client gets to answer the close frame once it is delivered (the WebSocket closing handshake).
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+/// Read (and discard) what the client sends until it answers the close or goes away.
+async fn drain_client(client_rx: &mut futures_util::stream::SplitStream<WebSocket>) {
+    while let Some(Ok(msg)) = client_rx.next().await {
+        if matches!(msg, Message::Close(_)) {
+            break;
+        }
+    }
+}
+
 /// The common teardown: the error event and close, the session record, the metrics.
 pub(super) async fn finish(
     meter: SessionMeter,
     end: End,
     client_tx: &mpsc::Sender<Outbound>,
     writer: tokio::task::JoinHandle<()>,
+    mut client_rx: futures_util::stream::SplitStream<WebSocket>,
     session_id: Option<&str>,
     vendor: &str,
 ) {
@@ -1199,22 +1280,46 @@ pub(super) async fn finish(
         .error
         .as_ref()
         .map(|(code, message)| gateway_error(code, message, None, None));
-    // Behind any backlog, so every frame queued before the close still arrives in order.
-    let _ = tokio::time::timeout(
-        Duration::from_secs(30),
-        client_tx.send(Outbound::Close {
-            error,
-            code: end.close_code.clamp(1000, 4999),
-            reason: end.reason.to_string(),
-        }),
-    )
-    .await;
-    let abort = writer.abort_handle();
-    if tokio::time::timeout(Duration::from_secs(30), writer)
-        .await
-        .is_err()
-    {
-        abort.abort();
+    let deliver = async {
+        // Behind any backlog, so every frame queued before the close still arrives in order.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            client_tx.send(Outbound::Close {
+                error,
+                code: end.close_code.clamp(1000, 4999),
+                reason: end.reason.to_string(),
+            }),
+        )
+        .await;
+        let abort = writer.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .is_err()
+        {
+            abort.abort();
+        }
+    };
+    // While the backlog and the close go out, keep reading what the client sends. A socket dropped with
+    // unread client data (a slow client's pongs, say) makes the kernel send a TCP reset, and a reset discards
+    // everything still buffered for the client: the tail of the audio and the close frame itself, exactly
+    // when the client was too slow.
+    let client_gone = {
+        let drain = drain_client(&mut client_rx);
+        tokio::pin!(deliver, drain);
+        tokio::select! {
+            () = &mut deliver => false,
+            () = &mut drain => {
+                deliver.await;
+                true
+            }
+        }
+    };
+    // Then give the client a moment to answer the close, off the teardown path: the session's admission and
+    // connection slot are released now, not after the grace.
+    if !client_gone {
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(CLOSE_GRACE, drain_client(&mut client_rx)).await;
+        });
     }
     info!(
         session_id = session_id.unwrap_or(meter.session_id()),
@@ -1233,6 +1338,31 @@ pub(super) async fn finish(
 #[cfg(test)]
 mod tests {
     use super::End;
+
+    #[tokio::test]
+    async fn a_file_only_deployment_without_an_agent_is_refused_with_its_reason() {
+        use super::{not_found, realtime_needs_agent};
+        use axum::http::StatusCode;
+        let e = realtime_needs_agent("my-scribe", "elevenlabs", "scribe_v2");
+        assert_eq!(e.status, StatusCode::NOT_FOUND, "today's status");
+        assert_eq!(e.code, "stt_live_unsupported");
+        let resp = axum::response::IntoResponse::into_response(e);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "stt_live_unsupported");
+        assert_eq!(v["error"]["param"], "model");
+        assert_eq!(v["error"]["details"]["reason"], "realtime_needs_agent");
+        assert_eq!(v["error"]["details"]["model"], "scribe_v2");
+        let nf = axum::response::IntoResponse::into_response(not_found("x"));
+        let body = axum::body::to_bytes(nf.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"].get("details").is_none(),
+            "OpenAI's shape is unchanged"
+        );
+    }
 
     #[test]
     fn a_normal_vendor_close_ends_the_session_without_an_error() {

@@ -120,6 +120,9 @@ bud-auth = { path = "../bud-auth" }
 # OpenAI-compatible audio request translation (FRD-018). Separate crate for the same reason
 # as bud-auth: pure mapping logic that tests in milliseconds instead of minutes.
 waav-openai-audio = { path = "../waav-openai-audio" }
+# Segmented speech-to-text: the capability map, the resolver, the segmenting engine and the
+# transcriber layer. Kept out of this crate so its tests run in seconds.
+waav-segmented-stt = { path = "../segmented-stt" }
 # FRD-022: a Bud deployment's Rate limiting and Resilience settings — the local-first limiter
 # shared with budgateway, plus retry/breaker/fallback primitives. Pinned by rev; the Redis
 # adapter matches the `redis` 0.27 bud-auth already links.
@@ -170,7 +173,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 hound = "3.5"
 
 # JWT authentication
-jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.2.0", features = ["aws_lc_rs"] }
 
 # WebSocket client
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
@@ -188,6 +191,8 @@ dotenvy = "0.15"
 
 # Configuration
 serde_yaml = "0.9"
+# Reports the YAML keys a config file sets but no field reads (typos such as `securty:`).
+serde_ignored = "0.1"
 
 # Error handling
 thiserror = "2.0.12"
@@ -238,11 +243,12 @@ livekit = "=0.7.24"
 # webrtc-sys-build wrong is the confusing failure: the download succeeds and the C++ headers
 # then reference a `cricket` namespace the newer prebuilt artifact no longer has.
 #
-# These are direct dependencies only so the pin is visible and reviewable; nothing in this
-# crate calls them. See BUILD_NOTES.md.
+# These are direct dependencies so the pin is visible and reviewable. The crate calls webrtc-sys
+# for one thing only: the ICE network policy the vendored copy adds (src/livekit/ice.rs). See
+# BUILD_NOTES.md.
 libwebrtc = "=0.3.19"
 webrtc-sys = "=0.3.16"
-livekit-api = "=0.4.9"
+livekit-api = "=0.4.9"  # patched: see [patch.crates-io] at the end of this file
 livekit-protocol = "=0.5.1"
 # Need prost/pbjson-types for SIP API client, using same versions as livekit to avoid conflicts
 prost = "0.12.6"
@@ -423,3 +429,23 @@ lto = "fat"         # Full LTO for maximum size reduction
 # - Incremental builds grow over time; periodic cleanup is essential
 # - Target dir >5GB indicates cleanup is needed
 # =============================================================================
+
+# =============================================================================
+# Patched dependencies
+# =============================================================================
+# livekit-api 0.4.9's Twirp client (RoomService/Egress/SIP) pushes "/twirp/livekit.X/Method"
+# as ONE path segment, so the url crate (every 2.x, by design) sends
+# "/%2Ftwirp%2Flivekit.RoomService%2FCreateRoom". LiveKit server 1.13+ answers 404 to that
+# (1.12 happened to route it), and the 404 body then surfaced as "error decoding response body".
+# The vendored copy is the published 0.4.9 source plus a fix to src/services/twirp_client.rs
+# (literal path, ws/wss -> http/https, readable non-Twirp errors). It is a path dependency, so
+# offline builds need nothing new. Drop this when an upstream livekit-api with the fix is
+# adopted together with the matching `livekit` crate.
+[patch.crates-io]
+livekit-api = { path = "vendor/livekit-api" }
+# x86-only NVIDIA codec trampolines no longer built on aarch64 (fresh GB10 builds with CUDA installed
+# failed in webrtc-sys); see the WaaV patch note in vendor/webrtc-sys/build.rs.
+webrtc-sys = { path = "vendor/webrtc-sys" }
+# zip without zstd for the libwebrtc download (RUSTSEC-2026-0395..0410); see the WaaV patch note in
+# vendor/webrtc-sys-build/Cargo.toml.
+webrtc-sys-build = { path = "vendor/webrtc-sys-build" }

@@ -32,9 +32,9 @@ pub use credentials::{
     CredentialDecryptor, CredentialError, REALTIME_RATE_KEYS, VoiceEndpoint, VoicePricing,
 };
 pub use endpoint_config::{
-    Pronunciation, RealtimeDefaults, RealtimeLimits, RealtimePolicy, RealtimeSettings,
-    RealtimeTranscription, SttSettings, TranslationSettings, TtsSettings, VoiceDescriptor,
-    VoiceEndpointSettings,
+    OverrideLatency, OverrideLimits, Pronunciation, RealtimeDefaults, RealtimeLimits,
+    RealtimePolicy, RealtimeSettings, RealtimeTranscription, SttCapabilityOverride, SttSegmented,
+    SttSettings, TranslationSettings, TtsSettings, VoiceDescriptor, VoiceEndpointSettings,
 };
 pub use guards::{Denied, EscalationPermit, KeyShape, MissGuardConfig, MissGuards};
 pub use hash::hash_api_key;

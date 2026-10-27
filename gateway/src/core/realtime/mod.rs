@@ -68,6 +68,16 @@ pub mod yandex;
 /// an OpenAI-family provider for text replies only (its own voice is off; WaaV's speaks).
 pub const HALF_CASCADE_TEXT: &str = "half_cascade_text";
 
+/// Whether an input-transcription model is OpenAI's default rather than one the client chose:
+/// the `/realtime` handler fills an unset model with [`DEFAULT_OPENAI_STT_MODEL`] (it was
+/// `whisper-1` before addendum B6), which a provider with transcription of its own does not know.
+///
+/// [`DEFAULT_OPENAI_STT_MODEL`]: crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL
+pub fn is_openai_default_transcription(model: &str) -> bool {
+    let model = model.trim();
+    model == "whisper-1" || model == crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL
+}
+
 pub use azure::{AzureProtocol, AzureRealtime};
 pub use base::{
     AudioOutputCallback, AwsStaticCredentials, BaseRealtime, BoxedRealtime, ConnectionState,
