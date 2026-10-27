@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>The real-time voice gateway for AI agents.</b><br>
-  One API for 70+ speech providers, realtime voice models and your own LLMs.<br>
+  One API for 44 speech vendors, realtime voice models and your own LLMs.<br>
   Self-hosted, open source, written in Rust. From <a href="https://github.com/BudEcosystem">Bud Ecosystem</a>.
 </p>
 
@@ -28,7 +28,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/readme/hero.svg" width="100%" alt="Apps, phone calls, LiveKit rooms and agents connect to WaaV, which reaches Deepgram, ElevenLabs, OpenAI, Google, Azure, AWS, your own LLMs and 60 more providers">
+  <img src="assets/readme/hero.svg" width="100%" alt="Apps, phone calls, LiveKit rooms and agents connect to WaaV, which reaches Deepgram, ElevenLabs, OpenAI, Google, Azure, AWS, your own LLMs and 38 more vendors">
 </p>
 
 WaaV sits between your app and the speech world. Your app streams audio or text to one endpoint; WaaV
@@ -42,8 +42,8 @@ rewrite.
 <tr>
 <td width="50%" valign="top">
 <h3>🔌 One API, every provider</h3>
-31 speech-to-text, 35 text-to-speech and 11 speech-to-speech providers behind one WebSocket and REST
-API, plus drop-in OpenAI <code>/v1/audio</code> and <code>/v1/realtime</code> endpoints. Language
+44 vendors behind one WebSocket and REST API (31 speech-to-text, 34 text-to-speech and 11
+speech-to-speech integrations), plus drop-in OpenAI <code>/v1/audio</code> and <code>/v1/realtime</code> endpoints. Language
 codes, voices and emotions are written once and mapped to each provider's own form.
 </td>
 <td width="50%" valign="top">
@@ -87,6 +87,29 @@ your own agents run in the background; the answer is read out word for word when
 
 It is opt-in: sessions that don't ask for it behave exactly as before.
 → [Tutorial](gateway/docs/tutorials/interaction_mode_tutorial.md) · [Reference](gateway/docs/interaction_mode.md) · [Changelog](gateway/CHANGELOG.md)
+
+## Audio intelligence, built in
+
+Speech providers transcribe and speak. Knowing *when* to listen, *when* the caller has finished and *what*
+they meant happens in WaaV itself, with small models that run on every caller's audio, whichever provider
+you use.
+
+<p align="center">
+  <img src="assets/readme/audio-intelligence.svg" width="100%" alt="The caller's audio passes through echo control (WebRTC AEC3), noise suppression (DeepFilterNet), voice activity (Silero VAD v5), end of turn by ear (Smart Turn v3.2) and by words (LiveKit turn detector), then the front model (Qwen3.5-2B) decides what the turn means">
+</p>
+
+| Step | Model | What it gives you | Turn it on |
+|---|---|---|---|
+| Echo control | WebRTC AEC3 and a correlation gate | The agent's own voice, played back through a speaker, is never taken for the caller | `interaction.duplex.echo` (the gate is on by default) |
+| Noise suppression | [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) | Cleaner transcripts from cars, streets and open offices | `stt_config.noise_suppression: true` |
+| Voice activity | [Silero VAD v5](https://github.com/snakers4/silero-vad) | Speech or silence every 32 ms, so the agent knows at once when the caller starts: barge-in, ducking, backchannels | with turn detection or `interaction` |
+| End of turn, by ear | [Smart Turn v3.2](https://huggingface.co/pipecat-ai/smart-turn-v3) | Hears whether a sentence *sounded* finished, so a thinking pause isn't cut off | `stt_config.turn_detection.enabled: true` |
+| End of turn, by words | [LiveKit turn detector](https://huggingface.co/livekit/turn-detector) | Reads the transcript to tell "I'd like to fly to…" from a complete request | in release builds, at each final transcript |
+| Meaning | Qwen3.5-2B front model on llama.cpp | Decides what each turn is (request, correction, "stop", answer) and replies at once | `interaction` |
+
+The voice and turn models run in the gateway on the CPU; the front model runs on llama.cpp beside it. The
+same models cut speech into turns for [segmented speech-to-text](docs/segmented-stt/customer-contract-reference.md),
+which lets file-only recognisers such as Whisper serve live calls.
 
 ## Quick start
 
@@ -161,7 +184,8 @@ Build details and gotchas: [docs/build/BUILD.md](docs/build/BUILD.md) · Deploym
 | | |
 |---|---|
 | **Interaction mode** | Front model for every turn, background tasks, barge-in, confirmations, caller controls, personas, caller memory, language packs. [Docs](gateway/docs/interaction_mode.md) |
-| **Voice pipeline** | DeepFilterNet noise suppression, Silero VAD, Smart Turn and text turn detection, streaming TTS, Opus transport. |
+| **Audio intelligence** | Echo control, noise suppression, voice activity and two end-of-turn models on every caller. [More](#audio-intelligence-built-in) |
+| **Voice pipeline** | Streaming STT and TTS, an Opus transport, resampling, audio-format detection at every boundary. |
 | **Realtime reasoning** | A fast model for simple turns and a reasoning model for hard ones, with latency masking, a stall watchdog and chain-of-thought never spoken. [Design](docs/research/REALTIME_REASONING.md) |
 | **Speech-to-speech** | One protocol for 11 realtime providers, with reconnect, conversation replay and barge-in done once for all. |
 | **Segmented speech-to-text** | File-only transcription models served live, turn by turn. [Docs](docs/segmented-stt/customer-contract-reference.md) |
@@ -180,14 +204,21 @@ Build details and gotchas: [docs/build/BUILD.md](docs/build/BUILD.md) · Deploym
 
 ## Providers
 
+<p align="center">
+  <img src="assets/readme/coverage-map.svg" width="100%" alt="World map of provider coverage. Regional specialists: Europe (Speechmatics, Gladia, Phonexia, Acapela, CereProc), Russia (Yandex SpeechKit, T-Bank VoiceKit, SberDevices), India (Sarvam AI, Gnani.ai, Reverie, Bhashini, Smallest.ai), China (iFlytek, Alibaba Cloud, Baidu, Tencent, Huawei), Korea and Japan (NAVER CLOVA, AmiVoice), South-East Asia (Zalo AI, FPT.AI, Viettel AI, NECTEC). Global clouds: Deepgram, OpenAI, Google, Microsoft Azure, AWS, ElevenLabs and 14 more">
+</p>
+
+A caller in Chennai, Hanoi or Osaka is best served by a recogniser trained on their language and accent. WaaV
+puts the regional specialists next to the global clouds behind the same API, so one agent can pick the right
+provider per call, per language, without new client code.
+
 | Kind | Count | Including |
 |---|---|---|
 | Speech-to-text | 31 | Deepgram, Google, Azure, OpenAI, ElevenLabs, AssemblyAI, Cartesia, AWS Transcribe, Speechmatics, Gladia, Sarvam, iFlytek… |
-| Text-to-speech | 35 | ElevenLabs, Deepgram, Cartesia, OpenAI, Google, Azure, AWS Polly, Hume, Murf, Resemble, Smallest.ai… |
+| Text-to-speech | 34 + self-hosted | ElevenLabs, Deepgram, Cartesia, OpenAI, Google, Azure, AWS Polly, Hume, Murf, Resemble, Smallest.ai… |
 | Speech-to-speech | 11 | OpenAI Realtime, Gemini Live, Deepgram Voice Agent, ElevenLabs agents, Hume EVI, AWS Nova Sonic, Azure, Grok, Inworld, Ultravox, Yandex |
 | Language models | any | OpenAI-compatible servers (vLLM, llama.cpp, Ollama…), OpenAI, Anthropic, Gemini |
 
-Regional coverage includes India, China, Japan, Korea, South-East Asia, Russia and Europe.
 → [Every provider, with models and features](gateway/docs/SUPPORTED_PROVIDERS.md)
 
 ## Client SDKs

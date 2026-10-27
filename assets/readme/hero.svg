@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="460" viewBox="0 0 1280 460" role="img" aria-labelledby="t d">
   <title id="t">WaaV Gateway</title>
-  <desc id="d">Apps, phones and agents connect to WaaV, which reaches 70+ speech providers and your own models through one API.</desc>
+  <desc id="d">Apps, phones and agents connect to WaaV, which reaches 44 speech vendors and your own models through one API.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#120B32"/>
@@ -59,14 +59,14 @@
 
     <text x="64" y="168" font-size="46" font-weight="800" fill="#FFFFFF" letter-spacing="-1">The real-time voice</text>
     <text x="64" y="222" font-size="46" font-weight="800" fill="#FFFFFF" letter-spacing="-1">gateway for <tspan fill="#C4B5FD">AI agents</tspan></text>
-    <text x="64" y="270" font-size="18" fill="#C7D2FE" fill-opacity="0.9">One API for 70+ speech providers, realtime voice</text>
+    <text x="64" y="270" font-size="18" fill="#C7D2FE" fill-opacity="0.9">One API for 44 speech vendors, realtime voice</text>
     <text x="64" y="296" font-size="18" fill="#C7D2FE" fill-opacity="0.9">models and your own LLMs. Self-hosted, written in Rust.</text>
 
     <g font-size="14" font-weight="600" fill="#FFFFFF">
       <rect x="64" y="332" width="140" height="34" rx="10" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
       <text x="134" y="354" text-anchor="middle">31 speech-to-text</text>
       <rect x="214" y="332" width="140" height="34" rx="10" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
-      <text x="284" y="354" text-anchor="middle">35 text-to-speech</text>
+      <text x="284" y="354" text-anchor="middle">34 text-to-speech</text>
       <rect x="364" y="332" width="160" height="34" rx="10" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
       <text x="444" y="354" text-anchor="middle">11 speech-to-speech</text>
     </g>
@@ -140,7 +140,7 @@
       <g transform="translate(1056 180)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.08" stroke="#A78BFA" stroke-opacity="0.45"/><text x="88" y="23" text-anchor="middle">OpenAI</text></g>
       <g transform="translate(1056 230)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.08" stroke="#A78BFA" stroke-opacity="0.45"/><text x="88" y="23" text-anchor="middle">Google · Azure · AWS</text></g>
       <g transform="translate(1056 280)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.08" stroke="#A78BFA" stroke-opacity="0.45"/><text x="88" y="23" text-anchor="middle">Your own LLMs</text></g>
-      <g transform="translate(1056 330)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.04" stroke="#FFFFFF" stroke-opacity="0.25" stroke-dasharray="4 4"/><text x="88" y="23" text-anchor="middle" fill="#CBD5E1">+ 60 more</text></g>
+      <g transform="translate(1056 330)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.04" stroke="#FFFFFF" stroke-opacity="0.25" stroke-dasharray="4 4"/><text x="88" y="23" text-anchor="middle" fill="#CBD5E1">+ 38 more</text></g>
     </g>
   </g>
 </svg>

@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="470" viewBox="0 0 1280 470" role="img" aria-labelledby="t d">
+  <title id="t">Audio intelligence built into WaaV</title>
+  <desc id="d">The caller's audio passes through models that run in the gateway: echo control with WebRTC AEC3, noise suppression with DeepFilterNet, voice activity with Silero VAD v5, end-of-turn from the audio with Smart Turn v3.2 and from the transcript with LiveKit's turn detector, then the front model, Qwen3.5-2B on llama.cpp, decides what the turn means.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#120B32"/>
+      <stop offset="0.6" stop-color="#17123F"/>
+      <stop offset="1" stop-color="#0A2540"/>
+    </linearGradient>
+    <linearGradient id="flow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#A78BFA"/>
+    </linearGradient>
+    <linearGradient id="front" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#A78BFA"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <clipPath id="card"><rect width="1280" height="470" rx="24"/></clipPath>
+  </defs>
+  <g clip-path="url(#card)"><rect width="1280" height="470" fill="url(#bg)"/></g>
+
+  <g font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="40" y="54" font-size="24" font-weight="800" fill="#FFFFFF">Audio intelligence, built in</text>
+    <text x="40" y="82" font-size="15" fill="#C7D2FE" fill-opacity="0.9">Small models inside the gateway listen to every caller before and after the speech providers do.</text>
+
+    <!-- caller waveform -->
+    <g transform="translate(40 112)">
+      <text x="0" y="0" font-size="12" font-weight="700" fill="#94A3B8" letter-spacing="1.5">CALLER AUDIO</text>
+      <path d="M0 30 h40 l6 -14 l6 26 l6 -32 l6 40 l6 -26 l6 14 h20 l5 -8 l5 14 l5 -10 l5 4 h30 l6 -18 l6 34 l6 -40 l6 44 l6 -30 l6 12 h40 l5 -6 l5 10 l5 -6 h400 l6 -16 l6 30 l6 -36 l6 40 l6 -22 l6 6 h40 l6 -12 l6 20 l6 -10 h300"
+            fill="none" stroke="url(#flow)" stroke-width="2" stroke-linejoin="round" opacity="0.85"/>
+    </g>
+
+    <!-- arrows between cards -->
+    <g stroke="#A78BFA" stroke-opacity="0.6" stroke-width="2" fill="none">
+      <path d="M218 266 h22"/><path d="M422 266 h22"/><path d="M626 266 h22"/><path d="M830 266 h22"/><path d="M1034 266 h22"/>
+    </g>
+    <g fill="#A78BFA">
+      <path d="M240 260 l8 6 l-8 6z"/><path d="M444 260 l8 6 l-8 6z"/><path d="M648 260 l8 6 l-8 6z"/><path d="M852 260 l8 6 l-8 6z"/><path d="M1056 260 l8 6 l-8 6z"/>
+    </g>
+
+    <!-- cards -->
+    <g>
+      <g transform="translate(40 172)">
+        <rect width="178" height="196" rx="16" fill="#FFFFFF" fill-opacity="0.06" stroke="#38BDF8" stroke-opacity="0.5"/>
+        <text x="16" y="34" font-size="12" font-weight="700" fill="#7DD3FC" letter-spacing="1">1 · ECHO</text>
+        <text x="16" y="60" font-size="16" font-weight="800" fill="#FFFFFF">The agent never</text>
+        <text x="16" y="80" font-size="16" font-weight="800" fill="#FFFFFF">hears itself</text>
+        <rect x="16" y="94" width="146" height="22" rx="11" fill="#38BDF8" fill-opacity="0.15"/>
+        <text x="89" y="109" text-anchor="middle" font-size="11.5" font-weight="600" fill="#BAE6FD">WebRTC AEC3 + gate</text>
+        <text x="16" y="140" font-size="12" fill="#CBD5E1">Removes the agent's own</text>
+        <text x="16" y="156" font-size="12" fill="#CBD5E1">voice from the line, so a</text>
+        <text x="16" y="172" font-size="12" fill="#CBD5E1">speakerphone can't barge in.</text>
+      </g>
+      <g transform="translate(244 172)">
+        <rect width="178" height="196" rx="16" fill="#FFFFFF" fill-opacity="0.06" stroke="#38BDF8" stroke-opacity="0.5"/>
+        <text x="16" y="34" font-size="12" font-weight="700" fill="#7DD3FC" letter-spacing="1">2 · NOISE</text>
+        <text x="16" y="60" font-size="16" font-weight="800" fill="#FFFFFF">Clean speech from</text>
+        <text x="16" y="80" font-size="16" font-weight="800" fill="#FFFFFF">noisy rooms</text>
+        <rect x="16" y="94" width="146" height="22" rx="11" fill="#38BDF8" fill-opacity="0.15"/>
+        <text x="89" y="109" text-anchor="middle" font-size="11.5" font-weight="600" fill="#BAE6FD">DeepFilterNet</text>
+        <text x="16" y="140" font-size="12" fill="#CBD5E1">Strips traffic, fans and</text>
+        <text x="16" y="156" font-size="12" fill="#CBD5E1">chatter before transcription,</text>
+        <text x="16" y="172" font-size="12" fill="#CBD5E1">for about 30 ms.</text>
+      </g>
+      <g transform="translate(448 172)">
+        <rect width="178" height="196" rx="16" fill="#FFFFFF" fill-opacity="0.06" stroke="#38BDF8" stroke-opacity="0.5"/>
+        <text x="16" y="34" font-size="12" font-weight="700" fill="#7DD3FC" letter-spacing="1">3 · VOICE</text>
+        <text x="16" y="60" font-size="16" font-weight="800" fill="#FFFFFF">Knows when</text>
+        <text x="16" y="80" font-size="16" font-weight="800" fill="#FFFFFF">someone speaks</text>
+        <rect x="16" y="94" width="146" height="22" rx="11" fill="#38BDF8" fill-opacity="0.15"/>
+        <text x="89" y="109" text-anchor="middle" font-size="11.5" font-weight="600" fill="#BAE6FD">Silero VAD v5</text>
+        <text x="16" y="140" font-size="12" fill="#CBD5E1">Speech or silence every</text>
+        <text x="16" y="156" font-size="12" fill="#CBD5E1">32 ms; a caller who starts</text>
+        <text x="16" y="172" font-size="12" fill="#CBD5E1">talking is noticed in 64 ms.</text>
+      </g>
+      <g transform="translate(652 172)">
+        <rect width="178" height="196" rx="16" fill="#FFFFFF" fill-opacity="0.06" stroke="#A78BFA" stroke-opacity="0.55"/>
+        <text x="16" y="34" font-size="12" font-weight="700" fill="#C4B5FD" letter-spacing="1">4 · TURN, BY EAR</text>
+        <text x="16" y="60" font-size="16" font-weight="800" fill="#FFFFFF">Did that sound</text>
+        <text x="16" y="80" font-size="16" font-weight="800" fill="#FFFFFF">finished?</text>
+        <rect x="16" y="94" width="146" height="22" rx="11" fill="#A78BFA" fill-opacity="0.18"/>
+        <text x="89" y="109" text-anchor="middle" font-size="11.5" font-weight="600" fill="#DDD6FE">Smart Turn v3.2</text>
+        <text x="16" y="140" font-size="12" fill="#CBD5E1">Reads intonation, so a</text>
+        <text x="16" y="156" font-size="12" fill="#CBD5E1">pause to think is not</text>
+        <text x="16" y="172" font-size="12" fill="#CBD5E1">mistaken for the end.</text>
+      </g>
+      <g transform="translate(856 172)">
+        <rect width="178" height="196" rx="16" fill="#FFFFFF" fill-opacity="0.06" stroke="#A78BFA" stroke-opacity="0.55"/>
+        <text x="16" y="34" font-size="12" font-weight="700" fill="#C4B5FD" letter-spacing="1">5 · TURN, BY WORDS</text>
+        <text x="16" y="60" font-size="16" font-weight="800" fill="#FFFFFF">Did that read</text>
+        <text x="16" y="80" font-size="16" font-weight="800" fill="#FFFFFF">finished?</text>
+        <rect x="16" y="94" width="146" height="22" rx="11" fill="#A78BFA" fill-opacity="0.18"/>
+        <text x="89" y="109" text-anchor="middle" font-size="11.5" font-weight="600" fill="#DDD6FE">LiveKit turn detector</text>
+        <text x="16" y="140" font-size="12" fill="#CBD5E1">Tells "I'd like to fly to…"</text>
+        <text x="16" y="156" font-size="12" fill="#CBD5E1">from a complete request,</text>
+        <text x="16" y="172" font-size="12" fill="#CBD5E1">using the transcript.</text>
+      </g>
+      <g transform="translate(1060 172)">
+        <rect width="180" height="196" rx="16" fill="url(#front)"/>
+        <text x="16" y="34" font-size="12" font-weight="700" fill="#EDE9FE" letter-spacing="1">6 · MEANING</text>
+        <text x="16" y="60" font-size="16" font-weight="800" fill="#FFFFFF">What does the</text>
+        <text x="16" y="80" font-size="16" font-weight="800" fill="#FFFFFF">caller want?</text>
+        <rect x="16" y="94" width="148" height="22" rx="11" fill="#FFFFFF" fill-opacity="0.2"/>
+        <text x="90" y="109" text-anchor="middle" font-size="11.5" font-weight="600" fill="#FFFFFF">Qwen3.5-2B front</text>
+        <text x="16" y="140" font-size="12" fill="#F5F3FF">A request, a correction,</text>
+        <text x="16" y="156" font-size="12" fill="#F5F3FF">"stop", or an answer: it</text>
+        <text x="16" y="172" font-size="12" fill="#F5F3FF">decides and replies at once.</text>
+      </g>
+    </g>
+
+    <!-- ensemble bracket under 3 to 5 -->
+    <g>
+      <path d="M460 382 v10 h562 v-10" fill="none" stroke="#A78BFA" stroke-opacity="0.6" stroke-width="1.5"/>
+      <text x="741" y="410" text-anchor="middle" font-size="12.5" fill="#C4B5FD">turn ensemble: the three agree on when the caller has finished</text>
+    </g>
+
+    <text x="40" y="446" font-size="12" fill="#64748B">Steps 1–5 run inside the gateway process on the CPU (ONNX Runtime, tract). Step 6 runs on llama.cpp beside it, which the gateway can start and supervise.</text>
+    <text x="40" y="462" font-size="12" fill="#64748B">The same voice and turn models cut speech into turns so file-only recognisers, such as Whisper, can serve live calls (segmented speech-to-text).</text>
+  </g>
+</svg>
