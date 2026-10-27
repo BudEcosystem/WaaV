@@ -7,6 +7,7 @@ use crate::core::providers::azure::AzureRegion;
 use crate::core::providers::google::{
     CredentialSource, GOOGLE_CLOUD_PLATFORM_SCOPE, GoogleAuthClient, TokenProvider,
 };
+use crate::handlers::voice_vendors::{CatalogCredential, CatalogVendor, VENDOR_LIST_TIMEOUT};
 use crate::state::AppState;
 
 /// Maximum decoded bytes for any single base64 voice-clone sample.
@@ -156,7 +157,7 @@ struct AzureVoice {
 }
 
 /// Maps a language code (e.g., "en-US") to a human-readable language name.
-fn language_code_to_name(code: &str) -> String {
+pub(crate) fn language_code_to_name(code: &str) -> String {
     // Extract the primary language code (e.g., "en" from "en-US")
     let primary = code.split('-').next().unwrap_or(code);
 
@@ -227,7 +228,7 @@ fn language_code_to_name(code: &str) -> String {
 }
 
 /// Extracts accent/region from a language code (e.g., "US" from "en-US").
-fn extract_accent_from_code(code: &str) -> String {
+pub(crate) fn extract_accent_from_code(code: &str) -> String {
     let parts: Vec<&str> = code.split('-').collect();
     if parts.len() >= 2 {
         // Map region codes to readable names
@@ -286,7 +287,7 @@ fn extract_accent_from_code(code: &str) -> String {
 }
 
 // Helper function to fetch voices from ElevenLabs API
-async fn fetch_elevenlabs_voices(
+pub(crate) async fn fetch_elevenlabs_voices(
     api_key: &str,
 ) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
     let client = voice_catalog_http_client()?;
@@ -417,7 +418,7 @@ fn voice_from_elevenlabs(voice: ElevenLabsVoice) -> Voice {
 }
 
 // Helper function to fetch voices from Deepgram API
-async fn fetch_deepgram_voices(
+pub(crate) async fn fetch_deepgram_voices(
     api_key: &str,
 ) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
     let client = voice_catalog_http_client()?;
@@ -505,7 +506,7 @@ async fn fetch_deepgram_voices(
 /// "Failed to fetch access token". Google is listed when a credential is configured, or when ADC
 /// has something to find: `GOOGLE_APPLICATION_CREDENTIALS`, gcloud's ADC file, or a metadata
 /// server (checked once per process).
-async fn google_voice_credentials(state: &AppState) -> Option<String> {
+pub(crate) async fn google_voice_credentials(state: &AppState) -> Option<String> {
     let configured = state.config.get_api_key("google").unwrap_or_default();
     if !configured.trim().is_empty() {
         return Some(configured);
@@ -576,7 +577,7 @@ async fn on_google_cloud() -> bool {
 }
 
 // Helper function to fetch voices from Google TTS API
-async fn fetch_google_voices(
+pub(crate) async fn fetch_google_voices(
     credentials: &str,
 ) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
     // Create credential source and auth client
@@ -652,7 +653,7 @@ async fn fetch_google_voices(
 }
 
 // Helper function to fetch voices from Azure TTS API
-async fn fetch_azure_voices(
+pub(crate) async fn fetch_azure_voices(
     subscription_key: &str,
     region: &str,
 ) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
@@ -725,69 +726,53 @@ fn azure_voices_list_url(region: &str) -> Result<String, String> {
     )
 )]
 pub async fn list_voices(State(state): State<Arc<AppState>>) -> axum::response::Response {
-    let mut voices_response = HashMap::new();
+    // Every vendor the operator holds a credential for, asked at once. A vendor that refuses,
+    // fails or outlasts its budget is left out, logged and named; the others are still answered.
+    let listings = CatalogVendor::ALL.into_iter().map(|vendor| {
+        let state = state.clone();
+        async move {
+            let Some(credential) = vendor.operator_credential(&state).await else {
+                tracing::debug!(vendor = vendor.key(), "no operator credential; not listed");
+                return None;
+            };
+            match tokio::time::timeout(VENDOR_LIST_TIMEOUT, vendor.fetch(&credential)).await {
+                Ok(Ok(voices)) => Some((vendor.key(), Ok(voices))),
+                Ok(Err(e)) => {
+                    tracing::warn!(vendor = vendor.key(), error = %e, "voice list failed");
+                    Some((vendor.key(), Err(e)))
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        vendor = vendor.key(),
+                        timeout_secs = VENDOR_LIST_TIMEOUT.as_secs(),
+                        "voice list timed out"
+                    );
+                    Some((
+                        vendor.key(),
+                        Err(format!(
+                            "timed out after {} s",
+                            VENDOR_LIST_TIMEOUT.as_secs()
+                        )),
+                    ))
+                }
+            }
+        }
+    });
+    let mut voices_response = VoicesResponse::new();
     // The vendors that refused or failed their voice list, with what they said.
     let mut failed: Vec<(&str, String)> = Vec::new();
-
-    // Fetch ElevenLabs voices - skip if not configured
-    if let Ok(api_key) = state.config.get_api_key("elevenlabs") {
-        match fetch_elevenlabs_voices(&api_key).await {
+    for (vendor, listed) in futures::future::join_all(listings)
+        .await
+        .into_iter()
+        .flatten()
+    {
+        match listed {
             Ok(voices) => {
-                voices_response.insert("elevenlabs".to_string(), voices);
+                voices_response.insert(vendor.to_string(), voices);
             }
-            Err(e) => {
-                tracing::warn!("Failed to fetch ElevenLabs voices: {}", e);
-                failed.push(("elevenlabs", e.to_string()));
-            }
-        }
-    } else {
-        tracing::debug!("ElevenLabs API key not configured, skipping");
-    }
-
-    // Fetch Deepgram voices - skip if not configured
-    if let Ok(api_key) = state.config.get_api_key("deepgram") {
-        match fetch_deepgram_voices(&api_key).await {
-            Ok(voices) => {
-                voices_response.insert("deepgram".to_string(), voices);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch Deepgram voices: {}", e);
-                failed.push(("deepgram", e.to_string()));
-            }
-        }
-    } else {
-        tracing::debug!("Deepgram API key not configured, skipping");
-    }
-
-    // Fetch Google TTS voices - only when a credential (or ADC with something to find) exists.
-    if let Some(credentials) = google_voice_credentials(&state).await {
-        match fetch_google_voices(&credentials).await {
-            Ok(voices) => {
-                voices_response.insert("google".to_string(), voices);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch Google TTS voices: {}", e);
-                failed.push(("google", e.to_string()));
-            }
+            Err(reason) => failed.push((vendor, reason)),
         }
     }
-
-    // Fetch Azure TTS voices - skip if not configured
-    if let Ok(subscription_key) = state.config.get_api_key("microsoft-azure") {
-        let region = state.config.get_azure_speech_region();
-        match fetch_azure_voices(&subscription_key, &region).await {
-            Ok(voices) => {
-                voices_response.insert("azure".to_string(), voices);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch Azure TTS voices: {}", e);
-                failed.push(("azure", e.to_string()));
-            }
-        }
-    } else {
-        tracing::debug!("Azure Speech credentials not configured, skipping");
-    }
-
     voices_answer(voices_response, failed)
 }
 
@@ -900,12 +885,12 @@ pub(crate) async fn fetch_catalog_with_key(
     provider: &str,
     api_key: &str,
 ) -> Option<Result<Vec<Voice>, String>> {
-    let fetched = match provider.to_lowercase().as_str() {
-        "elevenlabs" | "eleven_labs" => fetch_elevenlabs_voices(api_key).await,
-        "deepgram" => fetch_deepgram_voices(api_key).await,
-        _ => return None,
-    };
-    Some(fetched.map_err(|e| e.to_string()))
+    let vendor = CatalogVendor::from_name(provider).filter(|v| v.takes_a_key())?;
+    Some(
+        vendor
+            .fetch(&CatalogCredential::Key(api_key.to_string()))
+            .await,
+    )
 }
 
 /// A credential as a cache key holds it: hashed, never the key itself.
@@ -940,9 +925,8 @@ pub(crate) async fn fetch_catalog_shared(
     api_key: &str,
 ) -> Option<Result<Vec<Voice>, String>> {
     let vendor = provider.to_lowercase();
-    if !matches!(vendor.as_str(), "elevenlabs" | "eleven_labs" | "deepgram") {
-        return None;
-    }
+    // The vendors whose list a key reads ([`fetch_catalog_with_key`]); any other has none.
+    CatalogVendor::from_name(&vendor).filter(|v| v.takes_a_key())?;
     let key = format!("{vendor}:{:x}", credential_hash(api_key));
     let list = {
         let mut catalogs = shared_catalogs().lock();
@@ -1004,10 +988,7 @@ pub fn prefetch_catalogs(state: &Arc<AppState>) {
 /// every cause: an unparseable response, a key without permission to list voices, a network
 /// error. Callers that pick a voice from this list then pick the fixed default instead, and the
 /// vendor's refusal of THAT voice is the only symptom anyone sees. The key is never logged.
-fn catalog_or_empty(
-    provider: &str,
-    fetched: Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>>,
-) -> Vec<Voice> {
+fn catalog_or_empty(provider: &str, fetched: Result<Vec<Voice>, String>) -> Vec<Voice> {
     fetched.unwrap_or_else(|e| {
         tracing::warn!(provider, error = %e, "voice catalog fetch failed; treating it as empty");
         Vec::new()
@@ -1043,40 +1024,20 @@ pub(crate) async fn fetch_provider_catalog_with_key(
         return voices;
     }
 
-    // Cache miss → fetch live for the one provider.
-    let voices: Vec<Voice> = match provider_key.as_str() {
-        "elevenlabs" | "eleven_labs" => {
-            match supplied
-                .map(str::to_string)
-                .or_else(|| state.config.get_api_key("elevenlabs").ok())
-            {
-                Some(key) => catalog_or_empty("elevenlabs", fetch_elevenlabs_voices(&key).await),
+    // Cache miss → fetch live for the one provider: the caller's key where one key is all the
+    // vendor needs, else the operator's credential.
+    let voices: Vec<Voice> = match CatalogVendor::from_name(&provider_key) {
+        Some(vendor) => {
+            let credential = match supplied.filter(|_| vendor.takes_a_key()) {
+                Some(key) => Some(CatalogCredential::Key(key.to_string())),
+                None => vendor.operator_credential(state).await,
+            };
+            match credential {
+                Some(credential) => catalog_or_empty(vendor.key(), vendor.fetch(&credential).await),
                 None => Vec::new(),
             }
         }
-        "deepgram" => {
-            match supplied
-                .map(str::to_string)
-                .or_else(|| state.config.get_api_key("deepgram").ok())
-            {
-                Some(key) => catalog_or_empty("deepgram", fetch_deepgram_voices(&key).await),
-                None => Vec::new(),
-            }
-        }
-        "google" | "google-tts" => match google_voice_credentials(state).await {
-            Some(creds) => fetch_google_voices(&creds).await.unwrap_or_default(),
-            None => Vec::new(),
-        },
-        "azure" | "microsoft-azure" | "microsoft_azure" => {
-            match state.config.get_api_key("microsoft-azure") {
-                Ok(key) => {
-                    let region = state.config.get_azure_speech_region();
-                    fetch_azure_voices(&key, &region).await.unwrap_or_default()
-                }
-                Err(_) => Vec::new(),
-            }
-        }
-        _ => Vec::new(),
+        None => Vec::new(),
     };
 
     // Cache the result (even empty — short-circuits repeated misses within the TTL).
@@ -2738,7 +2699,7 @@ mod tests {
 
     #[test]
     fn a_failed_catalog_fetch_is_empty_rather_than_an_error() {
-        let failed: Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> =
+        let failed: Result<Vec<Voice>, String> =
             Err("elevenlabs /v2/voices answered 401 Unauthorized: missing voices_read".into());
         assert!(catalog_or_empty("elevenlabs", failed).is_empty());
     }

@@ -20,17 +20,32 @@ fn validate_speechify_tts_endpoint(source: &str, endpoint: &str) -> Result<(), S
 // Model Types
 // =============================================================================
 
-/// Speechify TTS models
+/// Speechify TTS models (<https://docs.speechify.ai/build/guides/concepts/models>).
+///
+/// The default is `simba-3.0`, the model Speechify itself applies when a request names none, and
+/// it is never sent: `SpeechifyStreamRequest::from_config` leaves `model` off for the default, so
+/// each workspace keeps the model its API version selects. `simba-3.5` (Speechify's
+/// recommendation, 48 languages) and `simba-3.2` are sent when a config names them. Speechify
+/// retired `simba-english` and `simba-multilingual` (Simba 1.6): a workspace created since answers
+/// `400 model_retired`, while one pinned to an older API version may still take them, so a config
+/// that names one is sent as written. `simba-turbo` and `simba-base` are absent from the current
+/// docs and are likewise only sent when asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SpeechifyModel {
-    /// Standard English model - clear and natural voice output
+    /// Simba 3.5: 48 languages under one model id, English included (set `language`).
+    Simba35,
+    /// Simba 3.2: English.
+    Simba32,
+    /// Simba 3.0: English, German, Spanish, French, Italian and Portuguese; the API's default.
     #[default]
+    Simba30,
+    /// Simba 1.6 English (retired for new workspaces).
     SimbaEnglish,
-    /// Faster processing with emotion control (English only)
+    /// Not in Speechify's current docs.
     SimbaTurbo,
-    /// Multi-language support (50+ languages)
+    /// Simba 1.6 multilingual (retired for new workspaces).
     SimbaMultilingual,
-    /// Base model (legacy)
+    /// Not in Speechify's current docs.
     SimbaBase,
 }
 
@@ -38,6 +53,9 @@ impl SpeechifyModel {
     /// Get the API model identifier
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Simba35 => "simba-3.5",
+            Self::Simba32 => "simba-3.2",
+            Self::Simba30 => "simba-3.0",
             Self::SimbaEnglish => "simba-english",
             Self::SimbaTurbo => "simba-turbo",
             Self::SimbaMultilingual => "simba-multilingual",
@@ -45,9 +63,22 @@ impl SpeechifyModel {
         }
     }
 
+    /// The `model` a request carries: none for the default, and none for `simba-english`, the
+    /// default before Simba 3 — WaaV never sent it, and sending it now would draw
+    /// `400 model_retired` from every workspace created since its retirement.
+    pub fn wire_value(&self) -> Option<&'static str> {
+        match self {
+            Self::Simba30 | Self::SimbaEnglish => None,
+            other => Some(other.as_str()),
+        }
+    }
+
     /// Check if model supports multilingual
     pub fn is_multilingual(&self) -> bool {
-        matches!(self, Self::SimbaMultilingual)
+        matches!(
+            self,
+            Self::Simba35 | Self::Simba30 | Self::SimbaMultilingual
+        )
     }
 
     /// Check if model supports emotion control
@@ -67,6 +98,9 @@ impl std::str::FromStr for SpeechifyModel {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "simba-3.5" | "simba_3.5" | "simba-3-5" => Ok(Self::Simba35),
+            "simba-3.2" | "simba_3.2" | "simba-3-2" => Ok(Self::Simba32),
+            "simba-3.0" | "simba_3.0" | "simba-3-0" | "simba-3" => Ok(Self::Simba30),
             "simba-english" | "simba_english" | "simbaenglish" | "english" => {
                 Ok(Self::SimbaEnglish)
             }
@@ -76,7 +110,7 @@ impl std::str::FromStr for SpeechifyModel {
             }
             "simba-base" | "simba_base" | "simbabase" | "base" => Ok(Self::SimbaBase),
             _ => Err(TTSError::InvalidConfiguration(format!(
-                "Unknown Speechify model: '{}'. Valid models: simba-english, simba-turbo, simba-multilingual, simba-base",
+                "Unknown Speechify model: '{}'. Valid models: simba-3.5, simba-3.2, simba-3.0 (and the retired simba-english, simba-multilingual)",
                 s
             ))),
         }
@@ -196,32 +230,72 @@ impl<'de> Deserialize<'de> for SpeechifyAudioFormat {
 // Voice Types
 // =============================================================================
 
-/// Speechify voice information
+/// One voice from `GET /v1/voices` (Speechify's `GetVoice`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeechifyVoice {
     /// Unique voice identifier
     pub id: String,
     /// Display name
-    pub name: String,
-    /// Gender (male, female, notSpecified)
+    pub display_name: String,
+    /// `male`, `female` or `not_specified`
     #[serde(default)]
     pub gender: Option<String>,
-    /// Language code (e.g., "en-US")
-    #[serde(default)]
-    pub language: Option<String>,
-    /// Locale code
+    /// The voice's own locale (BCP-47)
     #[serde(default)]
     pub locale: Option<String>,
-    /// Whether this is a custom/cloned voice
+    /// `shared` (the public catalogue) or `personal` (a workspace clone)
+    #[serde(default, rename = "type")]
+    pub voice_type: Option<String>,
+    /// Models this voice synthesizes with, and the locales each covers
     #[serde(default)]
-    pub is_cloned: bool,
+    pub models: Vec<SpeechifyVoiceModel>,
+    /// Sample audio URL
+    #[serde(default)]
+    pub preview_audio: Option<String>,
+    /// Descriptive tags
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
-/// Response from voices list endpoint
+impl SpeechifyVoice {
+    /// Whether this is a workspace clone rather than a catalogue voice.
+    pub fn is_cloned(&self) -> bool {
+        self.voice_type.as_deref() == Some("personal")
+    }
+}
+
+/// A model a voice supports (`GetVoicesModel`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeechifyVoiceModel {
+    /// Model id (`simba-3.5`, …)
+    pub name: String,
+    /// Locales the voice speaks with this model
+    #[serde(default)]
+    pub languages: Vec<SpeechifyVoiceLanguage>,
+}
+
+/// A locale a voice speaks under one model (`GetVoiceLanguage`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeechifyVoiceLanguage {
+    /// BCP-47 locale
+    pub locale: String,
+    /// Sample audio URL for this locale
+    #[serde(default)]
+    pub preview_audio: Option<String>,
+}
+
+/// One page of `GET /v1/voices`. A short page is not the end: follow `next_cursor` while
+/// `has_more` is true.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeechifyVoicesResponse {
-    /// List of available voices
+    /// Voices on this page
     pub voices: Vec<SpeechifyVoice>,
+    /// Whether more pages follow
+    #[serde(default)]
+    pub has_more: bool,
+    /// Cursor for the next page
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 // =============================================================================
@@ -264,11 +338,7 @@ impl SpeechifyStreamRequest {
         Self {
             input: text.to_string(),
             voice_id: config.voice_id.clone(),
-            model: if config.model != SpeechifyModel::default() {
-                Some(config.model.as_str().to_string())
-            } else {
-                None
-            },
+            model: config.model.wire_value().map(str::to_string),
             audio_format: if config.audio_format != SpeechifyAudioFormat::default() {
                 Some(config.audio_format.as_str().to_string())
             } else {
@@ -299,7 +369,7 @@ pub struct SpeechifyTtsConfig {
     /// API key for authentication
     pub api_key: String,
 
-    /// Voice identifier (e.g., "george", "henry", "kristy")
+    /// Voice identifier (e.g., "george", "geffen_32"); list them with `GET /v1/voices`
     pub voice_id: String,
 
     /// Model to use for synthesis
@@ -668,6 +738,9 @@ mod tests {
 
     #[test]
     fn test_model_features() {
+        assert!(SpeechifyModel::Simba35.is_multilingual());
+        assert!(!SpeechifyModel::Simba32.is_multilingual());
+        assert!(SpeechifyModel::Simba30.is_multilingual());
         assert!(!SpeechifyModel::SimbaEnglish.is_multilingual());
         assert!(!SpeechifyModel::SimbaTurbo.is_multilingual());
         assert!(SpeechifyModel::SimbaMultilingual.is_multilingual());
@@ -728,7 +801,7 @@ mod tests {
     fn test_config_defaults() {
         let config = SpeechifyTtsConfig::default();
         assert_eq!(config.voice_id, "george");
-        assert_eq!(config.model, SpeechifyModel::SimbaEnglish);
+        assert_eq!(config.model, SpeechifyModel::Simba30);
         assert_eq!(config.audio_format, SpeechifyAudioFormat::Wav48000);
         assert!(!config.loudness_normalization);
         assert!(!config.text_normalization);
@@ -909,23 +982,55 @@ mod tests {
         assert!(!json.contains("text_normalization")); // false shouldn't be serialized
     }
 
+    /// Speechify's documented `GetVoice` (the old struct read `name`, so parsing failed).
     #[test]
     fn test_voice_deserialization() {
         let json = r#"{
-            "id": "george",
-            "name": "George",
+            "display_name": "Geffen",
             "gender": "male",
-            "language": "en-US",
-            "locale": "en_US",
-            "is_cloned": false
+            "locale": "en-US",
+            "id": "geffen_32",
+            "models": [{"languages": [{"locale": "en-US", "preview_audio": null}], "name": "simba-3.5"}],
+            "type": "personal",
+            "avatar_image": null,
+            "preview_audio": "https://example/preview.mp3",
+            "tags": ["calm"]
         }"#;
 
         let voice: SpeechifyVoice = serde_json::from_str(json).unwrap();
-        assert_eq!(voice.id, "george");
-        assert_eq!(voice.name, "George");
+        assert_eq!(voice.id, "geffen_32");
+        assert_eq!(voice.display_name, "Geffen");
         assert_eq!(voice.gender, Some("male".to_string()));
-        assert_eq!(voice.language, Some("en-US".to_string()));
-        assert!(!voice.is_cloned);
+        assert_eq!(voice.locale, Some("en-US".to_string()));
+        assert_eq!(voice.models[0].name, "simba-3.5");
+        assert!(voice.is_cloned());
+    }
+
+    /// The current model ids parse; the retired ones still do, for workspaces pinned to them.
+    #[test]
+    fn current_and_retired_model_ids_parse() {
+        assert_eq!(
+            "simba-3.5".parse::<SpeechifyModel>().unwrap(),
+            SpeechifyModel::Simba35
+        );
+        assert_eq!(
+            "simba-3.2".parse::<SpeechifyModel>().unwrap(),
+            SpeechifyModel::Simba32
+        );
+        assert_eq!(
+            "simba-3.0".parse::<SpeechifyModel>().unwrap(),
+            SpeechifyModel::Simba30
+        );
+        assert_eq!(
+            "simba-english".parse::<SpeechifyModel>().unwrap().as_str(),
+            "simba-english"
+        );
+        // The default is the API's own default, so leaving it off the wire changes nothing.
+        assert_eq!(SpeechifyModel::default().as_str(), "simba-3.0");
+        // Neither the default nor the old default goes on the wire (unchanged from before 3.x).
+        assert_eq!(SpeechifyModel::default().wire_value(), None);
+        assert_eq!(SpeechifyModel::SimbaEnglish.wire_value(), None);
+        assert_eq!(SpeechifyModel::Simba35.wire_value(), Some("simba-3.5"));
     }
 
     #[test]

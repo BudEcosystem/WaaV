@@ -34,16 +34,16 @@ pub use provider::*;
 // =============================================================================
 
 /// Speechify synchronous TTS endpoint
-pub const SPEECHIFY_TTS_SYNC_URL: &str = "https://api.sws.speechify.com/v1/audio/speech";
+pub const SPEECHIFY_TTS_SYNC_URL: &str = "https://api.speechify.ai/v1/audio/speech";
 
 /// Speechify streaming TTS endpoint
-pub const SPEECHIFY_TTS_STREAM_URL: &str = "https://api.sws.speechify.com/v1/audio/stream";
+pub const SPEECHIFY_TTS_STREAM_URL: &str = "https://api.speechify.ai/v1/audio/stream";
 
 /// Speechify voices list endpoint
-pub const SPEECHIFY_VOICES_URL: &str = "https://api.sws.speechify.com/v1/voices";
+pub const SPEECHIFY_VOICES_URL: &str = "https://api.speechify.ai/v1/voices";
 
 /// Speechify auth token endpoint
-pub const SPEECHIFY_AUTH_URL: &str = "https://api.sws.speechify.com/v1/auth/token";
+pub const SPEECHIFY_AUTH_URL: &str = "https://api.speechify.ai/v1/auth/token";
 
 /// Maximum text length per request (characters)
 pub const MAX_TEXT_LENGTH: usize = 20000;

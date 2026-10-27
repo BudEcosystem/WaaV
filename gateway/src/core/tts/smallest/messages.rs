@@ -314,6 +314,10 @@ pub struct SmallestVoice {
     /// Voice tags/metadata.
     #[serde(default)]
     pub tags: SmallestVoiceTags,
+
+    /// Sample audio URL.
+    #[serde(default, rename = "audioPreview")]
+    pub audio_preview: Option<String>,
 }
 
 /// Voice metadata tags.
@@ -330,6 +334,18 @@ pub struct SmallestVoiceTags {
     /// Voice gender.
     #[serde(default)]
     pub gender: Option<String>,
+
+    /// Age band (`young`, `middle aged`, …).
+    #[serde(default)]
+    pub age: Option<String>,
+
+    /// What the voice suits ("Narration", "Insurance agent", …).
+    #[serde(default)]
+    pub usecases: Vec<String>,
+
+    /// Descriptive words ("Friendly", "Bold", …).
+    #[serde(default)]
+    pub emotions: Vec<String>,
 }
 
 /// Response from Get Voices API.

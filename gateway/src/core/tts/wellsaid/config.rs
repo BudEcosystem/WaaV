@@ -75,39 +75,46 @@ impl fmt::Display for WellSaidModel {
 // Voice Avatar
 // =============================================================================
 
-/// WellSaid voice avatar information
+/// One voice ("avatar") from `GET /v1/tts/avatars`, which answers `{"avatars": [...]}`.
+///
+/// `id` is unique per voice AND style (Wade C. conversational is 46, narration 30) and is the
+/// `speaker_id` a synthesis request takes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WellSaidAvatar {
-    /// Unique avatar identifier (e.g., "alana-b")
-    pub avatar_id: String,
-    /// Numeric speaker ID for TTS requests
+    /// Speaker id for TTS requests
+    #[serde(rename = "id")]
     pub speaker_id: u32,
     /// Display name (e.g., "Alana B.")
     pub name: String,
-    /// Gender (Male, Female)
+    /// `female` / `male`
     #[serde(default)]
     pub gender: Option<String>,
-    /// Accent/language (e.g., "US English", "British English")
+    /// Accent, e.g. "United States"
     #[serde(default)]
-    pub accent: Option<String>,
+    pub accent_type: Option<String>,
     /// Speaking style (Narration, Promo, Conversational)
     #[serde(default)]
     pub style: Option<String>,
-    /// Supported models for this avatar
+    /// Locale, e.g. `en_US`
     #[serde(default)]
-    pub models: Vec<String>,
+    pub locale: Option<String>,
+    /// Language, e.g. "English"
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Descriptive words ("Clear", "Crisp", …)
+    #[serde(default)]
+    pub characteristics: Vec<String>,
+    /// Sample audio URL
+    #[serde(default)]
+    pub preview_audio: Option<String>,
 }
 
-impl WellSaidAvatar {
-    /// Check if this avatar supports the Caruso model
-    pub fn supports_caruso(&self) -> bool {
-        self.models.iter().any(|m| m.to_lowercase() == "caruso")
-    }
-
-    /// Check if this avatar supports the Legacy model
-    pub fn supports_legacy(&self) -> bool {
-        self.models.iter().any(|m| m.to_lowercase() == "legacy")
-    }
+/// `GET /v1/tts/avatars`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WellSaidAvatarsResponse {
+    /// Every avatar the key can use
+    #[serde(default)]
+    pub avatars: Vec<WellSaidAvatar>,
 }
 
 // =============================================================================
@@ -663,32 +670,24 @@ mod tests {
         assert_eq!(request.model, Some("caruso".to_string()));
     }
 
+    /// The documented response: wrapped in `avatars`, the speaker id under `id`. Parsed as a
+    /// bare array with `avatar_id`/`speaker_id`, which no response carries, it used to fail.
     #[test]
-    fn test_avatar_caruso_support() {
-        let avatar = WellSaidAvatar {
-            avatar_id: "alana-b".to_string(),
-            speaker_id: 3,
-            name: "Alana B.".to_string(),
-            gender: Some("Female".to_string()),
-            accent: Some("US English".to_string()),
-            style: Some("Narration".to_string()),
-            models: vec!["caruso".to_string(), "legacy".to_string()],
-        };
-
-        assert!(avatar.supports_caruso());
-        assert!(avatar.supports_legacy());
-
-        let legacy_only = WellSaidAvatar {
-            avatar_id: "test".to_string(),
-            speaker_id: 100,
-            name: "Test".to_string(),
-            gender: None,
-            accent: None,
-            style: None,
-            models: vec!["legacy".to_string()],
-        };
-
-        assert!(!legacy_only.supports_caruso());
-        assert!(legacy_only.supports_legacy());
+    fn the_documented_avatars_response_parses() {
+        let json = r#"{"avatars": [{
+            "name": "Alana B.", "id": 3, "style": "Narration", "gender": "female",
+            "accent_type": "United States",
+            "characteristics": ["Clear", "Crisp", "Focused", "Informative", "Strong"],
+            "otherTags": [], "preview_audio": "https://media.graphassets.com/Ogq9S0cXRsOyUkYRjxWe",
+            "locale": "en_US", "language": "English", "language_variant": "United States",
+            "source": null
+        }]}"#;
+        let avatars = serde_json::from_str::<WellSaidAvatarsResponse>(json)
+            .unwrap()
+            .avatars;
+        assert_eq!(avatars[0].speaker_id, 3);
+        assert_eq!(avatars[0].name, "Alana B.");
+        assert_eq!(avatars[0].accent_type.as_deref(), Some("United States"));
+        assert_eq!(avatars[0].characteristics.len(), 5);
     }
 }

@@ -8,7 +8,9 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use tracing::{debug, info};
 
 use super::WELLSAID_AVATARS_URL;
-use super::config::{WellSaidAvatar, WellSaidStreamRequest, WellSaidTtsConfig};
+use super::config::{
+    WellSaidAvatar, WellSaidAvatarsResponse, WellSaidStreamRequest, WellSaidTtsConfig,
+};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 
@@ -172,11 +174,11 @@ impl WellSaidTts {
             )));
         }
 
-        let avatars: Vec<WellSaidAvatar> = response.json().await.map_err(|e| {
+        let avatars: WellSaidAvatarsResponse = response.json().await.map_err(|e| {
             TTSError::InternalError(format!("Failed to parse avatars response: {}", e))
         })?;
 
-        Ok(avatars)
+        Ok(avatars.avatars)
     }
 
     /// Get the WellSaid-specific configuration

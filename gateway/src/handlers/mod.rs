@@ -32,6 +32,7 @@ pub mod stt_capability;
 pub mod tasks;
 pub mod transcribe;
 pub mod voice_catalog;
+pub(crate) mod voice_vendors;
 pub mod voices;
 pub mod ws;
 
