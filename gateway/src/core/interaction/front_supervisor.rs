@@ -553,12 +553,14 @@ mod tests {
                 .spawn()
                 .expect("sleep runs")
         };
-        // A gateway that is gone: a finished process's pid.
-        let mut gone = std::process::Command::new("true")
-            .spawn()
-            .expect("true runs");
-        let gone_pid = gone.id();
-        gone.wait().expect("ended");
+        // A gateway that is gone: `pid_max` itself, which no process or thread ever gets (a
+        // finished process's pid can be handed to one of the test harness's threads at once).
+        let gone_pid: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .expect("pid_max")
+            .trim()
+            .parse()
+            .expect("a number");
+        assert!(!alive(gone_pid as i32));
         let mut stale = spawn_sleep();
         let mut kept = spawn_sleep();
         let sleep_program = program_of(stale.id() as i32).expect("sleep's command line");
