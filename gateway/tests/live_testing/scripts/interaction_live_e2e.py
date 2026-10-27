@@ -521,6 +521,13 @@ class Stack:
             "AUTH_REQUIRED": "true", "WAAV_REDIS_URL": f"redis://127.0.0.1:{args.bud_redis_port}",
             "WAAV_RSA_PRIVATE_KEY_PATH": str(key), "WAAV_LLM_BASE_URL": bud.url,
             "WAAV_INTERACTION_ENABLED": "1", "WAAV_INTERACTION_AGENT_DEFAULT": "true",
+            # The agents' recogniser (`ep-stt`) is the local Whisper, a model that transcribes
+            # uploaded files. Since release 1.0.0 a voice agent with automatic turn detection on
+            # such a model is refused (`stt_live_unsupported`) unless the operator covers the
+            # deployment with segmented speech-to-text or withdraws the refusal; these scenarios
+            # test interaction mode over today's buffering client (the gateway ends each turn and
+            # flushes it), so the operator's withdrawal switch keeps that path, with its warning.
+            "WAAV_STT_FILE_ONLY_REFUSAL": "off",
             # Every turn is the front model's (chapter 9): without it the mode is refused.
             "WAAV_INTERACTION_FRONT_URL": f"http://127.0.0.1:{args.front_port}",
             # RG3: interaction mode on the relay, over the background model and a booking tool.
@@ -3624,6 +3631,16 @@ CLIP_TRIES = 8
 MODEL_FRONT = {"front": {"profile": "model"}}
 # The background answers general questions here; one short sentence keeps the runs comparable.
 PLAIN_PROMPT = "You answer a caller's question in one short sentence."
+# Segmented speech-to-text's contract (release 1.0.0): a session on a model that transcribes
+# uploaded files (the local Whisper of `--stt request`) is told so before `ready` with this
+# config_warning, mode or no mode. It is about the recogniser, not interaction mode, so the
+# checks that a session runs the mode "with no warnings" leave it out.
+STT_MODEL_NOTICES = frozenset({"stt_buffered_until_commit"})
+
+
+def mode_warnings(warnings: List[dict]) -> List[dict]:
+    """The `config_warning`s before `ready` other than the recogniser's own notices."""
+    return [w for w in warnings if w.get("code") not in STT_MODEL_NOTICES]
 QUESTIONS = ["20_q_capital", "21_q_week", "22_q_sky", "23_q_planet", "24_q_ocean"]
 # Five things a caller asks a help line to do (the model front's delegate turns).
 REQUESTS = ["01_flight_request", "02_bag_question", "30_seat", "31_hotel", "32_invoice"]
@@ -4790,7 +4807,7 @@ async def c1(ctx: Ctx):
     raw_result = [e for _, e in raw.all("task_result", turn.first_event)]
     await raw.close()
     checks["a session with only interaction.tasks.llm answers"] = (
-        "interaction" in raw.ready and not raw.warnings and bool(relays)
+        "interaction" in raw.ready and not mode_warnings(raw.warnings) and bool(relays)
         and [e.get("state") for e in raw_result] == ["completed"] and "blue" in " ".join(relays).lower())
 
     failed = [name for name, ok in checks.items() if not ok]
@@ -5706,7 +5723,7 @@ async def g1(ctx: Ctx):
     for text in SPANISH[:3]:
         start = await typed(raw, text, reply=15.0)
         raw_lines.append([e["delta"] for _, e in raw.transcripts(start) if e.get("delta")])
-    raw_warned = [e.get("code") for _, e in raw.all("config_warning")]
+    raw_warned = [e.get("code") for _, e in raw.all("config_warning") if e.get("code") not in STT_MODEL_NOTICES]
     raw_tasks = len(raw.all("task_created"))
     await raw.close()
     checks = {
@@ -5785,7 +5802,7 @@ async def b1(ctx: Ctx):
     body = runs[0]["body"] if runs else {}
     checks["the session runs the mode on the agent"] = (
         session.ready.get("protocol_version") == "1.1" and backend.get("backend") == "agent:support"
-        and backend.get("speculative_start") == "off" and not session.warnings)
+        and backend.get("speculative_start") == "off" and not mode_warnings(session.warnings))
     checks["the greeting is heard"] = greeting_heard
     checks["one run of the agent, as the caller"] = (
         len(runs) == 1 and runs[0]["auth"] == f"Bearer {BUD_KEY}" and body.get("bud_channel") == "voice"
@@ -6258,7 +6275,7 @@ async def dg1(ctx: Ctx):
     follow_result = session.all("task_result", again)
     checks["the session runs the mode on its DAG"] = (
         session.ready.get("protocol_version") == "1.1" and backend.get("backend") == "dag"
-        and backend.get("speculative_start") == "off" and not session.warnings)
+        and backend.get("speculative_start") == "off" and not mode_warnings(session.warnings))
     checks["a task by the DAG, not speculative, completed"] = (
         len(created) == 1 and created[0].get("background") == "dag"
         and created[0].get("speculative") is False
