@@ -281,7 +281,10 @@ async fn test_real_openai_realtime_connection() {
     use tokio::time::{Duration, timeout};
     use waav_gateway::core::realtime::{TranscriptCallback, TranscriptResult};
 
-    let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("OPENAI_API_KEY not set");
 
     let config = RealtimeConfig {
         api_key,
@@ -339,7 +342,10 @@ async fn test_real_openai_realtime_audio_streaming() {
     use tokio::time::{Duration, timeout};
     use waav_gateway::core::realtime::{AudioOutputCallback, RealtimeAudioData};
 
-    let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("OPENAI_API_KEY not set");
 
     let config = RealtimeConfig {
         api_key,

@@ -273,7 +273,10 @@ fn test_audio_format_sample_rate_getter() {
 #[tokio::test]
 #[ignore = "Requires ELEVENLABS_API_KEY environment variable"]
 async fn test_real_connection() {
-    let api_key = std::env::var("ELEVENLABS_API_KEY").expect("ELEVENLABS_API_KEY not set");
+    let api_key = std::env::var("ELEVENLABS_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("ELEVENLABS_API_KEY not set");
 
     let config = STTConfig {
         api_key,
@@ -329,7 +332,10 @@ async fn test_real_connection() {
 async fn test_transcription_with_audio() {
     use tokio::time::{Duration, sleep};
 
-    let api_key = std::env::var("ELEVENLABS_API_KEY").expect("ELEVENLABS_API_KEY not set");
+    let api_key = std::env::var("ELEVENLABS_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("ELEVENLABS_API_KEY not set");
 
     let config = STTConfig {
         api_key,
