@@ -3641,6 +3641,8 @@ STT_MODEL_NOTICES = frozenset({"stt_buffered_until_commit"})
 def mode_warnings(warnings: List[dict]) -> List[dict]:
     """The `config_warning`s before `ready` other than the recogniser's own notices."""
     return [w for w in warnings if w.get("code") not in STT_MODEL_NOTICES]
+
+
 QUESTIONS = ["20_q_capital", "21_q_week", "22_q_sky", "23_q_planet", "24_q_ocean"]
 # Five things a caller asks a help line to do (the model front's delegate turns).
 REQUESTS = ["01_flight_request", "02_bag_question", "30_seat", "31_hotel", "32_invoice"]
