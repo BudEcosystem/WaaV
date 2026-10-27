@@ -148,16 +148,24 @@ pub async fn prepare(
     })
 }
 
+/// A standalone handshake's caller and the server alias its `?model` names.
+pub struct StandaloneAlias {
+    /// The `?model` the client connected with.
+    pub name: String,
+    pub def: crate::core::alias::AliasDefinition,
+    pub auth: crate::auth::Auth,
+}
+
 /// A standalone gateway (no Bud control plane): authenticate the handshake's key with the
 /// gateway's own authenticators and resolve `?model` to a server alias marked
-/// `openai_compatible: true` whose legs make a voice pipeline (speech-to-text, an LLM,
-/// text-to-speech).
-pub async fn prepare_alias(
+/// `openai_compatible: true`. Shared by both standalone engines: the cascade below, and the
+/// vendor relay of an alias's `realtime` block (`alias_relay`).
+pub async fn resolve_alias(
     state: &AppState,
     query: Option<&str>,
     headers: &HeaderMap,
     path: &str,
-) -> Result<PreparedCascade, HandshakeError> {
+) -> Result<StandaloneAlias, HandshakeError> {
     let model = handshake::parse_model(query, headers)?;
     let auth = match handshake::extract_credential(headers)? {
         Some(credential) => crate::auth::standalone::authenticate_bearer(
@@ -185,6 +193,21 @@ pub async fn prepare_alias(
             )
             .param("model")
         })?;
+    Ok(StandaloneAlias {
+        name: model,
+        def,
+        auth,
+    })
+}
+
+/// A standalone alias run by the conversation loop: its legs must make a voice pipeline
+/// (speech-to-text, an LLM, text-to-speech).
+pub fn prepare_alias(alias: StandaloneAlias) -> Result<PreparedCascade, HandshakeError> {
+    let StandaloneAlias {
+        name: model,
+        def,
+        auth,
+    } = alias;
     let missing: Vec<&str> = [
         ("stt", def.stt.is_none()),
         ("llm", def.llm.is_none()),
@@ -199,8 +222,7 @@ pub async fn prepare_alias(
             "alias_not_realtime",
             format!(
                 "Alias '{model}' has no {} leg: a realtime session needs speech-to-text, an LLM and \
-                 text-to-speech. (Relaying an alias to a vendor's own realtime API is not supported \
-                 without the Bud control plane.)",
+                 text-to-speech, or a `realtime` block naming a vendor's own realtime API.",
                 missing.join(", ")
             ),
         )

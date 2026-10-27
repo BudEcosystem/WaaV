@@ -471,3 +471,139 @@ fn an_alias_leg_key_is_the_clients_then_the_aliases_then_an_approved_operator_ke
     .unwrap_err();
     assert!(e.contains("nobody"), "{e}");
 }
+
+// ── A vendor's own realtime API (the `realtime` block, standalone `/v1/realtime`) ────────────
+
+#[test]
+fn a_realtime_block_parses_and_refuses_unknown_keys() {
+    let def = parse_def(
+        r#"
+openai_compatible: true
+realtime:
+  provider: openai
+  model: gpt-realtime
+  base_url: "https://api.openai.com/v1"
+  credential_ref: OPENAI_API_KEY
+  voice: marin
+  instructions: Be brief.
+"#,
+    );
+    let leg = def.realtime.as_ref().unwrap();
+    assert_eq!(leg.provider.as_deref(), Some("openai"));
+    assert_eq!(leg.model.as_deref(), Some("gpt-realtime"));
+    assert_eq!(leg.base_url.as_deref(), Some("https://api.openai.com/v1"));
+    assert_eq!(leg.credential_ref.as_deref(), Some("OPENAI_API_KEY"));
+    assert_eq!(leg.voice.as_deref(), Some("marin"));
+    assert_eq!(leg.instructions.as_deref(), Some("Be brief."));
+
+    let typo: Result<AliasDefinition, _> =
+        serde_yaml::from_str("realtime: { provider: openai, model_name: gpt-realtime }\n");
+    assert!(
+        typo.is_err(),
+        "an unknown realtime field (model_name for model) must be rejected"
+    );
+}
+
+#[test]
+fn startup_accepts_a_realtime_block_it_can_relay() {
+    // The vendor's own host with the gateway's key, alone or beside legs that serve /v1/audio/*.
+    let fine = config_of(&[
+        (
+            "rt-only",
+            "openai_compatible: true\nrealtime: { provider: openai, model: gpt-realtime }\n",
+        ),
+        (
+            "rt-and-legs",
+            r#"
+openai_compatible: true
+realtime: { provider: grok, model: grok-voice }
+stt: { provider: openai, model: whisper-1 }
+tts: { provider: openai, model: tts-1, voice: alloy }
+"#,
+        ),
+        (
+            // A vendor the GA facade translates.
+            "rt-translated",
+            "openai_compatible: true\nrealtime: { provider: gemini, model: gemini-2.5-flash-native-audio }\n",
+        ),
+        (
+            // A credential bound to the base's host (OPENAI_API_KEY's implicit binding).
+            "rt-bound",
+            r#"
+openai_compatible: true
+realtime: { provider: openai, model: gpt-realtime, base_url: "https://api.openai.com/v1", credential_ref: OPENAI_API_KEY }
+"#,
+        ),
+    ]);
+    assert_eq!(validate_aliases(&fine), Ok(()));
+}
+
+#[test]
+fn startup_refuses_a_realtime_block_it_cannot_relay() {
+    let refused = |yaml: &str| validate_aliases(&config_of(&[("rt", yaml)])).unwrap_err();
+
+    let e = refused("openai_compatible: true\nrealtime: { provider: acme, model: m }\n");
+    assert!(
+        e.contains("not a realtime vendor") && e.contains("openai"),
+        "{e}"
+    );
+    let e = refused("openai_compatible: true\nrealtime: { provider: nova_sonic, model: m }\n");
+    assert!(e.contains("AWS key pair"), "{e}");
+    let e = refused("openai_compatible: true\nrealtime: { model: m }\n");
+    assert!(e.contains("realtime.provider is required"), "{e}");
+    let e = refused("openai_compatible: true\nrealtime: { provider: openai }\n");
+    assert!(e.contains("realtime.model is required"), "{e}");
+
+    // Reachable only through /v1/realtime, which needs the mark.
+    let e = refused("realtime: { provider: openai, model: m }\n");
+    assert!(e.contains("openai_compatible"), "{e}");
+
+    // A base_url the egress rules refuse: private, or not a URL the relay can dial.
+    let e = refused(
+        "openai_compatible: true\nrealtime: { provider: openai, model: m, base_url: \"http://10.0.0.5:8000/v1\" }\n",
+    );
+    assert!(e.contains("WAAV_PRIVATE_EGRESS_ALLOWLIST"), "{e}");
+    let e = refused(
+        "openai_compatible: true\nrealtime: { provider: openai, model: m, base_url: \"ftp://api.openai.com/v1\" }\n",
+    );
+    assert!(e.contains("realtime.base_url"), "{e}");
+
+    // A credential is bound to its hosts: one bound elsewhere, or one nobody declared, stops the
+    // server rather than failing every session.
+    let e = refused(
+        r#"
+openai_compatible: true
+realtime: { provider: openai, model: m, base_url: "https://proxy.example.com/v1", credential_ref: OPENAI_API_KEY }
+"#,
+    );
+    assert!(
+        e.contains("may not be sent to 'proxy.example.com:443'"),
+        "{e}"
+    );
+    let e = refused(
+        r#"
+openai_compatible: true
+realtime: { provider: openai, model: m, base_url: "https://api.openai.com/v1", credential_ref: nobody }
+"#,
+    );
+    assert!(e.contains("'nobody' is not defined"), "{e}");
+    let e = refused(
+        "openai_compatible: true\nrealtime: { provider: openai, model: m, credential_ref: OPENAI_API_KEY }\n",
+    );
+    assert!(e.contains("needs realtime.base_url"), "{e}");
+
+    // A base_url without a credential_ref gets the gateway's key only where the operator
+    // approved the host for it.
+    let e = refused(
+        "openai_compatible: true\nrealtime: { provider: openai, model: m, base_url: \"https://proxy.example.com/v1\" }\n",
+    );
+    assert!(
+        e.contains("not approved for the gateway's openai key"),
+        "{e}"
+    );
+
+    // The vendor request is built at startup, as each session builds it: Azure needs its
+    // resource endpoint.
+    let e = refused("openai_compatible: true\nrealtime: { provider: azure_openai, model: rt }\n");
+    assert!(e.contains("api_base"), "{e}");
+}

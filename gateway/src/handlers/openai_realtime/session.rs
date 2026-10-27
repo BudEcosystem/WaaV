@@ -126,8 +126,22 @@ impl RealtimeRuntime {
 /// How a caller is re-checked during the session (D-17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallerCheck {
-    ApiKey { hashed: String, client_key: bool },
-    Jwt { sub: String },
+    ApiKey {
+        hashed: String,
+        client_key: bool,
+    },
+    Jwt {
+        sub: String,
+    },
+    /// A standalone gateway's caller (no Bud control plane), relayed to a server alias's
+    /// `realtime` vendor ([`super::alias_relay`]). It was authenticated at the upgrade by the
+    /// gateway's own authenticators, whose API secrets are static for the process lifetime, so
+    /// revalidation re-checks that the alias still relays (`alias_relay::still_served`), not the
+    /// key. Every Bud-only path refuses it: it reaches no deployment, mints no client secret and
+    /// is never a Bud `/ws` caller.
+    Standalone {
+        alias: String,
+    },
 }
 
 /// An authenticated caller.
@@ -140,11 +154,16 @@ pub struct Caller {
 }
 
 /// Does the caller still reach the endpoint, and is it still a realtime deployment?
+///
+/// A standalone caller is answered without a plane: the alias it connected to must still relay.
 pub async fn still_allowed(
     state: &AppState,
     check: &CallerCheck,
     endpoint_id: &str,
 ) -> Option<AliasMetadata> {
+    if let CallerCheck::Standalone { alias } = check {
+        return super::alias_relay::still_served(state, alias);
+    }
     let plane = state.bud_mode.as_ref()?.plane();
     let serving = plane
         .voice_endpoint(endpoint_id)
@@ -157,6 +176,8 @@ pub async fn still_allowed(
             plane.hash_reaches(hashed, endpoint_id, *client_key)
         }
         CallerCheck::Jwt { sub } => plane.subject_reaches(sub, endpoint_id).await,
+        // Answered above; a standalone caller never reaches a Bud deployment.
+        CallerCheck::Standalone { .. } => None,
     }
 }
 
@@ -439,6 +460,25 @@ pub async fn prepare(
         .voice_endpoint(&endpoint_id)
         .filter(|e| e.serves(REALTIME_CAPABILITY))
         .ok_or_else(|| not_found(&hs.model))?;
+    engage(state, caller, endpoint_id, hs.model, endpoint, alias).await
+}
+
+/// From a resolved vendor leg to a session: build the vendor request (relayed or translated),
+/// check the vendor's breaker, and take the deployment's slot (FRD §5.3 steps 4-5).
+///
+/// Shared by the Bud path ([`prepare`]) and a standalone alias's `realtime` block
+/// ([`super::alias_relay::prepare`]), which describes its vendor as the same [`VoiceEndpoint`].
+/// The breakers and the admission are the Bud deployments' (FRD-022): they exist only with the
+/// control plane (`state.policies`), so on a standalone gateway both are skipped here —
+/// `admit_deployment` admits with no slot — and the connection limit is what bounds sessions.
+pub(super) async fn engage(
+    state: &AppState,
+    caller: Caller,
+    endpoint_id: String,
+    endpoint_name: String,
+    endpoint: VoiceEndpoint,
+    alias: Option<AliasMetadata>,
+) -> Result<Prepared, HandshakeError> {
     let settings = endpoint.config.realtime.clone();
     let transcription = settings
         .as_ref()
@@ -493,7 +533,7 @@ pub async fn prepare(
     Ok(Prepared {
         rules: ClientRules::from_settings(settings.as_ref()),
         caller,
-        endpoint_name: hs.model,
+        endpoint_name,
         endpoint_id,
         endpoint,
         alias,
@@ -513,40 +553,23 @@ pub async fn realtime_ws_handler(
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     // The Cascade engine: a Bud voice agent (`?model=prompt:<agent>`, spec 025) or, on a gateway
-    // without the Bud control plane, a server alias run by the conversation loop.
-    let cascade = if state.bud_mode.is_none() {
-        Some(super::cascade::prepare_alias(&state, uri.query(), &headers, uri.path()).await)
+    // without the Bud control plane, a server alias run by the conversation loop. A standalone
+    // alias with a `realtime` block is relayed (or translated) to its vendor instead, like a Bud
+    // `realtime_session` deployment.
+    let prepared = if state.bud_mode.is_none() {
+        super::alias_relay::prepare_standalone(&state, uri.query(), &headers, uri.path()).await
     } else if handshake::parse(uri.query(), &headers)
         .is_ok_and(|hs| super::cascade::is_agent_model(&hs.model))
     {
-        Some(super::cascade::prepare(&state, uri.query(), &headers).await)
+        super::cascade::prepare(&state, uri.query(), &headers)
+            .await
+            .map(|p| Session::Cascade(Box::new(p)))
     } else {
-        None
+        prepare(&state, uri.query(), &headers)
+            .await
+            .map(|p| Session::Vendor(Box::new(p)))
     };
-    if let Some(prepared) = cascade {
-        let prepared = match prepared {
-            Ok(p) => p,
-            Err(e) => {
-                metrics::counter!("waav_realtime_refusals_total", "code" => e.code).increment(1);
-                return e.into_response();
-            }
-        };
-        let Ok(ws) = ws else {
-            return HandshakeError::new(
-                StatusCode::BAD_REQUEST,
-                "websocket_required",
-                "/v1/realtime is a WebSocket endpoint; send an Upgrade request.",
-            )
-            .into_response();
-        };
-        let slot = slot.map(|Extension(s)| s);
-        return ws
-            .protocols([SUBPROTOCOL])
-            .max_message_size(MAX_MESSAGE_BYTES)
-            .max_frame_size(MAX_MESSAGE_BYTES)
-            .on_upgrade(move |socket| super::cascade::run(state, prepared, socket, slot));
-    }
-    let prepared = match prepare(&state, uri.query(), &headers).await {
+    let prepared = match prepared {
         Ok(p) => p,
         Err(e) => {
             metrics::counter!("waav_realtime_refusals_total", "code" => e.code).increment(1);
@@ -566,11 +589,26 @@ pub async fn realtime_ws_handler(
         .max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
-            match prepared.engine {
-                Engine::Relay(_) => run(state, prepared, socket, slot).await,
-                Engine::Translate(_) => super::facade::run(state, prepared, socket, slot).await,
+            match prepared {
+                Session::Cascade(p) => super::cascade::run(state, *p, socket, slot).await,
+                Session::Vendor(p) => {
+                    let p = *p;
+                    match p.engine {
+                        Engine::Relay(_) => run(state, p, socket, slot).await,
+                        Engine::Translate(_) => super::facade::run(state, p, socket, slot).await,
+                    }
+                }
             }
         })
+}
+
+/// What one `/v1/realtime` upgrade runs, decided before it.
+pub enum Session {
+    /// The conversation loop: a Bud voice agent, or a standalone alias's stt/llm/tts legs.
+    Cascade(Box<super::cascade::PreparedCascade>),
+    /// A vendor's own realtime API, relayed or translated: a Bud `realtime_session` deployment,
+    /// or a standalone alias's `realtime` block. Both boxed: the two differ in size by kilobytes.
+    Vendor(Box<Prepared>),
 }
 
 /// How a session ended.

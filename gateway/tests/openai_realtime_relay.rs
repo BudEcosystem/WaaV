@@ -1,6 +1,7 @@
 //! FRD-023 `/v1/realtime` end to end, in process: a Bud-mode gateway over an in-memory control
 //! plane, a mock OpenAI-GA vendor, and real WebSocket clients (TC-HS, TC-UP, TC-EVT, TC-LIFE,
-//! TC-MET, TC-EK, TC-SEC-07).
+//! TC-MET, TC-EK, TC-SEC-07). The last section runs the same relay on a standalone gateway (no
+//! control plane), from a server alias's `realtime` block.
 //!
 //! Each test uses its own deployment names and ids, so tests run in parallel against their own
 //! gateway and vendor; spans are captured per test on the test's own (current-thread) runtime.
@@ -740,14 +741,25 @@ enum Auth<'a> {
     None,
 }
 
+/// Where a gateway under test listens: a Bud-mode [`Gateway`] or a [`StandaloneGateway`].
+trait Listening {
+    fn addr(&self) -> SocketAddr;
+}
+
+impl Listening for Gateway {
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
 async fn connect_with(
-    gw: &Gateway,
+    gw: &impl Listening,
     query: &str,
     auth: Auth<'_>,
     extra_headers: &[(&str, &str)],
     extra_protocols: &[&str],
 ) -> Result<Connected, (u16, Json, HashMap<String, String>)> {
-    let mut req = format!("ws://{}/v1/realtime?{query}", gw.addr)
+    let mut req = format!("ws://{}/v1/realtime?{query}", gw.addr())
         .into_client_request()
         .unwrap();
     let mut protocols: Vec<String> = Vec::new();
@@ -2289,4 +2301,299 @@ async fn client_secrets_unconfigured_is_501() {
     let (s, body) = mint(&gw, KEY, json!({"session": {"model": "rt"}})).await;
     assert_eq!(s, 501);
     assert_eq!(body["error"]["code"], "client_secrets_not_configured");
+}
+
+// =============================================================================================
+// A standalone gateway (no Bud control plane): a server alias's `realtime` block, relayed to its
+// vendor the way a Bud `realtime_session` deployment is
+// =============================================================================================
+
+/// The standalone gateway's API secret (what a client connects with).
+const STANDALONE_SECRET: &str = "standalone-realtime-relay-secret";
+/// The gateway's own OpenAI key in the standalone tests (`OPENAI_API_KEY`).
+const STANDALONE_OPERATOR_KEY: &str = "sk-test-standalone-operator-key";
+/// The value of the operator credential `rt-alias` (WAAV_CREDENTIALS_JSON), bound to 127.0.0.1.
+const CREDENTIAL_REF_KEY: &str = "sk-test-alias-credential-ref-key";
+
+struct StandaloneGateway {
+    addr: SocketAddr,
+}
+
+impl Listening for StandaloneGateway {
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+/// The operator credential `rt-alias`, declared once per test binary (the registry is
+/// process-wide), for the loopback mock vendors on any port. `clients: false`: an alias may name
+/// it, a client may not.
+fn standalone_credentials() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        unsafe {
+            std::env::set_var("WAAV_TEST_RT_ALIAS_KEY", CREDENTIAL_REF_KEY);
+            std::env::set_var(
+                "WAAV_CREDENTIALS_JSON",
+                json!({"rt-alias": {"env": "WAAV_TEST_RT_ALIAS_KEY", "hosts": ["127.0.0.1"], "clients": false}})
+                    .to_string(),
+            );
+        }
+        waav_gateway::core::credentials::initialize_credentials().unwrap();
+    });
+}
+
+/// Register `aliases` the way `main` does: validated (the startup checks), then registered.
+fn register_aliases(aliases: &[(&str, Json)]) {
+    let config = waav_gateway::core::alias::AliasConfig {
+        aliases: aliases
+            .iter()
+            .map(|(name, def)| {
+                (
+                    name.to_string(),
+                    serde_json::from_value(def.clone()).expect("alias parses"),
+                )
+            })
+            .collect(),
+    };
+    waav_gateway::core::alias::validate_aliases(&config).expect("the startup checks pass");
+    waav_gateway::core::alias::initialize_aliases(&config);
+}
+
+/// A gateway without the Bud control plane, with API-secret authentication on.
+async fn standalone_gateway() -> StandaloneGateway {
+    allow_loopback();
+    standalone_credentials();
+    let mut cfg = config();
+    cfg.openai_api_key = Some(STANDALONE_OPERATOR_KEY.to_string());
+    cfg.auth_required = true;
+    cfg.auth_api_secrets = vec![waav_gateway::config::AuthApiSecret {
+        id: "standalone-client".to_string(),
+        secret: STANDALONE_SECRET.to_string(),
+    }];
+    let mut state = AppState::new(cfg).await;
+    {
+        let s = Arc::get_mut(&mut state).expect("unshared");
+        assert!(s.bud_mode.is_none() && s.policies.is_none(), "standalone");
+        s.realtime = Arc::new(RealtimeRuntime {
+            timings: fast_timings(),
+            client_secret_keys: None,
+            bedrock_http_client: None,
+        });
+    }
+    let app = waav_gateway::routes::openai_realtime::create_openai_realtime_router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            waav_gateway::middleware::connection_limit_middleware,
+        ))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    StandaloneGateway { addr }
+}
+
+async fn standalone_connect(gw: &StandaloneGateway, alias: &str) -> Client {
+    connect_with(
+        gw,
+        &format!("model={alias}"),
+        Auth::Bearer(STANDALONE_SECRET),
+        &[],
+        &[],
+    )
+    .await
+    .unwrap_or_else(|(s, b, _)| panic!("connect refused {s}: {b}"))
+    .ws
+}
+
+/// One response, both ways: the client's frames reach the vendor as sent, and the vendor's
+/// response reaches the client.
+async fn standalone_round_trip(ws: &mut Client, vendor: &MockVendor, n: usize) {
+    send(
+        ws,
+        json!({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}]}}),
+    )
+    .await;
+    send(ws, json!({"type": "response.create"})).await;
+    let delta = until_type(ws, "response.output_audio.delta").await;
+    assert_eq!(delta["response_id"], format!("resp_{n}"));
+    let done = until_type(ws, "response.done").await;
+    assert_eq!(done["response"]["status"], "completed");
+    assert_eq!(vendor.frames_of("response.create").len(), n);
+    let items = vendor.frames_of("conversation.item.create");
+    assert_eq!(
+        items.last().unwrap()["item"]["content"][0]["text"],
+        "hello",
+        "client frames reach the vendor as sent"
+    );
+}
+
+/// A standalone alias with a `realtime` block and no `credential_ref`: the session is relayed to
+/// the vendor, with the vendor model and the alias's defaults, and the gateway's own OpenAI key
+/// goes to the vendor's host — approved for it here by the loopback escape hatch the mock needs
+/// (`WAAV_ALLOW_LOOPBACK_ENDPOINTS`); a public host would need a declaration. Revalidation keeps
+/// the session open while the alias still relays.
+#[tokio::test]
+async fn a_standalone_alias_relays_to_its_realtime_vendor_with_the_gateways_key() {
+    let vendor = MockVendor::start(Behaviour::default()).await;
+    let gw = standalone_gateway().await;
+    register_aliases(&[(
+        "sa-rt-operator",
+        json!({"openai_compatible": true, "realtime": {"provider": "openai",
+            "model": "gpt-realtime-2.1", "base_url": vendor.base(), "voice": "marin",
+            "instructions": "Be brief."}}),
+    )]);
+    let mut ws = standalone_connect(&gw, "sa-rt-operator").await;
+    let created = until_type(&mut ws, "session.created").await;
+    assert_eq!(
+        created["session"]["model"], "sa-rt-operator",
+        "the client sees the alias, never the vendor model"
+    );
+    standalone_round_trip(&mut ws, &vendor, 1).await;
+
+    let upgrades = vendor.upgrades();
+    assert_eq!(upgrades.len(), 1);
+    let (path, headers) = &upgrades[0];
+    assert_eq!(path, "/v1/realtime?model=gpt-realtime-2.1");
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some(format!("Bearer {STANDALONE_OPERATOR_KEY}").as_str())
+    );
+    assert!(
+        !headers.values().any(|v| v.contains(STANDALONE_SECRET)),
+        "the client's gateway key never reaches the vendor"
+    );
+    let defaults = &vendor.frames_of("session.update")[0];
+    assert_eq!(defaults["session"]["audio"]["output"]["voice"], "marin");
+    assert_eq!(defaults["session"]["instructions"], "Be brief.");
+
+    // Past several revalidation ticks (300 ms) and still served.
+    keep_alive(&mut ws, Duration::from_millis(900)).await;
+    standalone_round_trip(&mut ws, &vendor, 2).await;
+}
+
+/// An alias's `credential_ref` is what the vendor gets — never the gateway's own key.
+#[tokio::test]
+async fn a_standalone_alias_sends_its_credential_ref_to_its_vendor() {
+    let vendor = MockVendor::start(Behaviour::default()).await;
+    let gw = standalone_gateway().await;
+    register_aliases(&[(
+        "sa-rt-credential",
+        json!({"openai_compatible": true, "realtime": {"provider": "openai",
+            "model": "gpt-realtime-2.1", "base_url": vendor.base(), "credential_ref": "rt-alias"}}),
+    )]);
+    let mut ws = standalone_connect(&gw, "sa-rt-credential").await;
+    until_type(&mut ws, "session.created").await;
+    standalone_round_trip(&mut ws, &vendor, 1).await;
+    let (_, headers) = &vendor.upgrades()[0];
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some(format!("Bearer {CREDENTIAL_REF_KEY}").as_str())
+    );
+    assert!(
+        !headers
+            .values()
+            .any(|v| v.contains(STANDALONE_OPERATOR_KEY)),
+        "the gateway's own key is not sent alongside"
+    );
+}
+
+/// Authentication is the standalone gateway's own, before anything is dialled: a wrong key and
+/// no key are refused 401 in OpenAI's envelope, and the vendor never sees a connection.
+#[tokio::test]
+async fn a_standalone_alias_refuses_a_wrong_client_key() {
+    let vendor = MockVendor::start(Behaviour::default()).await;
+    let gw = standalone_gateway().await;
+    register_aliases(&[(
+        "sa-rt-auth",
+        json!({"openai_compatible": true, "realtime": {"provider": "openai",
+            "model": "gpt-realtime-2.1", "base_url": vendor.base()}}),
+    )]);
+    let Err((status, body, _)) = connect_with(
+        &gw,
+        "model=sa-rt-auth",
+        Auth::Bearer("not-the-secret"),
+        &[],
+        &[],
+    )
+    .await
+    else {
+        panic!("connected with a wrong key");
+    };
+    assert_eq!(status, 401);
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    let Err((status, _, _)) = connect_with(&gw, "model=sa-rt-auth", Auth::None, &[], &[]).await
+    else {
+        panic!("connected without a key");
+    };
+    assert_eq!(status, 401);
+    assert_eq!(vendor.connections(), 0, "nothing was dialled");
+}
+
+/// Only aliases the operator marked `openai_compatible` are reachable as `?model` (the startup
+/// checks refuse a `realtime` block without it; the registry is checked again here), and an
+/// unknown name is the same `404`.
+#[tokio::test]
+async fn an_unmarked_standalone_alias_is_not_found() {
+    let vendor = MockVendor::start(Behaviour::default()).await;
+    let gw = standalone_gateway().await;
+    let def: waav_gateway::core::alias::AliasDefinition = serde_json::from_value(json!({
+        "realtime": {"provider": "openai", "model": "gpt-realtime-2.1", "base_url": vendor.base()}
+    }))
+    .unwrap();
+    let refused =
+        waav_gateway::core::alias::validate_aliases(&waav_gateway::core::alias::AliasConfig {
+            aliases: [("sa-rt-unmarked".to_string(), def.clone())].into(),
+        })
+        .unwrap_err();
+    assert!(refused.contains("openai_compatible"), "{refused}");
+    waav_gateway::core::alias::global_aliases().register("sa-rt-unmarked", def);
+    for model in ["sa-rt-unmarked", "sa-rt-nobody"] {
+        let Err((status, body, _)) = connect_with(
+            &gw,
+            &format!("model={model}"),
+            Auth::Bearer(STANDALONE_SECRET),
+            &[],
+            &[],
+        )
+        .await
+        else {
+            panic!("{model}: connected");
+        };
+        assert_eq!(status, 404, "{model}");
+        assert_eq!(body["error"]["code"], "model_not_found", "{model}");
+        assert_eq!(body["error"]["param"], "model");
+    }
+    assert_eq!(vendor.connections(), 0);
+}
+
+/// Revalidation is real: once the alias stops relaying, the next tick closes the session as
+/// revoked, as a revoked Bud key does.
+#[tokio::test]
+async fn a_standalone_session_ends_when_its_alias_stops_relaying() {
+    let vendor = MockVendor::start(Behaviour::default()).await;
+    let gw = standalone_gateway().await;
+    register_aliases(&[(
+        "sa-rt-revoked",
+        json!({"openai_compatible": true, "realtime": {"provider": "openai",
+            "model": "gpt-realtime-2.1", "base_url": vendor.base()}}),
+    )]);
+    let mut ws = standalone_connect(&gw, "sa-rt-revoked").await;
+    until_type(&mut ws, "session.created").await;
+    waav_gateway::core::alias::global_aliases().remove("sa-rt-revoked");
+    let (errors, code) = until_close(&mut ws).await;
+    assert_eq!(code, Some(1008));
+    assert!(
+        errors.contains(&"session_revoked".to_string()),
+        "{errors:?}"
+    );
 }

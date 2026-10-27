@@ -190,13 +190,14 @@ fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
             None
         }
     };
+    // Credentials first: an alias's realtime `credential_ref` is checked against them.
+    if let Err(e) = waav_gateway::core::credentials::initialize_credentials() {
+        problems.push(format!("credentials: {e}"));
+    }
     if let Some(config) = config.as_ref()
         && let Err(e) = waav_gateway::core::alias::validate_aliases(&config.aliases)
     {
         problems.push(format!("aliases: {e}"));
-    }
-    if let Err(e) = waav_gateway::core::credentials::initialize_credentials() {
-        problems.push(format!("credentials: {e}"));
     }
     #[cfg(feature = "dag-routing")]
     if let Ok(dir) = std::env::var("WAAV_DAG_TEMPLATES_DIR")
@@ -388,6 +389,18 @@ async fn main() -> anyhow::Result<()> {
         ServerConfig::from_env().map_err(|e| anyhow!(e.to_string()))?
     };
 
+    // Operator credentials (WAAV_CREDENTIALS_FILE / WAAV_CREDENTIALS_JSON): the ONLY secrets a
+    // client config may name, each bound to the hosts it may be sent to. A malformed file stops
+    // the server (it must never degrade to "no credentials" silently). Loaded before the aliases,
+    // whose realtime `credential_ref` is checked against them.
+    {
+        let n = waav_gateway::core::credentials::initialize_credentials()
+            .map_err(|e| anyhow!("credentials: {e}"))?;
+        if n > 0 {
+            info!("Registered {} operator credential(s)", n);
+        }
+    }
+
     // P3: register the server-side alias registry from config (the `aliases:` section).
     // Mirrors the DAG template registry initialization; definitions are server-config-
     // only (SSRF-safe). A client may NAME an alias on its `config` message but never
@@ -400,17 +413,6 @@ async fn main() -> anyhow::Result<()> {
         let n = waav_gateway::core::alias::initialize_aliases(&config.aliases);
         if n > 0 {
             info!("Registered {} server-side config alias(es)", n);
-        }
-    }
-
-    // Operator credentials (WAAV_CREDENTIALS_FILE / WAAV_CREDENTIALS_JSON): the ONLY secrets a
-    // client config may name, each bound to the hosts it may be sent to. A malformed file stops
-    // the server (it must never degrade to "no credentials" silently).
-    {
-        let n = waav_gateway::core::credentials::initialize_credentials()
-            .map_err(|e| anyhow!("credentials: {e}"))?;
-        if n > 0 {
-            info!("Registered {} operator credential(s)", n);
         }
     }
 

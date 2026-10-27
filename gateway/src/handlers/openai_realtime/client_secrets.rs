@@ -164,6 +164,14 @@ pub async fn mint(
             ck: *client_key,
         },
         CallerCheck::Jwt { sub } => Parent::Jwt { sub: sub.clone() },
+        // `authenticate` answers only Bud callers; a standalone one has no parent to seal.
+        CallerCheck::Standalone { .. } => {
+            return Err(HandshakeError::new(
+                StatusCode::NOT_FOUND,
+                "bud_mode_required",
+                "Client secrets need the Bud control plane.",
+            ));
+        }
     };
     let claims = Claims {
         v: 1,
