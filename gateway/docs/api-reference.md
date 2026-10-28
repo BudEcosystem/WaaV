@@ -111,6 +111,7 @@ All responses use JSON unless otherwise noted. Errors follow the shape `{ "error
 | `wellsaid` | `GET /v1/tts/avatars` | `WELLSAID_API_KEY` |
 | `ibm_watson` | `GET /instances/{id}/v1/voices` | IBM API key + instance + region |
 | `aws_polly` | `DescribeVoices` (paged) | AWS key pair + region |
+| `unrealspeech` | the 38 documented V8 voices | `UNREALSPEECH_API_KEY` |
 
 Smallest has no operator key, so it is listed only where a deployment or session brings one
 (descriptor resolution, budapp's catalog). Vendors whose voice list WaaV cannot fetch, or whose

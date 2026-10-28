@@ -28,8 +28,8 @@
 - **Authentication:** Bearer Token via `Authorization` header
 - **Protocol:** REST (HTTP POST)
 - **Audio Formats:** MP3 (libmp3lame), PCM mu-law (pcm_mulaw)
-- **Bitrates:** 16k, 32k, 64k, 128k, 192k (default), 256k, 320k
-- **Languages:** English (primary)
+- **Bitrates:** 16k, 32k, 48k, 64k, 128k, 192k (default), 256k, 320k
+- **Languages:** American English, Chinese, Spanish, French, Hindi, Italian, Portuguese
 - **Latency:** ~300ms TTFA for `/stream` endpoint
 
 ---
@@ -51,7 +51,7 @@ Content-Type: application/json
 ```json
 {
   "Text": "Hello, this is a test.",
-  "VoiceId": "Scarlett",
+  "VoiceId": "Sierra",
   "Bitrate": "192k",
   "Speed": 0,
   "Pitch": 1.0,
@@ -85,7 +85,7 @@ Content-Type: application/json
 ```json
 {
   "Text": "Longer text content here...",
-  "VoiceId": "Will",
+  "VoiceId": "Daniel",
   "Bitrate": "192k",
   "Speed": 0,
   "Pitch": 1.0,
@@ -120,7 +120,7 @@ Content-Type: application/json
 ```json
 {
   "Text": "Very long text content...",
-  "VoiceId": "Dan",
+  "VoiceId": "Noah",
   "Bitrate": "320k",
   "Speed": 0,
   "Pitch": 1.0,
@@ -158,51 +158,38 @@ Content-Type: application/json
 
 ## 3. Voices
 
-### Standard Voices
-| Voice ID | Name | Gender | Style |
-|----------|------|--------|-------|
-| Scarlett | Scarlett | Female | Young |
-| Liv | Liv | Female | Young |
-| Amy | Amy | Female | Mature |
-| Dan | Dan | Male | Young |
-| Will | Will | Male | Mature |
+The V8 API documents 38 voices (docs.v8.unrealspeech.com, `VoiceId`). It has no voice-list
+endpoint, so `GET /voices` lists these from the gateway's table (`V8_VOICES` in `config.rs`).
+The default is **Sierra**, the voice Unreal's own examples use.
 
-### V8 Kokoro Voices (48 voices across 8 languages)
+| Language | Female | Male |
+|----------|--------|------|
+| American English | Autumn, Melody, Hannah, Emily, Ivy, Kaitlyn, Luna, Willow, Lauren, Sierra | Noah, Jasper, Caleb, Ronan, Ethan, Daniel, Zane |
+| Chinese | Mei, Lian, Ting, Jing | Wei, Jian, Hao, Sheng |
+| Spanish | Lucía | Mateo, Javier |
+| French | Élodie | |
+| Hindi | Ananya, Priya | Arjun, Rohan |
+| Italian | Giulia | Luca |
+| Portuguese | Camila | Thiago, Rafael |
 
-#### American English (af = American Female, am = American Male)
-| Voice ID | Description |
-|----------|-------------|
-| af_heart | American Female - Heart |
-| af_alloy | American Female - Alloy |
-| af_aoede | American Female - Aoede |
-| af_bella | American Female - Bella |
-| af_jessica | American Female - Jessica |
-| af_kore | American Female - Kore |
-| af_nicole | American Female - Nicole |
-| af_nova | American Female - Nova |
-| af_river | American Female - River |
-| af_sarah | American Female - Sarah |
-| af_sky | American Female - Sky |
-| am_adam | American Male - Adam |
-| am_echo | American Male - Echo |
-| am_eric | American Male - Eric |
-| am_fenrir | American Male - Fenrir |
-| am_liam | American Male - Liam |
-| am_michael | American Male - Michael |
-| am_onyx | American Male - Onyx |
-| am_puck | American Male - Puck |
-| am_santa | American Male - Santa |
+A documented name is matched without regard to case (`sierra` is sent as `Sierra`; `lucia` and
+`elodie` as `Lucía` and `Élodie`). Any other id, such as a custom voice, is sent exactly as given.
 
-#### British English (bf = British Female, bm = British Male)
-| Voice ID | Description |
-|----------|-------------|
-| bf_emma | British Female - Emma |
-| bf_isabella | British Female - Isabella |
-| bm_george | British Male - George |
-| bm_lewis | British Male - Lewis |
+### V7 voice ids
 
-#### Additional Languages (French, Hindi, Spanish, Japanese, Chinese, Portuguese)
-48 total voices across 8 languages - use API `/voices` to list all available voices.
+V8 renamed every voice ("Migrating from V6 or V7: update the VoiceID"). A V7 id is sent as a
+V8 voice of the same gender, and the gateway logs a warning:
+
+| V7 | Sent as |
+|----|---------|
+| Scarlett | Sierra |
+| Liv | Hannah |
+| Amy | Emily |
+| Dan | Noah |
+| Will | Daniel |
+
+The Kokoro-style ids this provider used to list (`af_bella`, `bm_george`, …) and their short names
+(`bella`, `george`, …) are still sent as before. They are not in Unreal's V8 list.
 
 ---
 
@@ -257,7 +244,7 @@ src/core/tts/unrealspeech/
    - Module exports
 
 2. **Create config.rs**
-   - UnrealSpeechVoice enum
+   - UnrealSpeechVoice (V8 voice table, V7 migration)
    - UnrealSpeechCodec enum
    - UnrealSpeechTtsConfig struct
    - UnrealSpeechStreamRequest struct

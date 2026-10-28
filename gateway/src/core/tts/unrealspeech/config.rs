@@ -22,100 +22,134 @@ fn validate_unrealspeech_tts_endpoint(source: &str, endpoint: &str) -> TTSResult
 // Voice Types
 // =============================================================================
 
-/// Unreal Speech voice identifiers
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum UnrealSpeechVoice {
-    // Standard voices
-    /// Young female voice (default)
-    #[default]
-    Scarlett,
-    /// Young female voice
-    Liv,
-    /// Mature female voice
-    Amy,
-    /// Young male voice
-    Dan,
-    /// Mature male voice
-    Will,
+/// The voices Unreal Speech's V8 API documents (`VoiceId`, docs.v8.unrealspeech.com), with the
+/// gender and language it lists each under. V8 renamed every voice ("Migrating from V6 or V7:
+/// update the VoiceID"), so none of V7's ids is among them.
+pub const V8_VOICES: &[(&str, &str, &str)] = &[
+    ("Autumn", "female", "en-US"),
+    ("Melody", "female", "en-US"),
+    ("Hannah", "female", "en-US"),
+    ("Emily", "female", "en-US"),
+    ("Ivy", "female", "en-US"),
+    ("Kaitlyn", "female", "en-US"),
+    ("Luna", "female", "en-US"),
+    ("Willow", "female", "en-US"),
+    ("Lauren", "female", "en-US"),
+    ("Sierra", "female", "en-US"),
+    ("Noah", "male", "en-US"),
+    ("Jasper", "male", "en-US"),
+    ("Caleb", "male", "en-US"),
+    ("Ronan", "male", "en-US"),
+    ("Ethan", "male", "en-US"),
+    ("Daniel", "male", "en-US"),
+    ("Zane", "male", "en-US"),
+    ("Mei", "female", "zh"),
+    ("Lian", "female", "zh"),
+    ("Ting", "female", "zh"),
+    ("Jing", "female", "zh"),
+    ("Wei", "male", "zh"),
+    ("Jian", "male", "zh"),
+    ("Hao", "male", "zh"),
+    ("Sheng", "male", "zh"),
+    ("Lucía", "female", "es"),
+    ("Mateo", "male", "es"),
+    ("Javier", "male", "es"),
+    ("Élodie", "female", "fr"),
+    ("Ananya", "female", "hi"),
+    ("Priya", "female", "hi"),
+    ("Arjun", "male", "hi"),
+    ("Rohan", "male", "hi"),
+    ("Giulia", "female", "it"),
+    ("Luca", "male", "it"),
+    ("Camila", "female", "pt"),
+    ("Thiago", "male", "pt"),
+    ("Rafael", "male", "pt"),
+];
 
-    // Kokoro V8 voices - American
-    /// American female
-    Af,
-    /// American female - Bella
-    AfBella,
-    /// American female - Sarah
-    AfSarah,
-    /// American female - Nicole
-    AfNicole,
-    /// American female - Sky
-    AfSky,
-    /// American male - Adam
-    AmAdam,
-    /// American male - Michael
-    AmMichael,
+/// V7's voice ids, each mapped to a V8 voice of the same gender so a configuration written for V7
+/// keeps speaking (V7's default, Scarlett, becomes V8's documented example, Sierra).
+const V7_VOICES: &[(&str, &str)] = &[
+    ("scarlett", "Sierra"),
+    ("liv", "Hannah"),
+    ("amy", "Emily"),
+    ("dan", "Noah"),
+    ("will", "Daniel"),
+];
 
-    // Kokoro V8 voices - British
-    /// British female - Emma
-    BfEmma,
-    /// British female - Isabella
-    BfIsabella,
-    /// British male - George
-    BmGeorge,
-    /// British male - Lewis
-    BmLewis,
+/// Spellings this provider has always accepted, sent as they always were: the two accented V8
+/// names without their accents, and short names for the Kokoro-style ids (`af_bella`, ...), which
+/// Unreal's V8 list does not document.
+const ALIASES: &[(&str, &str)] = &[
+    ("lucia", "Lucía"),
+    ("elodie", "Élodie"),
+    ("afbella", "af_bella"),
+    ("bella", "af_bella"),
+    ("afsarah", "af_sarah"),
+    ("sarah", "af_sarah"),
+    ("afnicole", "af_nicole"),
+    ("nicole", "af_nicole"),
+    ("afsky", "af_sky"),
+    ("sky", "af_sky"),
+    ("amadam", "am_adam"),
+    ("adam", "am_adam"),
+    ("ammichael", "am_michael"),
+    ("michael", "am_michael"),
+    ("bfemma", "bf_emma"),
+    ("emma", "bf_emma"),
+    ("bfisabella", "bf_isabella"),
+    ("isabella", "bf_isabella"),
+    ("bmgeorge", "bm_george"),
+    ("george", "bm_george"),
+    ("bmlewis", "bm_lewis"),
+    ("lewis", "bm_lewis"),
+];
 
-    /// Custom voice ID
-    Custom(String),
+/// An Unreal Speech `VoiceId`, as the V8 API is sent it.
+///
+/// A documented V8 voice is matched without regard to case and sent as Unreal spells it; a V7 id
+/// becomes its V8 counterpart ([`Self::parse_with_migration`] says so); any other id (a custom
+/// voice) is sent exactly as given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrealSpeechVoice(String);
+
+impl Default for UnrealSpeechVoice {
+    fn default() -> Self {
+        Self(super::DEFAULT_VOICE_ID.to_string())
+    }
 }
 
 impl UnrealSpeechVoice {
-    /// Get the API voice identifier
+    /// The `VoiceId` sent to the API.
     pub fn as_str(&self) -> &str {
-        match self {
-            Self::Scarlett => "Scarlett",
-            Self::Liv => "Liv",
-            Self::Amy => "Amy",
-            Self::Dan => "Dan",
-            Self::Will => "Will",
-            Self::Af => "af",
-            Self::AfBella => "af_bella",
-            Self::AfSarah => "af_sarah",
-            Self::AfNicole => "af_nicole",
-            Self::AfSky => "af_sky",
-            Self::AmAdam => "am_adam",
-            Self::AmMichael => "am_michael",
-            Self::BfEmma => "bf_emma",
-            Self::BfIsabella => "bf_isabella",
-            Self::BmGeorge => "bm_george",
-            Self::BmLewis => "bm_lewis",
-            Self::Custom(id) => id.as_str(),
+        &self.0
+    }
+
+    /// Parse a voice id, reporting the V7 id it replaced when it was one. An empty id is the
+    /// default voice.
+    pub fn parse_with_migration(s: &str) -> (Self, Option<&'static str>) {
+        let id = s.trim();
+        if id.is_empty() {
+            return (Self::default(), None);
         }
+        let lowered = id.to_lowercase();
+        if let Some((name, _, _)) = V8_VOICES
+            .iter()
+            .find(|(name, _, _)| name.to_lowercase() == lowered)
+        {
+            return (Self((*name).to_string()), None);
+        }
+        if let Some((old, new)) = V7_VOICES.iter().find(|(old, _)| *old == lowered) {
+            return (Self((*new).to_string()), Some(*old));
+        }
+        if let Some((_, to)) = ALIASES.iter().find(|(from, _)| *from == lowered) {
+            return (Self((*to).to_string()), None);
+        }
+        (Self(id.to_string()), None)
     }
 
-    /// Check if voice is a standard voice
-    pub fn is_standard(&self) -> bool {
-        matches!(
-            self,
-            Self::Scarlett | Self::Liv | Self::Amy | Self::Dan | Self::Will
-        )
-    }
-
-    /// Check if voice is a Kokoro V8 voice
-    pub fn is_kokoro(&self) -> bool {
-        matches!(
-            self,
-            Self::Af
-                | Self::AfBella
-                | Self::AfSarah
-                | Self::AfNicole
-                | Self::AfSky
-                | Self::AmAdam
-                | Self::AmMichael
-                | Self::BfEmma
-                | Self::BfIsabella
-                | Self::BmGeorge
-                | Self::BmLewis
-        )
+    /// Whether this is a voice Unreal's V8 list documents.
+    pub fn is_documented(&self) -> bool {
+        V8_VOICES.iter().any(|(name, _, _)| *name == self.0)
     }
 }
 
@@ -129,26 +163,7 @@ impl std::str::FromStr for UnrealSpeechVoice {
     type Err = TTSError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "scarlett" => Ok(Self::Scarlett),
-            "liv" => Ok(Self::Liv),
-            "amy" => Ok(Self::Amy),
-            "dan" => Ok(Self::Dan),
-            "will" => Ok(Self::Will),
-            "af" => Ok(Self::Af),
-            "af_bella" | "afbella" | "bella" => Ok(Self::AfBella),
-            "af_sarah" | "afsarah" | "sarah" => Ok(Self::AfSarah),
-            "af_nicole" | "afnicole" | "nicole" => Ok(Self::AfNicole),
-            "af_sky" | "afsky" | "sky" => Ok(Self::AfSky),
-            "am_adam" | "amadam" | "adam" => Ok(Self::AmAdam),
-            "am_michael" | "ammichael" | "michael" => Ok(Self::AmMichael),
-            "bf_emma" | "bfemma" | "emma" => Ok(Self::BfEmma),
-            "bf_isabella" | "bfisabella" | "isabella" => Ok(Self::BfIsabella),
-            "bm_george" | "bmgeorge" | "george" => Ok(Self::BmGeorge),
-            "bm_lewis" | "bmlewis" | "lewis" => Ok(Self::BmLewis),
-            // Allow any other voice ID as custom
-            other => Ok(Self::Custom(other.to_string())),
-        }
+        Ok(Self::parse_with_migration(s).0)
     }
 }
 
@@ -265,6 +280,8 @@ pub enum UnrealSpeechBitrate {
     Bitrate16k,
     /// 32 kbps
     Bitrate32k,
+    /// 48 kbps
+    Bitrate48k,
     /// 64 kbps
     Bitrate64k,
     /// 128 kbps
@@ -284,6 +301,7 @@ impl UnrealSpeechBitrate {
         match self {
             Self::Bitrate16k => "16k",
             Self::Bitrate32k => "32k",
+            Self::Bitrate48k => "48k",
             Self::Bitrate64k => "64k",
             Self::Bitrate128k => "128k",
             Self::Bitrate192k => "192k",
@@ -297,6 +315,7 @@ impl UnrealSpeechBitrate {
         match self {
             Self::Bitrate16k => 16,
             Self::Bitrate32k => 32,
+            Self::Bitrate48k => 48,
             Self::Bitrate64k => 64,
             Self::Bitrate128k => 128,
             Self::Bitrate192k => 192,
@@ -319,13 +338,14 @@ impl std::str::FromStr for UnrealSpeechBitrate {
         match s.to_lowercase().as_str() {
             "16k" | "16" => Ok(Self::Bitrate16k),
             "32k" | "32" => Ok(Self::Bitrate32k),
+            "48k" | "48" => Ok(Self::Bitrate48k),
             "64k" | "64" => Ok(Self::Bitrate64k),
             "128k" | "128" => Ok(Self::Bitrate128k),
             "192k" | "192" => Ok(Self::Bitrate192k),
             "256k" | "256" => Ok(Self::Bitrate256k),
             "320k" | "320" => Ok(Self::Bitrate320k),
             _ => Err(TTSError::InvalidConfiguration(format!(
-                "Unknown Unreal Speech bitrate: '{}'. Valid bitrates: 16k, 32k, 64k, 128k, 192k, 256k, 320k",
+                "Unknown Unreal Speech bitrate: '{}'. Valid bitrates: 16k, 32k, 48k, 64k, 128k, 192k, 256k, 320k",
                 s
             ))),
         }
@@ -470,12 +490,20 @@ impl UnrealSpeechTtsConfig {
             ));
         }
 
-        // Get voice from config
-        let voice = config
-            .voice_id
-            .as_ref()
-            .map(|v| v.parse().unwrap_or_default())
-            .unwrap_or_default();
+        let voice = match config.voice_id.as_deref() {
+            Some(id) => {
+                let (voice, v7) = UnrealSpeechVoice::parse_with_migration(id);
+                if let Some(old) = v7 {
+                    tracing::warn!(
+                        voice = %old,
+                        replacement = %voice,
+                        "Unreal Speech V8 has no V7 voice ids; using the V8 voice of the same gender"
+                    );
+                }
+                voice
+            }
+            None => UnrealSpeechVoice::default(),
+        };
 
         // Parse codec from audio_format - fall back to default for unsupported formats
         let codec = if let Some(ref fmt) = config.audio_format {
@@ -723,7 +751,7 @@ mod tests {
         assert_eq!(cfg.bitrate, UnrealSpeechBitrate::Bitrate320k); // extras passthrough
         assert_eq!(cfg.codec, UnrealSpeechCodec::PcmS16le); // typed audio_format -> codec
         assert_eq!(cfg.temperature, Some(0.35)); // extras passthrough
-        assert_eq!(cfg.voice, UnrealSpeechVoice::Dan); // base passthrough preserved
+        assert_eq!(cfg.voice, voice("Noah")); // base passthrough preserved
     }
 
     // WIRE-LEVEL guard: the recurring bug class is asserting only the config struct. This serializes
@@ -773,56 +801,70 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_voice_enum_standard() {
-        assert_eq!(UnrealSpeechVoice::Scarlett.as_str(), "Scarlett");
-        assert_eq!(UnrealSpeechVoice::Liv.as_str(), "Liv");
-        assert_eq!(UnrealSpeechVoice::Amy.as_str(), "Amy");
-        assert_eq!(UnrealSpeechVoice::Dan.as_str(), "Dan");
-        assert_eq!(UnrealSpeechVoice::Will.as_str(), "Will");
-
-        assert!(UnrealSpeechVoice::Scarlett.is_standard());
-        assert!(!UnrealSpeechVoice::Scarlett.is_kokoro());
+    fn voice(id: &str) -> UnrealSpeechVoice {
+        id.parse().unwrap()
     }
 
+    /// V8 renamed every voice: a documented one is sent as Unreal spells it, whatever the case
+    /// it was given in; V7's become a V8 voice of the same gender, and say so; any other id (a
+    /// custom voice, the Kokoro-style ids) is sent exactly as given.
     #[test]
-    fn test_voice_enum_kokoro() {
-        assert_eq!(UnrealSpeechVoice::Af.as_str(), "af");
-        assert_eq!(UnrealSpeechVoice::AfBella.as_str(), "af_bella");
-        assert_eq!(UnrealSpeechVoice::AmAdam.as_str(), "am_adam");
-        assert_eq!(UnrealSpeechVoice::BfEmma.as_str(), "bf_emma");
-        assert_eq!(UnrealSpeechVoice::BmGeorge.as_str(), "bm_george");
+    fn voices_are_v8_ids() {
+        assert_eq!(UnrealSpeechVoice::default().as_str(), "Sierra");
+        assert!(UnrealSpeechVoice::default().is_documented());
+        assert_eq!(voice("sierra").as_str(), "Sierra");
+        assert_eq!(voice(" ZANE ").as_str(), "Zane");
+        assert_eq!(voice("lucia").as_str(), "Lucía");
+        assert_eq!(voice("Élodie").as_str(), "Élodie");
+        assert_eq!(voice("").as_str(), "Sierra");
 
-        assert!(!UnrealSpeechVoice::AfBella.is_standard());
-        assert!(UnrealSpeechVoice::AfBella.is_kokoro());
+        for (old, new) in [
+            ("Scarlett", "Sierra"),
+            ("liv", "Hannah"),
+            ("Amy", "Emily"),
+            ("Dan", "Noah"),
+            ("will", "Daniel"),
+        ] {
+            let (v, replaced) = UnrealSpeechVoice::parse_with_migration(old);
+            assert_eq!(v.as_str(), new, "{old}");
+            assert_eq!(
+                replaced.map(str::to_owned),
+                Some(old.to_lowercase()),
+                "{old}"
+            );
+            let gender = |id: &str| V8_VOICES.iter().find(|(n, _, _)| *n == id).map(|v| v.1);
+            assert!(gender(new).is_some(), "{new} is a V8 voice");
+        }
+        assert_eq!(UnrealSpeechVoice::parse_with_migration("Noah").1, None);
+
+        // Unchanged from before: a custom id keeps its case (it used to be lowercased), the
+        // Kokoro-style ids and their short names go out as they always did.
+        assert_eq!(voice("MyClonedVoice-01").as_str(), "MyClonedVoice-01");
+        assert!(!voice("MyClonedVoice-01").is_documented());
+        assert_eq!(voice("af_bella").as_str(), "af_bella");
+        assert_eq!(voice("bella").as_str(), "af_bella");
+        assert_eq!(voice("adam").as_str(), "am_adam");
+        assert_eq!(voice("af").as_str(), "af");
     }
 
+    /// The table is Unreal's documented list: unique ids, a gender and a language each.
     #[test]
-    fn test_voice_from_str() {
-        assert_eq!(
-            "scarlett".parse::<UnrealSpeechVoice>().unwrap(),
-            UnrealSpeechVoice::Scarlett
-        );
-        assert_eq!(
-            "dan".parse::<UnrealSpeechVoice>().unwrap(),
-            UnrealSpeechVoice::Dan
-        );
-        assert_eq!(
-            "af_bella".parse::<UnrealSpeechVoice>().unwrap(),
-            UnrealSpeechVoice::AfBella
-        );
-        assert_eq!(
-            "bella".parse::<UnrealSpeechVoice>().unwrap(),
-            UnrealSpeechVoice::AfBella
-        );
-        assert_eq!(
-            "am_adam".parse::<UnrealSpeechVoice>().unwrap(),
-            UnrealSpeechVoice::AmAdam
-        );
-
-        // Custom voice ID
-        let custom = "custom_voice".parse::<UnrealSpeechVoice>().unwrap();
-        assert!(matches!(custom, UnrealSpeechVoice::Custom(_)));
+    fn the_v8_voice_table_is_well_formed() {
+        assert_eq!(V8_VOICES.len(), 38);
+        let mut ids: Vec<_> = V8_VOICES.iter().map(|v| v.0.to_lowercase()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), V8_VOICES.len());
+        for (id, gender, lang) in V8_VOICES {
+            assert!(matches!(*gender, "female" | "male"), "{id}");
+            assert!(!lang.is_empty(), "{id}");
+            assert!(
+                V7_VOICES
+                    .iter()
+                    .all(|(old, _)| !old.eq_ignore_ascii_case(id)),
+                "{id}"
+            );
+        }
     }
 
     #[test]
@@ -894,7 +936,7 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = UnrealSpeechTtsConfig::default();
-        assert_eq!(config.voice, UnrealSpeechVoice::Scarlett);
+        assert_eq!(config.voice, voice("Sierra"));
         assert_eq!(config.bitrate, UnrealSpeechBitrate::Bitrate192k);
         assert_eq!(config.speed, 0.0);
         assert_eq!(config.pitch, 1.0);
@@ -912,7 +954,8 @@ mod tests {
 
         let config = UnrealSpeechTtsConfig::from_base(&base_config).unwrap();
         assert_eq!(config.api_key, "test-api-key");
-        assert_eq!(config.voice, UnrealSpeechVoice::Will);
+        // A V7 id, mapped onto V8's voice of the same gender.
+        assert_eq!(config.voice, voice("Daniel"));
         assert_eq!(config.codec, UnrealSpeechCodec::Mp3);
     }
 
@@ -937,7 +980,7 @@ mod tests {
     fn test_config_validation() {
         let config = UnrealSpeechTtsConfig {
             api_key: "test-key".to_string(),
-            voice: UnrealSpeechVoice::Scarlett,
+            voice: voice("Sierra"),
             speed: 0.0,
             pitch: 1.0,
             ..Default::default()
@@ -957,7 +1000,7 @@ mod tests {
         let _env = crate::core::net::ssrf_env_lock();
         let mut config = UnrealSpeechTtsConfig {
             api_key: "test-key".to_string(),
-            voice: UnrealSpeechVoice::Scarlett,
+            voice: voice("Sierra"),
             speed: 0.0,
             pitch: 1.0,
             ..Default::default()
@@ -1042,7 +1085,7 @@ mod tests {
     fn test_config_builder() {
         let config = UnrealSpeechTtsConfig::builder()
             .api_key("test-key")
-            .voice(UnrealSpeechVoice::Dan)
+            .voice(voice("Noah"))
             .bitrate(UnrealSpeechBitrate::Bitrate320k)
             .speed(0.5)
             .pitch(0.9)
@@ -1051,7 +1094,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.api_key, "test-key");
-        assert_eq!(config.voice, UnrealSpeechVoice::Dan);
+        assert_eq!(config.voice, voice("Noah"));
         assert_eq!(config.bitrate, UnrealSpeechBitrate::Bitrate320k);
         assert_eq!(config.speed, 0.5);
         assert_eq!(config.pitch, 0.9);
@@ -1062,7 +1105,7 @@ mod tests {
     fn test_stream_request_from_config() {
         let config = UnrealSpeechTtsConfig {
             api_key: "test-key".to_string(),
-            voice: UnrealSpeechVoice::Scarlett,
+            voice: voice("Sierra"),
             bitrate: UnrealSpeechBitrate::Bitrate192k,
             speed: 0.0,
             pitch: 1.0,
@@ -1074,7 +1117,7 @@ mod tests {
         let request = UnrealSpeechStreamRequest::from_config(&config, "Hello world");
 
         assert_eq!(request.text, "Hello world");
-        assert_eq!(request.voice_id, "Scarlett");
+        assert_eq!(request.voice_id, "Sierra");
         assert_eq!(request.bitrate, "192k");
         assert_eq!(request.speed, 0.0);
         assert_eq!(request.pitch, 1.0);
@@ -1085,7 +1128,7 @@ mod tests {
     fn test_stream_request_serialization() {
         let config = UnrealSpeechTtsConfig {
             api_key: "test-key".to_string(),
-            voice: UnrealSpeechVoice::Dan,
+            voice: voice("Noah"),
             bitrate: UnrealSpeechBitrate::Bitrate320k,
             speed: 0.5,
             pitch: 0.92,
@@ -1098,7 +1141,7 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
 
         assert!(json.contains("\"Text\":\"Test text\""));
-        assert!(json.contains("\"VoiceId\":\"Dan\""));
+        assert!(json.contains("\"VoiceId\":\"Noah\""));
         assert!(json.contains("\"Bitrate\":\"320k\""));
         assert!(json.contains("\"Speed\":0.5"));
         assert!(json.contains("\"Pitch\":0.92"));
@@ -1107,12 +1150,12 @@ mod tests {
 
     #[test]
     fn test_voice_serialization() {
-        let voice = UnrealSpeechVoice::AfBella;
-        let json = serde_json::to_string(&voice).unwrap();
+        let json = serde_json::to_string(&voice("af_bella")).unwrap();
         assert_eq!(json, "\"af_bella\"");
-
         let deserialized: UnrealSpeechVoice = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, UnrealSpeechVoice::AfBella);
+        assert_eq!(deserialized, voice("af_bella"));
+        let migrated: UnrealSpeechVoice = serde_json::from_str("\"Scarlett\"").unwrap();
+        assert_eq!(migrated.as_str(), "Sierra");
     }
 
     #[test]
