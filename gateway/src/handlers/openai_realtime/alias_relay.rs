@@ -292,35 +292,30 @@ pub fn validate(name: &str, def: &AliasDefinition, leg: &AliasRealtime) -> Resul
             "realtime.model is required (the {vendor} model the session runs)"
         )));
     }
-    match nonempty(leg.base_url.as_deref()) {
-        None if leg.credential_ref.is_some() => return Err(fail(credential_ref_needs_base_url())),
-        None => {}
-        Some(base) => {
-            crate::core::net::validate_url_for_ssrf(&base, crate::core::net::HTTP_WS_URL_SCHEMES)
-                .map_err(|e| {
+    let credential = nonempty(leg.credential_ref.as_deref());
+    let base = nonempty(leg.base_url.as_deref());
+    if let Some(base) = &base {
+        crate::core::net::validate_url_for_ssrf(base, crate::core::net::HTTP_WS_URL_SCHEMES)
+            .map_err(|e| {
                 fail(format!(
                     "realtime.base_url {base:?} is not allowed: {e}. A private address needs \
-                         WAAV_PRIVATE_EGRESS_ALLOWLIST (host:port)"
+                     WAAV_PRIVATE_EGRESS_ALLOWLIST (host:port)"
                 ))
             })?;
-            // The key rule's host decision, without reading a secret: a secret that appears after
-            // startup (a mounted file) is read per session.
-            match nonempty(leg.credential_ref.as_deref()) {
-                Some(credential) => {
-                    crate::core::credentials::global_credentials()
-                        .bind(&credential, &base)
-                        .map_err(|e| fail(format!("realtime.credential_ref: {e}")))?;
-                }
-                None => {
-                    if !crate::core::client_destination::operator_approved(
-                        key_provider(&vendor),
-                        &base,
-                    ) {
-                        return Err(fail(not_approved(&vendor, &base)));
-                    }
-                }
-            }
-        }
+    }
+    // The key rule's host decision, without reading a secret.
+    crate::core::alias::validate_leg_credential(
+        "realtime",
+        credential.as_deref(),
+        base.as_deref(),
+        true,
+    )
+    .map_err(fail)?;
+    if let Some(base) = &base
+        && credential.is_none()
+        && !crate::core::client_destination::operator_approved(key_provider(&vendor), base)
+    {
+        return Err(fail(not_approved(&vendor, base)));
     }
     let endpoint = voice_endpoint(leg, &vendor, VALIDATION_KEY.to_string());
     if facade::is_translate_vendor(&vendor) {

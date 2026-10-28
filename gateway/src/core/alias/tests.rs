@@ -429,6 +429,58 @@ tts: { provider: openai, base_url: "https://tts.example.com" }
     assert_eq!(validate_aliases(&fine), Ok(()));
 }
 
+/// Every leg's `credential_ref` is checked at startup as its sessions bind it (the realtime
+/// block's are in `startup_refuses_a_realtime_block_it_cannot_relay`).
+#[test]
+fn startup_checks_each_legs_credential_ref() {
+    let check = |yaml: &str| validate_aliases(&config_of(&[("cr", yaml)]));
+    for leg in ["stt", "tts"] {
+        // Sent only to the leg's own server: without one it would be silently unused.
+        let e = check(&format!(
+            "{leg}: {{ provider: openai, credential_ref: OPENAI_API_KEY }}\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains(&format!("needs {leg}.base_url")), "{e}");
+        let e = check(&format!(
+            "{leg}: {{ provider: openai, base_url: \"https://proxy.example.com/v1\", credential_ref: OPENAI_API_KEY }}\n"
+        ))
+        .unwrap_err();
+        assert!(
+            e.contains("may not be sent to 'proxy.example.com:443'"),
+            "{e}"
+        );
+        let e = check(&format!(
+            "{leg}: {{ provider: openai, base_url: \"https://api.openai.com/v1\", credential_ref: nobody }}\n"
+        ))
+        .unwrap_err();
+        assert!(
+            e.contains(&format!("{leg}.credential_ref")) && e.contains("'nobody' is not defined"),
+            "{e}"
+        );
+        assert_eq!(
+            check(&format!(
+                "{leg}: {{ provider: openai, base_url: \"https://api.openai.com/v1\", credential_ref: OPENAI_API_KEY }}\n"
+            )),
+            Ok(())
+        );
+    }
+    // The LLM leg's goes wherever the session's LLM is: without a base_url, declared is enough.
+    assert_eq!(
+        check("llm: { model: m, credential_ref: OPENAI_API_KEY }\n"),
+        Ok(())
+    );
+    let e = check("llm: { model: m, credential_ref: nobody }\n").unwrap_err();
+    assert!(
+        e.contains("llm.credential_ref") && e.contains("'nobody' is not defined"),
+        "{e}"
+    );
+    let e = check(
+        "llm: { model: m, base_url: \"https://proxy.example.com/v1\", credential_ref: OPENAI_API_KEY }\n",
+    )
+    .unwrap_err();
+    assert!(e.contains("may not be sent to"), "{e}");
+}
+
 fn endpoint(base: &str, credential_ref: Option<&str>) -> AliasLegEndpoint {
     AliasLegEndpoint {
         provider: "openai".into(),

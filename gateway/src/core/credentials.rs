@@ -375,6 +375,12 @@ impl CredentialRegistry {
         })
     }
 
+    /// Whether `name` is a credential the operator declared (or one implied by a provider key
+    /// variable), whatever hosts it may reach.
+    pub fn is_declared(&self, name: &str) -> bool {
+        self.lookup(name).is_some()
+    }
+
     /// Bind credential `name` to `url`, or say why not.
     pub fn bind(
         &self,
