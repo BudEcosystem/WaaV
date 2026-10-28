@@ -868,6 +868,7 @@ impl Policy {
                 .and_then(|asking| asking.key_at)
                 .map(|at| at + Ms::from(self.cfg.hitl_key_gap_ms)),
             self.repeat.as_ref().and_then(|repeat| repeat.deadline),
+            self.offer,
             self.wait_line_due().map(|(due, _)| due),
             self.wait
                 .as_ref()
@@ -3442,6 +3443,12 @@ impl Policy {
             }
         }
 
+        // A choice offer nobody answered in its time: its answer no longer counts
+        // (`Stage::Choice`), and it no longer holds the updates back ("asked"). Live (launch
+        // demo take 24, 28 Oct): the caller's "Keep going." to it was taken for the agent's
+        // echo, the offer stayed open until the caller's next turn 3.5 minutes later, and the
+        // results of the release check and the download numbers waited all that time.
+        self.offer.take_if(|until| *until <= now);
         let unanswered = |repeat: &mut Repeat| repeat.deadline.is_some_and(|at| at <= now);
         if self.repeat.take_if(unanswered).is_some() {
             // Nothing was started, and the caller is told so.
@@ -4426,6 +4433,10 @@ mod tests {
         );
         assert_eq!(spoken(&actions)[0].kind, Kind::ChoiceOffer);
 
+        // Its answer counts for 10 s; then it is closed, unanswered (an agreed wait).
+        assert_eq!(policy.next_wakeup(), Some(27_000));
+        assert!(policy.step(27_000, PolicyInput::Tick, &board).is_empty());
+        assert_eq!(policy.offer, None);
         assert_eq!(policy.next_wakeup(), Some(47_000));
         let actions = policy.step(47_000, PolicyInput::Tick, &board);
         assert_eq!(spoken(&actions)[0].kind, Kind::Checkin);
@@ -7270,6 +7281,22 @@ mod tests {
             release,
             "Check the GitHub release: Open"
         ));
+    }
+
+    /// Live take 24 (28 Oct): "Keep going." to the choice offer was taken for the agent's echo,
+    /// the offer stayed open for 3.5 minutes and held two finished results back all that time.
+    /// An offer nobody answered in its time no longer holds an update.
+    #[test]
+    fn an_unanswered_choice_offer_does_not_hold_updates_back() {
+        let board = tree(&[("t2", FLIGHT)]);
+        let mut policy = policy();
+        policy.offer = Some(10_000);
+        let done = event_of("t2", true, 5_000, TaskState::Completed, completed(BOOKED));
+        assert!(narrations(&policy.step(5_000, done, &board)).is_empty());
+        assert_eq!(policy.next_wakeup(), Some(10_000));
+        let actions = policy.step(10_000, PolicyInput::Tick, &board);
+        assert_eq!(policy.offer, None);
+        assert_eq!(narrations(&actions).len(), 1, "{actions:?}");
     }
 
     #[test]

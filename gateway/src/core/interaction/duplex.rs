@@ -40,6 +40,12 @@ const SILENCE_CEILING_MS: u32 = 1_500;
 /// No final this long after an upload or a claim: the turn ends without one.
 const FINAL_DUE_MS: Ms = 3_000;
 const HOLD_MS: Ms = 800;
+/// Words with no turn this long after a turn of the caller's sound was closed for want of
+/// words are that sound's: the turn has its onset. Live (launch demo take 24, 28 Oct): "Yes. Go
+/// ahead." to a confirmation came from Deepgram 2.6 s after the caller stopped; the wordless
+/// turn had been closed at the silence ceiling, the words opened one with no onset, their
+/// attribution was medium, and the yes did not bind ("Just to be sure: ...").
+const LATE_WORDS_MS: Ms = FINAL_DUE_MS;
 const EAGER_PER_TURN: u8 = 2;
 const EAGER_MORE_VOICED_MS: u64 = 300;
 /// Echo: this many words, this share of them found in what the agent said in the window (also
@@ -161,6 +167,10 @@ pub struct Duplex {
     /// The words of a claim the speech-to-text never answered in time: the turn ended on
     /// them, and the late results that repeat them are not a turn of their own.
     unanswered: Option<String>,
+    /// The caller's sound a turn was closed on at the silence ceiling before any of its words
+    /// came: its onset, level and when it was closed. Words that come soon after are that
+    /// sound's (see [`LATE_WORDS_MS`]).
+    unworded: Option<(Ms, Option<f32>, Ms)>,
     /// The caller's answer to a question is expected (the latest input said so).
     answer_expected: bool,
 }
@@ -188,6 +198,7 @@ impl Duplex {
             provider_turns: false,
             claim_after_ms: None,
             unanswered: None,
+            unworded: None,
             answer_expected: false,
         }
     }
@@ -238,6 +249,17 @@ impl Duplex {
         }
         let over_agent = floor.agent_audible && self.cfg.barge_in;
         match &self.turn {
+            // The words of a sound the analyser heard and a turn was closed on before they came.
+            None if self
+                .unworded
+                .is_some_and(|(_, _, closed)| now <= closed + LATE_WORDS_MS) =>
+            {
+                let sound = self.unworded.take();
+                self.onset(now, None, false, floor, &mut out);
+                if let (Some(turn), Some((at, level, _))) = (&mut self.turn, sound) {
+                    turn.onset.get_or_insert((at, level));
+                }
+            }
             // Words with no onset. While the analyser hears the agent's echo and no sound of
             // the caller's, they are taken for the agent's: the turn opens and nothing is
             // ducked.
@@ -382,6 +404,7 @@ impl Duplex {
                 level_db,
                 reflex_ducked,
             } => {
+                self.unworded = None;
                 self.voiced_from = Some(at);
                 self.silence_ms = 0;
                 // The caller goes on while the claim or the upload is away: its final holds
@@ -424,7 +447,8 @@ impl Duplex {
                     turn.p = Some(p);
                     // A turn held for want of a verdict: a sure one ends it now, and so does
                     // one that does not hold it (not a thinking pause, no dangling word).
-                    let holds = p < THINKING_P || (p < TURN_END_P && dangles(lexicon, &turn.held));
+                    // A dangling word holds whatever the verdict (see `speech_final`).
+                    let holds = p < THINKING_P || dangles(lexicon, &turn.held);
                     if !holds && let Some(until) = &mut turn.hold_until {
                         *until = (*until).min(now);
                     }
@@ -881,7 +905,11 @@ impl Duplex {
             .as_ref()
             .is_some_and(|turn| turn.p.is_some_and(|p| p >= end_p));
         let ceiling = self.silence_ms >= SILENCE_CEILING_MS;
-        let early = self.silence_ms >= SILENCE_SHORT_MS && sure;
+        // Words that dangle are not claimed early: the caller is mid-phrase whatever Smart
+        // Turn heard (the silence ceiling still claims them).
+        let dangling =
+            (self.turn.as_ref()).is_some_and(|turn| dangles(&self.lexicon, &turn.text()));
+        let early = self.silence_ms >= SILENCE_SHORT_MS && sure && !dangling;
         let source = if ceiling {
             EotSource::SilenceCeiling
         } else {
@@ -937,7 +965,7 @@ impl Duplex {
     }
 
     /// A speech-final result: E, unless the pause it came in is not over. The turn is held
-    /// (once per pause, at most `HOLD_MS`) when Smart Turn is unsure and the words dangle, and,
+    /// (once per pause, at most `HOLD_MS`) when the words dangle, and,
     /// where the speech-to-text ended the segment by its endpointing (no claim, no upload, no
     /// turn model of its own) and the analyser heard the turn, also
     /// when Smart Turn is sure the caller has not finished (`THINKING_P`), when its verdict on
@@ -987,7 +1015,12 @@ impl Duplex {
         // the kids can swim and play." ended the turn at p 0.57 and the rest became a second
         // task, three runs of three).
         let story = judged && !answer_expected && unsure && !turn.held.is_empty();
-        if !turn.hold_used && ((unsure && dangling) || thinking || story) {
+        // A last word that dangles ("... the download numbers in the") holds the turn whatever
+        // Smart Turn says: it hears sound, not words. Live (launch demo take 22 and 24, 28
+        // Oct): it was sure at a 200 ms gap the analyser heard in "... in the terminal?", the
+        // claim made the speech-to-text end its segment at "the", and "terminal?" became a
+        // turn of its own (read as the same request again, "change it, or a second one?").
+        if !turn.hold_used && (dangling || thinking || story) {
             turn.hold_used = true;
             turn.hold_until = Some(now + HOLD_MS);
             turn.held = text;
@@ -1010,6 +1043,9 @@ impl Duplex {
             Some(turn) => {
                 if turn.speaking {
                     out.push(DuplexAction::UserSpeaking(false));
+                }
+                if let Some((at, level)) = turn.onset.filter(|_| turn.voiced_ms > 0) {
+                    self.unworded = Some((at, level, now));
                 }
                 self.turn = None;
             }
@@ -2465,7 +2501,9 @@ mod tests {
             (TurnId(1), "book a table and a taxi to")
         );
 
-        // A sure Smart Turn does not hold.
+        // A sure Smart Turn holds a dangling word too: it hears sound, not words (live take
+        // 24: sure at a gap in "... the download numbers in the terminal?", the turn ended at
+        // "the"). The words that follow merge into the turn.
         let mut duplex = streaming();
         duplex.on_event(0, onset(0), &floor, false);
         duplex.on_event(
@@ -2474,8 +2512,85 @@ mod tests {
             &floor,
             false,
         );
-        let actions = duplex.on_stt(1_500, "book a table and", true, true, &floor, false);
-        assert_eq!(end_of_turn(&actions).text, "book a table and");
+        let held = duplex.on_stt(
+            1_500,
+            "can you get the download numbers in the",
+            true,
+            true,
+            &floor,
+            false,
+        );
+        assert_eq!(held, vec![]);
+        assert_eq!(duplex.next_wakeup(), Some(2_300));
+        assert_eq!(
+            duplex.on_stt(1_900, "terminal", false, false, &floor, false),
+            vec![]
+        );
+        let actions = duplex.on_stt(2_100, "terminal?", true, true, &floor, false);
+        assert_eq!(
+            end_of_turn(&actions).text,
+            "can you get the download numbers in the terminal?"
+        );
+        // Without more words it ends when the hold is over.
+        let mut duplex = streaming();
+        duplex.on_event(0, onset(0), &floor, false);
+        duplex.on_event(
+            1_120,
+            DuplexEvent::SmartTurn { at: 1_120, p: 0.9 },
+            &floor,
+            false,
+        );
+        assert_eq!(
+            duplex.on_stt(1_500, "book a table and", true, true, &floor, false),
+            vec![]
+        );
+        assert_eq!(
+            end_of_turn(&duplex.tick(2_300, &floor, false)).text,
+            "book a table and"
+        );
+    }
+
+    /// Live take 24 (28 Oct): "Yes. Go ahead." to a confirmation came from the speech-to-text
+    /// 2.6 s after the caller stopped. The turn of that sound had been closed at the silence
+    /// ceiling with no words; the words opened a turn with no onset, attributed medium, and
+    /// the yes did not bind. Words that come soon after are that sound's: its onset, high.
+    #[test]
+    fn late_words_keep_the_onset_of_the_sound_they_are() {
+        let floor = quiet();
+        let spoken = |duplex: &mut Duplex| {
+            duplex.on_event(1_000, onset(1_000), &floor, true);
+            duplex.on_event(
+                1_800,
+                DuplexEvent::Offset {
+                    at: 1_800,
+                    voiced_ms: 800,
+                },
+                &floor,
+                true,
+            );
+            duplex.on_event(
+                3_300,
+                DuplexEvent::Silence {
+                    at: 3_300,
+                    ms: 1_500,
+                },
+                &floor,
+                true,
+            );
+        };
+        let mut duplex = streaming();
+        spoken(&mut duplex);
+        let actions = duplex.on_stt(4_400, "Yes. Go ahead.", true, true, &floor, true);
+        let turn = end_of_turn(&actions);
+        assert_eq!(
+            (turn.attribution, turn.onset_at),
+            (Attribution::High, Some(1_000))
+        );
+        // Too late, or after another sound began, the words are a turn of their own.
+        let mut duplex = streaming();
+        spoken(&mut duplex);
+        let actions = duplex.on_stt(3_300 + LATE_WORDS_MS + 1, "Yes.", true, true, &floor, true);
+        assert_eq!(end_of_turn(&actions).attribution, Attribution::Medium);
     }
 
     /// A caller who spoke until `voiced_ms` and paused: the onset, the offset and, 200 ms into
@@ -2935,6 +3050,35 @@ mod tests {
                 .with_turn_end_on_claim(Some(200))
                 .with_provider_turns(true)
         ));
+        // Words that dangle are not claimed early, however sure Smart Turn is (live take 24:
+        // "... the download numbers in the" was claimed at a 200 ms gap, "terminal?" became a
+        // turn of its own).
+        let mut duplex = streaming().with_turn_end_on_claim(Some(200));
+        duplex.on_event(1_000, onset(1_000), &floor, false);
+        duplex.on_stt(
+            2_000,
+            "the download numbers in the",
+            false,
+            false,
+            &floor,
+            false,
+        );
+        duplex.on_event(
+            2_500,
+            DuplexEvent::Offset {
+                at: 2_500,
+                voiced_ms: 1_500,
+            },
+            &floor,
+            false,
+        );
+        let silence = DuplexEvent::Silence { at: 2_700, ms: 200 };
+        let mut actions = duplex.on_event(2_700, silence, &floor, false);
+        actions.extend(sure(&mut duplex, 2_800));
+        assert!(
+            !actions.contains(&DuplexAction::ClaimSegment),
+            "{actions:?}"
+        );
         // The claim's final (Finalize's, a speech-final) is E.
         let mut duplex = streaming().with_turn_end_on_claim(Some(200));
         assert!(claimed(&mut duplex));
