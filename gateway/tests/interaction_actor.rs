@@ -1502,14 +1502,19 @@ async fn scratch_that_follows_the_cut_of_an_amended_answer() {
 
 // ---- provider failures
 
+/// A line the voice could not give is reported to the client, once in a run of failures, and
+/// never said as a failed task: "Sorry, I couldn't get that done just now." is a task's
+/// failure, and the voice's own failure is the health watcher's to say (chapter 10). Live
+/// (launch demo take 22, 28 Oct): said for each failed line, the apology failed in turn and was
+/// said every 13 s for six minutes.
 #[tokio::test(start_paused = true)]
 #[serial]
-async fn a_tts_error_is_said_once_and_a_second_one_only_reported() {
+async fn a_tts_error_is_reported_once_a_run_and_never_said_as_a_failed_task() {
     let rig = Rig::start(Opts::default()).await;
     rig.ready().await;
     let sorry = "Sorry, I couldn't get that done just now.";
 
-    // The acknowledgement fails: the caller is told, and the answer is still relayed.
+    // The acknowledgement fails: the client is told, and the answer is still relayed.
     rig.llm.push(answer(2_500));
     rig.tts.fail_next(1);
     rig.turn("what time does the store open").await;
@@ -1518,40 +1523,23 @@ async fn a_tts_error_is_said_once_and_a_second_one_only_reported() {
     assert!(is_ack(&lines[0]), "{}", rig.timeline());
     // Its words went to the client although no audio came of them.
     assert_eq!(rig.heard(&lines[0]["utterance_id"]), "none");
-    assert_eq!(lines[1]["delta"], sorry);
-    assert!(rig.heard_in_full(sorry));
-    assert!(rig.events("error").is_empty(), "{}", rig.timeline());
-    rig.run(1_000).await;
-
-    // The acknowledgement and the apology both fail: no third try, the client gets an error.
-    let before = rig.wire().len();
-    rig.llm.push(answer(2_500));
-    rig.tts.fail_next(2);
-    rig.turn("and when does it close").await;
-    rig.until_event("error", 1).await;
-    rig.until_event("task_result", 2).await;
-    rig.run(6_000).await;
+    assert!(!rig.heard_in_full(sorry), "{}", rig.timeline());
+    assert!(lines.iter().all(|line| line["delta"] != sorry));
     let errors = rig.events("error");
     assert_eq!(errors.len(), 1, "{}", rig.timeline());
     assert_eq!(errors[0]["code"], "interaction_tts_failed");
-    let after: Vec<Value> = rig
-        .wire()
-        .split_off(before)
-        .into_iter()
-        .map(|(_, e)| e)
-        .collect();
-    let lines: Vec<&Value> = after
-        .iter()
-        .filter(|e| e["delta"].is_string() && e["delta"] != "")
-        .collect();
-    assert!(
-        is_ack(lines[0]) && lines[1]["delta"] == sorry,
-        "{}",
-        rig.timeline()
-    );
-    // The synthesis works again: the answer is spoken.
-    assert_eq!(lines[2]["delta"], "The store opens at nine.");
-    assert_eq!(rig.heard(&lines[2]["utterance_id"]), "full");
+    rig.run(1_000).await;
+
+    // Two lines fail in a row: one error for the run, no apology.
+    rig.llm.push(answer(2_500));
+    rig.tts.fail_next(2);
+    rig.turn("and when does it close").await;
+    rig.until_event("task_result", 2).await;
+    rig.run(6_000).await;
+    assert_eq!(rig.events("error").len(), 2, "{}", rig.timeline());
+    assert!(rig.lines().iter().all(|line| line["delta"] != sorry));
+    // The synthesis works again: the rest of the answer is spoken.
+    assert!(rig.heard_in_full("It closes at six."), "{}", rig.timeline());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1564,8 +1552,10 @@ async fn a_refused_speak_fails_the_utterance_too() {
     rig.tts.refuse_next(1);
     rig.turn("what time does the store open").await;
     rig.until_heard("It closes at six.").await;
-    assert!(rig.heard_in_full("Sorry, I couldn't get that done just now."));
-    assert!(rig.events("error").is_empty(), "{}", rig.timeline());
+    assert!(!rig.heard_in_full("Sorry, I couldn't get that done just now."));
+    let errors = rig.events("error");
+    assert_eq!(errors.len(), 1, "{}", rig.timeline());
+    assert_eq!(errors[0]["code"], "interaction_tts_failed");
 }
 
 #[tokio::test(start_paused = true)]

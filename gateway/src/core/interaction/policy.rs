@@ -930,10 +930,31 @@ impl Policy {
 
     // ---- settling a turn
 
-    fn end_of_turn(&mut self, now: Ms, eot: EndOfTurn, board: &Board, out: &mut Vec<PolicyAction>) {
+    fn end_of_turn(
+        &mut self,
+        now: Ms,
+        mut eot: EndOfTurn,
+        board: &Board,
+        out: &mut Vec<PolicyAction>,
+    ) {
         self.user_speaking = false;
         self.last_speech = now;
         self.caller_at = now;
+        // The caller went on before their last turn was decided, within `GOING_ON_MS` of its
+        // end: the pause was not the end of the turn, and this turn carries its words. Live
+        // (launch demo take 22, 28 Oct): "Great. Can you also get" ended at a pause (Smart
+        // Turn was sure), "the download numbers in the terminal?" came 0.3 s later as a turn
+        // of its own, and its words alone were read as a follow-up of the finished browser
+        // task: the browser agent was asked for "the download numbers in the terminal" and
+        // asked back which project was meant.
+        let onset = eot.onset_at.unwrap_or(eot.at);
+        if let Some(last) = self.turn.as_ref().filter(|last| !last.settled)
+            && last.id != eot.turn
+            && onset <= last.e + GOING_ON_MS
+            && !last.text.trim().is_empty()
+        {
+            eot.text = format!("{} {}", last.text.trim(), eot.text.trim());
+        }
         self.turn = Some(Turn {
             id: eot.turn,
             e: eot.at,
@@ -2585,7 +2606,6 @@ impl Policy {
             LaneEvent::Started { item, at, .. } => {
                 self.last_speech = at;
                 self.agent_at = at;
-                self.tts_failed = false;
                 if let Some(turn) = &mut self.turn {
                     turn.audible_by = None;
                 }
@@ -2599,6 +2619,9 @@ impl Policy {
                 }
             }
             LaneEvent::Heard { item, heard_at } => {
+                // A line heard to its end ends a run of synthesis failures (one that only
+                // started may still fail: live take 22, each line played and then failed).
+                self.tts_failed = false;
                 self.last_speech = now;
                 self.agent_at = now;
                 if let Some(repeat) = self.repeat.as_mut().filter(|repeat| repeat.item == item) {
@@ -2625,31 +2648,43 @@ impl Policy {
                 }
             }
             LaneEvent::Dropped {
+                item,
                 cause: CutCause::Failure,
                 ..
             } => {
-                // Once the caller is told; a second failure in a row only reaches the client.
-                if std::mem::replace(&mut self.tts_failed, true) {
+                // A line the voice could not give: the client is told, once in a run of
+                // failures; the caller hears the health watcher's line for the voice (chapter
+                // 10: a stall line when the next line does not succeed either), never "Sorry,
+                // I couldn't get that done just now.", which says a task failed. Live (launch
+                // demo take 22, 28 Oct): with the voice's completions lost after a refused
+                // flush, every line played and then failed on the floor's watchdog; each
+                // failure said that notice, the notice's own start ended the run of failures,
+                // and the notice failed in turn: it was said every 13 s for six minutes, and a
+                // confirmation's question was never heard.
+                if !std::mem::replace(&mut self.tts_failed, true) {
                     out.push(error("interaction_tts_failed", "speech synthesis failed"));
-                } else {
-                    let notice =
-                        self.utterance(Kind::Notice, RANK_RELAY, template("failure.retryable"));
-                    out.push(PolicyAction::Speak(notice));
                 }
+                self.unheard(now, item);
             }
             LaneEvent::Dropped { item, .. } | LaneEvent::Returned { item } => {
-                self.asked.retain(|asked| *asked != item);
-                if let Some(repeat) = self.repeat.as_mut().filter(|repeat| repeat.item == item) {
-                    // Cut by the caller, whose words are then the answer; else it waits as long.
-                    repeat.deadline = Some(now + Ms::from(self.cfg.hitl_answer_timeout_ms));
-                }
-                if let Some(asking) = &mut self.asking
-                    && asking.items.contains(&item)
-                {
-                    asking.reoffer = true;
-                }
+                self.unheard(now, item);
             }
             LaneEvent::Idle { .. } => {}
+        }
+    }
+
+    /// `item` never reached the caller in full: a question it asked is asked again, and an
+    /// open repeat question waits for its answer from now on.
+    fn unheard(&mut self, now: Ms, item: ItemId) {
+        self.asked.retain(|asked| *asked != item);
+        if let Some(repeat) = self.repeat.as_mut().filter(|repeat| repeat.item == item) {
+            // Cut by the caller, whose words are then the answer; else it waits as long.
+            repeat.deadline = Some(now + Ms::from(self.cfg.hitl_answer_timeout_ms));
+        }
+        if let Some(asking) = &mut self.asking
+            && asking.items.contains(&item)
+        {
+            asking.reoffer = true;
         }
     }
 
@@ -5818,8 +5853,58 @@ mod tests {
         ));
     }
 
+    /// Live (launch demo take 22, 28 Oct): "Great. Can you also get" ended at a pause and
+    /// "the download numbers in the terminal?" came 0.3 s later as a turn of its own, read
+    /// alone as a follow-up of the finished browser task. A turn the caller goes on with
+    /// before it is decided carries into the next.
     #[test]
-    fn a_tts_failure_is_said_once_and_a_second_in_a_row_only_reported() {
+    fn a_turn_the_caller_goes_on_with_before_it_is_decided_carries_into_the_next() {
+        let asked = |actions: &[PolicyAction]| {
+            actions.iter().find_map(|action| match action {
+                PolicyAction::RequestFront { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+        };
+        let board = Board::default();
+        let mut policy = policy();
+        let first = policy.step(10_000, says(3, 10_000, "Great. Can you also get"), &board);
+        assert_eq!(asked(&first).as_deref(), Some("Great. Can you also get"));
+        let mut next = turn(4, 10_300, "the download numbers in the terminal?");
+        next.onset_at = Some(10_050);
+        let actions = policy.step(10_300, PolicyInput::EndOfTurn(next), &board);
+        assert_eq!(
+            asked(&actions).as_deref(),
+            Some("Great. Can you also get the download numbers in the terminal?")
+        );
+        assert_eq!(
+            policy.turn.as_ref().map(|turn| turn.text.as_str()),
+            Some("Great. Can you also get the download numbers in the terminal?")
+        );
+
+        // A turn already decided, or one begun well after the last ended, stands alone.
+        let mut policy = self::policy();
+        policy.step(10_000, says(3, 10_000, "What time is it?"), &board);
+        policy.step(10_100, done(3, Act::Delegate), &board);
+        let mut next = turn(4, 10_600, "And in Tokyo?");
+        next.onset_at = Some(10_200);
+        let actions = policy.step(10_600, PolicyInput::EndOfTurn(next), &board);
+        assert_eq!(asked(&actions).as_deref(), Some("And in Tokyo?"));
+        let mut policy = self::policy();
+        policy.step(10_000, says(3, 10_000, "Great. Can you also get"), &board);
+        let mut late = turn(4, 14_000, "What's the weather?");
+        late.onset_at = Some(12_000);
+        let actions = policy.step(14_000, PolicyInput::EndOfTurn(late), &board);
+        assert_eq!(asked(&actions).as_deref(), Some("What's the weather?"));
+    }
+
+    /// Live (launch demo take 22, 28 Oct): with the voice's completions lost, every line
+    /// played and then failed on the floor's watchdog, each failure said "Sorry, I couldn't
+    /// get that done just now.", and that notice, which started and then failed too, said it
+    /// again: every 13 s for six minutes. A line the voice could not give is reported to the
+    /// client once in a run of failures and never said as a failed task (the health watcher
+    /// speaks for the voice); only a line heard to its end ends the run.
+    #[test]
+    fn a_tts_failure_is_reported_once_and_never_said_as_a_failed_task() {
         let mut policy = policy();
         let board = Board::default();
         let failed = |item| {
@@ -5829,25 +5914,35 @@ mod tests {
                 cause: CutCause::Failure,
             })
         };
-        let actions = policy.step(1_000, failed(1), &board);
-        assert_eq!(
-            words(&actions),
-            ["Sorry, I couldn't get that done just now."]
-        );
-        let notice = spoken(&actions)[0].item;
-        let actions = policy.step(1_500, failed(notice.0), &board);
-        assert!(matches!(
-            &actions[..],
-            [PolicyAction::Emit(WireEvent::Error { code, .. })] if code == "interaction_tts_failed"
-        ));
-        // Speech that plays ends the run of failures.
-        let started = LaneEvent::Started {
-            item: ItemId(9),
-            utt: UttId(3),
-            at: 2_000,
+        let reported = |actions: &[PolicyAction]| {
+            matches!(
+                actions,
+                [PolicyAction::Emit(WireEvent::Error { code, .. })] if code == "interaction_tts_failed"
+            )
         };
-        policy.step(2_000, PolicyInput::Lane(started), &board);
-        assert_eq!(spoken(&policy.step(3_000, failed(10), &board)).len(), 1);
+        let actions = policy.step(1_000, failed(1), &board);
+        assert!(reported(&actions), "{actions:?}");
+        assert!(spoken(&actions).is_empty(), "{actions:?}");
+        // A line that starts and fails again is the same run: nothing more.
+        let started = |item, at| {
+            PolicyInput::Lane(LaneEvent::Started {
+                item: ItemId(item),
+                utt: UttId(item),
+                at,
+            })
+        };
+        policy.step(2_000, started(2, 2_000), &board);
+        assert!(policy.step(12_000, failed(2), &board).is_empty());
+        // A line heard to its end ends the run.
+        policy.step(13_000, started(3, 13_000), &board);
+        let heard = LaneEvent::Heard {
+            item: ItemId(3),
+            heard_at: 14_000,
+        };
+        policy.step(14_000, PolicyInput::Lane(heard), &board);
+        let actions = policy.step(15_000, failed(4), &board);
+        assert!(reported(&actions), "{actions:?}");
+        assert!(spoken(&actions).is_empty());
     }
 
     #[test]
