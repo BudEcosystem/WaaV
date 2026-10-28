@@ -237,29 +237,18 @@ POST https://tts.intl.tencentcloudapi.com
 | 2 | 1.5x |
 | 6 | 2.5x |
 
-**Standard Voices (VoiceType):**
+**Voices (VoiceType)**, as Tencent's SDKs list them (`TextToVoiceRequest.VoiceType`, intl and
+China; the full list with genders is Tencent's voice list page):
 
-| ID | Name | Gender | Language |
-|----|------|--------|----------|
-| 1001 | Intelligent Woman | Female | Chinese |
-| 1002 | Intelligent Man | Male | Chinese |
-| 1003 | Mature Man | Male | Chinese |
-| 1050 | WeChat Xiaowei | Female | Chinese |
-| 1051 | WeChat Xiaowei (Female) | Female | Chinese |
+- Standard: 10510000 zhixiaoyao, 1001 zhiyu, 1002 zhiling, 1003 zhimei, 1004 zhiyun, 1005 zhili,
+  1008 zhiqi, 1009 zhiyun, 1010 zhihua, 1017 zhirong, 1018 zhijing, 1050 WeJack (English),
+  1051 WeRose (English).
+- Premium: 100510000 zhixiaoyao, 101001–101035 (101019 zhitong is Cantonese), 101040 zhichuan
+  (Sichuan dialect), 101050 WeJack (English), 101051 WeRose (English), 101052–101056.
 
-**Premium Voices (VoiceType):**
-
-| ID | Name | Gender | Language |
-|----|------|--------|----------|
-| 101001 | Intelligent Woman Premium | Female | Chinese |
-| 101002 | Intelligent Man Premium | Male | Chinese |
-| 101003 | Customer Service Female | Female | Chinese |
-| 101004 | Customer Service Male | Male | Chinese |
-| 101005 | News Female | Female | Chinese |
-| 101006 | News Male | Male | Chinese |
-| 101015 | Cantonese Female | Female | Cantonese |
-| 101016 | Cantonese Male | Male | Cantonese |
-| 101017 | Sichuan Dialect | Female | Sichuan |
+The gateway's default is **1001** (zhiyu, standard). The original basic voices (IDs 0–6, the
+provider's `friendly_female` … `emotional_male`) are no longer on Tencent's list; one named
+explicitly is still sent as given. An unknown voice name gets the default, with a warning.
 | 101050 | English Female | Female | English |
 | 101051 | English Male | Male | English |
 

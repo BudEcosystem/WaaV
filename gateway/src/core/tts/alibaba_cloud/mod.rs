@@ -84,13 +84,16 @@
 //!
 //! ## CosyVoice Voices
 //!
-//! | Voice | Language | Description |
-//! |-------|----------|-------------|
-//! | `longxiaochun` | Chinese | Default female voice |
-//! | `longxiaoxia` | Chinese | Female voice |
-//! | `longlaotie` | Chinese | Male voice |
-//! | `longshu` | Chinese | Male voice |
-//! | `longwan` | Chinese | Female voice |
+//! CosyVoice v2 and v3 name their voices with the model's suffix (`longxiaochun_v3` for
+//! `cosyvoice-v3-flash`, `longxiaochun_v2` for `cosyvoice-v2`); v1's unsuffixed names are sent as
+//! their successor. A session that names no voice gets the model's default in its region:
+//!
+//! | Model | Default voice |
+//! |-------|---------------|
+//! | `cosyvoice-v3-flash` | `longxiaochun_v3` (Beijing), `longwan_v3` (Singapore) |
+//! | `cosyvoice-v3-plus` | `longanhuan` (it has two voices, with `longanyang`) |
+//! | `cosyvoice-v2` | `longxiaochun_v2` |
+//! | `qwen3-tts-flash-realtime` | `Cherry` |
 //!
 //! ## Qwen3 TTS Voices
 //!
@@ -226,7 +229,7 @@ mod tests {
     fn test_supported_voices() {
         let voices = DashScopeTtsConfig::supported_voices();
         assert!(voices.len() >= 10);
-        assert!(voices.contains(&"longxiaochun"));
+        assert!(voices.contains(&"longxiaochun_v3"));
         assert!(voices.contains(&"Cherry"));
     }
 

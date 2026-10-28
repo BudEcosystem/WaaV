@@ -771,6 +771,21 @@ mod tests {
         assert!(payload["Codec"].is_string());
     }
 
+    /// A session that names no voice sends a VoiceType on Tencent's current list (1001), not the
+    /// retired basic voice 0; one named explicitly is sent as given.
+    #[test]
+    fn the_default_voice_type_is_one_tencent_lists() {
+        let mut config = create_test_config();
+        config.voice_id = None;
+        let payload = TencentTts::new(config).unwrap().build_payload("Hi");
+        assert_eq!(payload["VoiceType"], 1001);
+
+        let mut config = create_test_config();
+        config.voice_id = Some("101016".to_string());
+        let payload = TencentTts::new(config).unwrap().build_payload("Hi");
+        assert_eq!(payload["VoiceType"], 101016);
+    }
+
     // WIRE-LEVEL: the TextToVoice synthesis knobs (ModelType / FastVoiceType / SegmentRate) sourced
     // from `extras` must reach the actual request BODY (`build_payload`), not merely the config
     // struct — the recurring "config set but never serialized" bug class. Asserts the JSON the
