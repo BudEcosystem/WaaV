@@ -1756,11 +1756,25 @@ impl Policy {
             let agent = view.and_then(|view| view.lineage.agent.as_ref());
             agent.is_some_and(|agent| self.single_calls.contains(agent))
         };
+        // Words that name another agent of the session are a request for that agent's work,
+        // not more of the finished task's: the orchestrator places them (live take 23).
+        let elsewhere = |task: &TaskRef| {
+            let view = done.iter().find(|view| view.task_ref == *task);
+            let named = view.and_then(|view| {
+                let agent = view.lineage.agent.as_deref()?;
+                rules::other_agent_named(&text, agent, &view.title, &self.agent_topics)
+            });
+            if let Some(other) = named {
+                tracing::debug!(task = %task.0, other, "interaction follow-up names another agent");
+            }
+            named.is_some()
+        };
         let follow = match act {
             Act::FollowUp => named
                 .filter(|task| done.iter().any(|view| view.task_ref == *task))
                 .or_else(|| last.clone())
-                .filter(|task| !single(task)),
+                .filter(|task| !single(task))
+                .filter(|task| !elsewhere(task)),
             _ => None,
         };
         if let Some(task) = follow {
@@ -7732,6 +7746,66 @@ mod tests {
         let board = parcel(2_000);
         let actions = decided(&mut policy, 1, 12_000, words, &board, delegate);
         assert_eq!(settled(&actions).0, Act::Delegate, "{actions:?}");
+    }
+
+    /// Live take 23 of the launch demo (28 Oct): "Great. Can you also get the download numbers
+    /// in the terminal?" after the browser's release check was a follow-up of it (the reading
+    /// apart had no label in time). Words that name another agent of the session are a new
+    /// request, not read apart.
+    #[test]
+    fn a_follow_up_that_names_another_agent_is_a_new_request() {
+        let modelled = |turn: u64| {
+            PolicyInput::Front(FrontEvent::Done {
+                turn: TurnId(turn),
+                decision: ActDecision {
+                    task: Some(TaskRef("t2".to_owned())),
+                    say: Some("Okay, let me check.".to_owned()),
+                    source: ActSource::Model,
+                    ..decision(Act::FollowUp)
+                },
+            })
+        };
+        let topics = vec![
+            (
+                "browser".to_owned(),
+                "Operates airline websites and books flights.".to_owned(),
+            ),
+            (
+                "terminal".to_owned(),
+                "Runs shell commands: downloads and verifies files.".to_owned(),
+            ),
+        ];
+        let mut policy = policy();
+        let board = booked(&mut policy);
+        policy.reader = None;
+        policy.set_agent_topics(topics.clone());
+        let words = "Great. Can you also get the download numbers in the terminal?";
+        policy.step(10_000, says(3, 10_000, words), &board);
+        let actions = policy.step(10_000, modelled(3), &board);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, PolicyAction::Read(_))),
+            "{actions:?}"
+        );
+        assert_eq!(settled(&actions).0, Act::Delegate, "{actions:?}");
+        assert!(
+            commands(&actions)
+                .iter()
+                .any(|cmd| matches!(cmd, TaskCmd::Delegate { .. })),
+            "{actions:?}"
+        );
+        // A question about the finished task itself is still read apart.
+        let mut policy = self::policy();
+        let board = booked(&mut policy);
+        policy.reader = None;
+        policy.set_agent_topics(topics);
+        policy.step(20_000, says(4, 20_000, "Which seat did I get?"), &board);
+        let actions = policy.step(20_000, modelled(4), &board);
+        assert!(
+            matches!(actions[..], [PolicyAction::Read(_)]),
+            "{actions:?}"
+        );
     }
 
     /// Live rehearsal 1 of the launch demo (28 Oct): after the browser's release check every

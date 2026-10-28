@@ -5032,6 +5032,10 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
     /// What the launch demo's browser agent says it does (rehearsal 1, 28 Oct).
     const DESK_BROWSER: &str = "Operates a real web browser: opens pages, reads them, follows links, \
         and reports what it found.";
+    const DESK_TERMINAL: &str = "Runs shell commands on a sandboxed Linux machine with internet \
+        access: downloads, verifies checksums, unpacks, starts and health-checks programs.";
+    const DESK_WRITER: &str = "Drafts documents such as announcements, emails and notes, and saves \
+        them in the word processor on the caller's screen after the caller approves.";
     const RELEASE_TITLE: &str = "Check the GitHub release: Open";
     const RELEASE_SAID: &str = "The GitHub release for version 1.1.0 is published as Latest. The \
         details are on your screen.";
@@ -5140,7 +5144,15 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
             .ok()
             .and_then(|rounds| rounds.parse().ok())
             .unwrap_or(10);
-        let (mut right, mut decided_right, mut total) = (0, 0, 0);
+        let (mut right, mut decided_right, mut guarded_right, mut total) = (0, 0, 0, 0);
+        let desk: Vec<(String, String)> = [
+            ("browser", DESK_BROWSER),
+            ("terminal", DESK_TERMINAL),
+            ("writer", DESK_WRITER),
+        ]
+        .into_iter()
+        .map(|(name, what)| (name.to_owned(), what.to_owned()))
+        .collect();
         for (said, text, working, meant) in FINISHED_GATE {
             let mut release = task("t3", TaskState::Completed, RELEASE_TITLE, 27_000);
             release.lineage.agent = Some("browser".to_owned());
@@ -5156,9 +5168,18 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
             request.said = said.iter().map(|line| (*line).to_owned()).collect();
             let read = labels_read(&server, &persona, &request, rounds).await;
             let follows = read.get("follow_up").copied().unwrap_or(0);
+            // Words that name another agent are a new request, unread (the policy's guard);
+            // `guarded`: what the turn comes to when the reading apart has no label in time.
+            let mut guarded = read.clone();
+            let elsewhere =
+                rules::other_agent_named(text, "browser", RELEASE_TITLE, &desk).is_some();
+            if follows > 0 && elsewhere {
+                guarded.remove("follow_up");
+                *guarded.entry("delegate".to_owned()).or_insert(0) += follows;
+            }
             // The policy reads a follow-up apart (temperature 0: once for all of them).
-            let mut settled = read.clone();
-            if follows > 0 {
+            let mut settled = guarded.clone();
+            if follows > 0 && !elsewhere {
                 let reading = follows_reading(RELEASE_TITLE, Some(DESK_BROWSER), text);
                 let label = super::read(&server, &reading, Duration::from_secs(5)).await;
                 let act = match label.as_deref() {
@@ -5180,6 +5201,7 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
             let (good_settled, good_decided) = (good(&settled), good(&read));
             right += good_settled;
             decided_right += good_decided;
+            guarded_right += good(&guarded);
             total += rounds;
             println!(
                 "{text:?} working={} -> decided {read:?}, settled {settled:?} (right \
@@ -5188,7 +5210,8 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
             );
         }
         println!(
-            "finished-task gate: settled {right} of {total}, decided {decided_right} of {total}"
+            "finished-task gate: settled {right} of {total}, decided {decided_right} of \
+             {total}, without the reading {guarded_right} of {total}"
         );
     }
 
