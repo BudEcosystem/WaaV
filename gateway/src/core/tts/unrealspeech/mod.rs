@@ -19,7 +19,7 @@
 //!
 //! let config = TTSConfig {
 //!     api_key: "your-api-key".to_string(),
-//!     voice_id: Some("Scarlett".to_string()),
+//!     voice_id: Some("Sierra".to_string()),
 //!     ..Default::default()
 //! };
 //!
@@ -63,8 +63,8 @@ pub const MAX_SPEECH_TEXT_LENGTH: usize = 3000;
 /// Maximum text length for /synthesisTasks endpoint
 pub const MAX_SYNTHESIS_TEXT_LENGTH: usize = 500000;
 
-/// Default voice ID
-pub const DEFAULT_VOICE_ID: &str = "Scarlett";
+/// Default voice ID: the voice Unreal's V8 documentation uses in its examples.
+pub const DEFAULT_VOICE_ID: &str = "Sierra";
 
 /// Default bitrate
 pub const DEFAULT_BITRATE: &str = "192k";

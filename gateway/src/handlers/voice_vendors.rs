@@ -8,7 +8,7 @@
 //! resolver four, the deployment catalog two. [`CatalogVendor`] is now the only list.
 //!
 //! A vendor is here when it publishes a voice-list API WaaV can call, or when its voices are a
-//! fixed, documented set (OpenAI, Speechmatics). Vendors whose code carries only a sample of their
+//! fixed, documented set (OpenAI, Speechmatics, Unreal Speech). Vendors whose code carries only a sample of their
 //! voices are left out rather than published as if complete.
 
 use std::time::Duration;
@@ -67,10 +67,11 @@ pub(crate) enum CatalogVendor {
     Smallest,
     IbmWatson,
     AwsPolly,
+    UnrealSpeech,
 }
 
 impl CatalogVendor {
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::ElevenLabs,
         Self::Deepgram,
         Self::Google,
@@ -86,6 +87,7 @@ impl CatalogVendor {
         Self::Smallest,
         Self::IbmWatson,
         Self::AwsPolly,
+        Self::UnrealSpeech,
     ];
 
     /// The key this vendor's voices appear under in `GET /voices`.
@@ -106,6 +108,7 @@ impl CatalogVendor {
             Self::Smallest => "smallest",
             Self::IbmWatson => "ibm_watson",
             Self::AwsPolly => "aws_polly",
+            Self::UnrealSpeech => "unrealspeech",
         }
     }
 
@@ -127,6 +130,7 @@ impl CatalogVendor {
             "smallest" | "smallest_ai" | "smallest-ai" | "smallest.ai" | "waves" => Self::Smallest,
             "ibm_watson" | "ibm-watson" | "ibm" | "watson" => Self::IbmWatson,
             "aws_polly" | "aws-polly" | "amazon-polly" | "polly" => Self::AwsPolly,
+            "unrealspeech" | "unreal_speech" | "unreal-speech" => Self::UnrealSpeech,
             _ => return None,
         })
     }
@@ -195,6 +199,7 @@ impl CatalogVendor {
             Self::Speechify => env_key("SPEECHIFY_API_KEY"),
             Self::Resemble => env_key("RESEMBLE_API_KEY"),
             Self::WellSaid => env_key("WELLSAID_API_KEY"),
+            Self::UnrealSpeech => env_key("UNREALSPEECH_API_KEY"),
             Self::Smallest => None,
         }
     }
@@ -247,6 +252,7 @@ impl CatalogVendor {
             Self::OpenAi => Ok(openai_voices()),
             Self::Hume => fetch_hume_voices(key).await,
             Self::Speechmatics => Ok(speechmatics_voices()),
+            Self::UnrealSpeech => Ok(unrealspeech_voices()),
             Self::Murf => crate::core::tts::murf::MurfTts::list_voices(key)
                 .await
                 .map(|voices| voices.into_iter().map(voice_from_murf).collect())
@@ -403,7 +409,7 @@ async fn fetch_cartesia_voices(key: &str) -> Result<Vec<Voice>, String> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// OpenAI and Speechmatics — fixed, documented sets
+// OpenAI, Speechmatics and Unreal Speech — fixed, documented sets
 // ---------------------------------------------------------------------------------------------
 
 fn openai_voices() -> Vec<Voice> {
@@ -436,6 +442,26 @@ fn speechmatics_voices() -> Vec<Voice> {
                 description: v.description().to_string(),
                 ..Default::default()
             }
+        })
+        .collect()
+}
+
+/// Unreal Speech's V8 voices: the API has no list endpoint, and its documentation names each
+/// voice with a gender and a language.
+fn unrealspeech_voices() -> Vec<Voice> {
+    crate::core::tts::unrealspeech::V8_VOICES
+        .iter()
+        .map(|(id, gender, lang)| Voice {
+            id: id.to_string(),
+            name: id.to_string(),
+            gender: gender.to_string(),
+            language: language_code_to_name(lang),
+            accent: if lang.contains('-') {
+                extract_accent_from_code(lang)
+            } else {
+                String::new()
+            },
+            ..Default::default()
         })
         .collect()
 }
@@ -899,6 +925,20 @@ mod tests {
         let sm = speechmatics_voices();
         assert_eq!(sm.len(), 4);
         assert!(sm.iter().any(|v| v.id == "megan" && v.accent == "American"));
+        let unreal = unrealspeech_voices();
+        assert_eq!(
+            unreal.len(),
+            crate::core::tts::unrealspeech::V8_VOICES.len()
+        );
+        assert!(unreal.iter().any(|v| v.id == "Sierra"
+            && v.gender == "female"
+            && v.language == "English"
+            && v.accent == "American"));
+        assert!(
+            unreal
+                .iter()
+                .any(|v| v.id == "Arjun" && v.language == "Hindi" && v.accent.is_empty())
+        );
     }
 
     #[test]

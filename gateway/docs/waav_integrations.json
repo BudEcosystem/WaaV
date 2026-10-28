@@ -463,7 +463,7 @@
       "name": "Unreal Speech",
       "website": "https://unrealspeech.com",
       "regions": ["Global", "US"],
-      "languages": "8 languages (American English, British English, French, Hindi, Spanish, Japanese, Chinese, Portuguese) with 48 Kokoro voices + 5 legacy voices",
+      "languages": "7 languages (American English, Chinese, Spanish, French, Hindi, Italian, Portuguese) with 38 documented V8 voices",
       "api_documentation": "https://docs.unrealspeech.com",
       "api_documentation_v8": "https://docs.v8.unrealspeech.com",
       "pricing_page": "https://unrealspeech.com/pricing",
@@ -475,12 +475,12 @@
         "Low latency: 0.3s streaming latency",
         "High volume: Up to 500,000 chars per request, 10 hours audio",
         "Per-word timestamps for lip-sync and captions",
-        "48 Kokoro voices + 5 legacy voices",
+        "38 documented V8 voices (V7 ids mapped to a V8 voice of the same gender)",
         "99.9% uptime"
       ],
       "models": {
-        "kokoro": "v8 API - 82M parameter model, 48 voices, 8 languages",
-        "legacy": "Original 5 English voices (Scarlett, Dan, Will, Liv, Amy)"
+        "v8": "V8 API (api.v8.unrealspeech.com): 38 documented voices, 7 languages",
+        "v7_ids": "V7's 5 voices (Scarlett, Dan, Will, Liv, Amy) are not V8 voices; WaaV maps them to Sierra, Noah, Daniel, Hannah, Emily"
       },
       "endpoints": {
         "stream": "/stream - Up to 1,000 chars, 0.3s latency, raw audio",
@@ -502,16 +502,21 @@
       },
       "audio_formats": ["MP3 (libmp3lame)", "PCM (pcm_mulaw)"],
       "parameters": {
-        "bitrate": "16k-320k (default 192k)",
+        "bitrate": "16k, 32k, 48k, 64k, 128k, 192k (default), 256k, 320k",
         "speed": "-1.0 to 1.0 (default 0)",
         "pitch": "0.5 to 1.5 (default 1.0)",
         "sample_rate": "24000 Hz",
         "timestamp_type": "word, sentence"
       },
       "voice_ids": {
-        "legacy": ["Scarlett", "Dan", "Will", "Liv", "Amy"],
-        "kokoro_american": ["af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky", "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael", "am_onyx", "am_puck", "am_santa"],
-        "kokoro_british": ["bf_emma", "bf_isabella", "bm_george", "bm_lewis"]
+        "american_female": ["Autumn", "Melody", "Hannah", "Emily", "Ivy", "Kaitlyn", "Luna", "Willow", "Lauren", "Sierra"],
+        "american_male": ["Noah", "Jasper", "Caleb", "Ronan", "Ethan", "Daniel", "Zane"],
+        "chinese": ["Mei", "Lian", "Ting", "Jing", "Wei", "Jian", "Hao", "Sheng"],
+        "spanish": ["Lucía", "Mateo", "Javier"],
+        "french": ["Élodie"],
+        "hindi": ["Ananya", "Priya", "Arjun", "Rohan"],
+        "italian": ["Giulia", "Luca"],
+        "portuguese": ["Camila", "Thiago", "Rafael"]
       }
     },
     {

@@ -108,11 +108,11 @@ impl TTSRequestBuilder for UnrealSpeechRequestBuilder {
 /// # Features
 ///
 /// - **Ultra-low latency**: ~300ms time-to-first-audio
-/// - **Standard voices**: Scarlett, Liv, Amy, Dan, Will
-/// - **Kokoro V8 voices**: af, af_bella, am_adam, bf_emma, bm_george, etc.
+/// - **V8 voices**: the 38 Unreal documents ([`super::config::V8_VOICES`]); V7's ids (Scarlett, Liv,
+///   Amy, Dan, Will) become a V8 voice of the same gender
 /// - **Speed control**: -1.0 to 1.0
 /// - **Pitch control**: 0.5 to 1.5
-/// - **Bitrate options**: 16k to 320k
+/// - **Bitrate options**: 16k to 320k (incl. 48k)
 /// - **Cost-effective**: Up to 90% cheaper than competitors
 ///
 /// # Example
@@ -123,7 +123,7 @@ impl TTSRequestBuilder for UnrealSpeechRequestBuilder {
 ///
 /// let config = TTSConfig {
 ///     api_key: "your-api-key".to_string(),
-///     voice_id: Some("Scarlett".to_string()),
+///     voice_id: Some("Sierra".to_string()),
 ///     ..Default::default()
 /// };
 ///
@@ -276,7 +276,7 @@ impl BaseTTS for UnrealSpeechTts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::tts::unrealspeech::{UnrealSpeechBitrate, UnrealSpeechVoice};
+    use crate::core::tts::unrealspeech::UnrealSpeechBitrate;
 
     // W1 keystone: the standardized dispatch path reaches the provider STRUCT's `from_standard`,
     // building the real provider with the mapped speed offset + pitch multiplier (plus the bitrate
@@ -290,7 +290,7 @@ mod tests {
             base: TTSConfig {
                 provider: "unrealspeech".into(),
                 api_key: "test-key".into(),
-                voice_id: Some("Dan".into()),
+                voice_id: Some("Noah".into()),
                 ..Default::default()
             },
             features: TtsFeatures {
@@ -308,14 +308,14 @@ mod tests {
             tts.unrealspeech_config().bitrate,
             UnrealSpeechBitrate::Bitrate320k
         );
-        assert_eq!(tts.unrealspeech_config().voice, UnrealSpeechVoice::Dan);
+        assert_eq!(tts.unrealspeech_config().voice.as_str(), "Noah");
     }
 
     #[test]
     fn invalid_unrealspeech_api_key_header_value_is_request_build_error() {
         let config = TTSConfig {
             api_key: "bad\nkey".to_string(),
-            voice_id: Some("Dan".to_string()),
+            voice_id: Some("Noah".to_string()),
             ..Default::default()
         };
         let unrealspeech_config = UnrealSpeechTtsConfig::from_base(&config).unwrap();
@@ -336,7 +336,7 @@ mod tests {
         let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
             provider: "unrealspeech".into(),
             api_key: "test-key".into(),
-            voice_id: Some("Dan".into()),
+            voice_id: Some("Noah".into()),
             ..Default::default()
         })
         .with_endpoint_override("http://127.0.0.1:9000");
@@ -354,7 +354,7 @@ mod tests {
         // With API key
         let config = TTSConfig {
             api_key: "test-api-key".to_string(),
-            voice_id: Some("Scarlett".to_string()),
+            voice_id: Some("Sierra".to_string()),
             ..Default::default()
         };
 
@@ -362,7 +362,7 @@ mod tests {
         assert!(tts.is_ok());
 
         let tts = tts.unwrap();
-        assert_eq!(tts.unrealspeech_config().voice, UnrealSpeechVoice::Scarlett);
+        assert_eq!(tts.unrealspeech_config().voice.as_str(), "Sierra");
         assert!(!tts.is_ready());
     }
 
@@ -383,7 +383,7 @@ mod tests {
     fn test_request_builder_headers() {
         let config = TTSConfig {
             api_key: "test-key".to_string(),
-            voice_id: Some("Dan".to_string()),
+            voice_id: Some("Noah".to_string()),
             audio_format: Some("mp3".to_string()),
             ..Default::default()
         };
@@ -407,10 +407,7 @@ mod tests {
         let unrealspeech_config = UnrealSpeechTtsConfig::from_base(&config).unwrap();
         let builder = UnrealSpeechRequestBuilder::new(unrealspeech_config, config);
 
-        assert_eq!(
-            builder.unrealspeech_config().voice,
-            UnrealSpeechVoice::AfBella
-        );
+        assert_eq!(builder.unrealspeech_config().voice.as_str(), "af_bella");
     }
 
     #[test]
@@ -428,7 +425,8 @@ mod tests {
 
         // Verify JSON structure (PascalCase field names for Unreal Speech API)
         assert!(json.contains("\"Text\":\"Hello world\""));
-        assert!(json.contains("\"VoiceId\":\"Will\""));
+        // V7's "Will" is not a V8 voice: it goes out as V8's male "Daniel".
+        assert!(json.contains("\"VoiceId\":\"Daniel\""));
         assert!(json.contains("\"Bitrate\":\"192k\""));
         assert!(json.contains("\"Speed\":0"));
         assert!(json.contains("\"Pitch\":1"));
@@ -441,7 +439,7 @@ mod tests {
 
         let config = TTSConfig {
             api_key: "test-key".to_string(),
-            voice_id: Some("Scarlett".to_string()),
+            voice_id: Some("Sierra".to_string()),
             pronunciations: vec![
                 Pronunciation {
                     word: "API".to_string(),
@@ -465,7 +463,7 @@ mod tests {
     async fn test_unrealspeech_tts_connect_disconnect() {
         let config = TTSConfig {
             api_key: "test-key".to_string(),
-            voice_id: Some("Scarlett".to_string()),
+            voice_id: Some("Sierra".to_string()),
             ..Default::default()
         };
 
@@ -490,7 +488,7 @@ mod tests {
     async fn test_unrealspeech_tts_speak_not_connected() {
         let config = TTSConfig {
             api_key: "test-key".to_string(),
-            voice_id: Some("Scarlett".to_string()),
+            voice_id: Some("Sierra".to_string()),
             ..Default::default()
         };
 
@@ -511,7 +509,7 @@ mod tests {
     async fn test_unrealspeech_tts_empty_text() {
         let config = TTSConfig {
             api_key: "test-key".to_string(),
-            voice_id: Some("Scarlett".to_string()),
+            voice_id: Some("Sierra".to_string()),
             ..Default::default()
         };
 
@@ -532,7 +530,7 @@ mod tests {
     async fn test_unrealspeech_tts_text_too_long() {
         let config = TTSConfig {
             api_key: "test-key".to_string(),
-            voice_id: Some("Scarlett".to_string()),
+            voice_id: Some("Sierra".to_string()),
             ..Default::default()
         };
 
@@ -557,7 +555,7 @@ mod tests {
     fn test_default_streaming_url() {
         let config = TTSConfig {
             api_key: "test-key".to_string(),
-            voice_id: Some("Scarlett".to_string()),
+            voice_id: Some("Sierra".to_string()),
             ..Default::default()
         };
 
@@ -577,7 +575,7 @@ mod tests {
         };
 
         let tts = UnrealSpeechTts::new(config).unwrap();
-        assert_eq!(tts.unrealspeech_config().voice, UnrealSpeechVoice::AmAdam);
+        assert_eq!(tts.unrealspeech_config().voice.as_str(), "am_adam");
         assert_eq!(
             tts.unrealspeech_config().bitrate,
             UnrealSpeechBitrate::Bitrate192k
