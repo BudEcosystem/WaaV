@@ -1,0 +1,38 @@
+[
+ {
+  "label": "open",
+  "text": "Morning, Ava! Can you pull up the GitHub release for WaaV one point one and check it all looks right?",
+  "start": 1.06,
+  "end": 6.23
+ },
+ {
+  "label": "chat",
+  "text": "Thanks. Remind me, how many speech vendors do we support now?",
+  "start": 37.026,
+  "end": 40.456
+ },
+ {
+  "label": "numbers",
+  "text": "Great. Can you also get the download numbers in the terminal?",
+  "start": 54.084,
+  "end": 57.1
+ },
+ {
+  "label": "draft",
+  "text": "Nice. Can you draft the launch announcement now, with those numbers in it?",
+  "start": 92.046,
+  "end": 95.88
+ },
+ {
+  "label": "yes",
+  "text": "Yes, go ahead.",
+  "start": 139.284,
+  "end": 140.145
+ },
+ {
+  "label": "thanks",
+  "text": "Perfect, that's everything. Thanks, Ava!",
+  "start": 157.983,
+  "end": 160.204
+ }
+]

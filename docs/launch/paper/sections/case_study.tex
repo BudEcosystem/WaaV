@@ -1,0 +1,80 @@
+\section{Case Study: A Voice Coworker That Uses a Computer}\label{sec:case}
+
+The benchmarks measure turns and tool calls one at a time. Our launch demonstration asks what interaction mode
+is for: a conversation with an agent that does real work on a computer while the conversation goes on, the way
+one works with a colleague, asking for one thing, chatting, asking for the next, and approving what changes
+something. We recorded it in one take, with no edits to what was said or done.
+
+\paragraph{The set-up.} The session's background is Claude Opus~5.5 as an orchestrator, with three agents
+registered as the operator's webhook backends (the settings \texttt{tasks.orchestrator} and
+\texttt{interaction.task\_backends}):
+\begin{itemize}
+\item \textbf{browser}: a Claude Opus~5.5 tool loop driving a visible Chromium window through Playwright (open a
+page, follow a link, read the page while scrolling through it, highlight what it found);
+\item \textbf{terminal}: a Claude Opus~5.5 tool loop that types commands into a visible terminal (a tmux session in
+an xterm) and reads their output;
+\item \textbf{writer}: a Claude Opus~5.5 tool loop that types a draft into LibreOffice Writer and, after the caller
+approves, saves it.
+\end{itemize}
+The agents run on a sandboxed Linux desktop (a container with a 1920$\times$1080 virtual screen, no access to the
+host's files or local services, and internet access), whose screen is recorded. Their actions are paced for a
+person to follow: keys are typed one at a time (25--60\,ms apart in the terminal, 16\,ms in Writer), and the
+browser's pointer glides to a link before it clicks; the work itself is real. Each agent reports progress,
+questions and results with the signed webhook protocol of Section~\ref{sec:system}; the save is a side effect, so
+it is read back to the caller and needs a spoken yes. The caller's voice is synthesised (ElevenLabs) before the
+call and each line is said when the call reaches the moment it is written for, the ``yes'' only after the
+read-back has been heard and the agent has stopped talking. Speech recognition and the agent's voice are
+Deepgram (Aura-2 ``juno''); the front model is Qwen3.5-2B on the same GPU. The take ran on a build of the gateway
+with the fixes described below (PR~\#49 on the project's repository), not on release 1.1.0, and with
+\texttt{failure.stall\_after\_ms} raised from 2.5 to 8\,s, an operator setting for a cloud planner that takes a few
+seconds before its first word.
+
+\paragraph{What happens.} Times are seconds from the start of the call; reply latencies are measured on the
+recording from the caller's last voiced sound.
+\begin{itemize}
+\item \textbf{1.1--6.2\,s.} ``Morning, Ava! Can you pull up the GitHub release for WaaV one point one and check it all
+looks right?'' The agent acknowledges (``Let me look into that.'') 1.8\,s after the caller stops; the orchestrator
+starts the browser at 10.3\,s and says what it is doing (``I'm pulling up the version one point one release on
+GitHub now to check it over.'').
+\item \textbf{10.3--26.3\,s.} The browser opens the release page, scrolls through it and highlights the ``Latest''
+label and the release note on interaction mode. Its result (published, marked Latest, interaction mode in the
+notes, all three files) is told at 27.1\,s.
+\item \textbf{37.0--45.3\,s.} The caller makes conversation: ``Thanks. Remind me, how many speech vendors do we
+support now?'' The answer comes from the orchestrator, from the facts it was given: ``Forty-four speech vendors.
+That's thirty-one for speech-to-text, thirty-four for text-to-speech and eleven for speech-to-speech \ldots''
+\item \textbf{54.1--77.0\,s.} ``Great. Can you also get the download numbers in the terminal?'' The terminal starts at
+60.3\,s, types a \texttt{curl \textbar\ jq} query against the GitHub API, and finishes at 77.0\,s: the x86-64 archive
+had 0 downloads, the arm64 archive 12 and the checksum file 14.
+\item \textbf{92.0--124.2\,s.} ``Nice. Can you draft the launch announcement now, with those numbers in it?'' The
+orchestrator passes the numbers found earlier to the writer (started at 102.1\,s), which types the announcement
+into Writer on screen, title, sections, bullet lists and an ``Early numbers'' section, while the orchestrator says
+what it is doing.
+\item \textbf{124.6--148.5\,s.} The save is read back: ``To confirm: save the document, Bud WaaV 1.1.0 Is Out. Do you
+want me to do that?''. The caller's ``Yes, go ahead.'' is accepted (``Okay.''), and the document is saved at
+148.5\,s and told at 149.7\,s.
+\item \textbf{158.0--161.6\,s.} ``Perfect, that's everything. Thanks, Ava!'' --- ``You're welcome.'' The call lasts
+168\,s.
+\end{itemize}
+Every request was acknowledged 1.5--1.8\,s after the caller stopped speaking; each piece of work started on the
+right agent, ran while the conversation went on, and was told when it finished.
+
+\paragraph{What went wrong in this take.} Two defects are visible and are reported as they happened. The front
+model's spoken update of the terminal's result was garbled (``one point one point zero for the x86 build, twelve for
+ARM''); the orchestrator corrected it on its own 25\,s later (``Quick fix on what you heard before: the x86 build
+actually has zero downloads, ARM has twelve, and the checksum file has fourteen. That's twenty-six in total.''). And
+the caller's yes came 9.6\,s after the question, because our caller script waits for the line to go quiet; the
+gateway, having heard nothing for 8\,s, asked again in short form (``Do you want me to save the document?'') just
+as the yes began, and the yes was then accepted.
+
+\paragraph{What the takes before it found.} We recorded 27 takes while the host was shared with unrelated GPU jobs
+and on Wi-Fi. The earlier ones exposed defects in the gateway that the takes were then used to fix (PR~\#49): task
+results lost because the narrator's length limits disagreed or a version number ended its sentence; an update
+spoken under the wrong task; a sentence cut by a question replayed whole; holding lines that repeated the line
+before; after a task had finished, new requests read as follow-ups about it (a 2B front chose \texttt{follow\_up}
+for 10 of 10 such turns offline; with a check that names the finished task's agent, 130 of 130 of a gate set were
+settled right); a rejected synthesis flush from the speech vendor that left every later line unfinished and played
+an apology every 13\,s for six minutes; a request split at ``the'' and read as a duplicate; a late transcript that
+turned a clear yes into a weak one; and an unanswered offer that held the results back for minutes. Other takes
+failed on the network (the speech vendor's connection timed out at set-up) or on the shared GPU (the front model's
+decisions missed their budget). We chose the demonstrated take for being complete, not for being typical, and the
+remaining failures are in the project's issue list.

@@ -1,0 +1,80 @@
+\section{Related Work}\label{sec:related}
+
+Numbers in this section are taken from the cited sources; numbers that vendors or authors report about
+their own systems are marked \emph{self-reported} (SR). Latency metrics differ between sources and are
+comparable only when the metric is the same.
+
+\paragraph{Turn-taking.}
+Conversation analysis describes turn-taking as locally managed, with speaker changes at
+transition-relevance places~\citep{sacks1974turntaking}; \citet{skantze2021review} reviews how spoken
+dialogue systems detect turn ends and handle backchannels and interruptions, and Voice Activity
+Projection learns to predict both speakers' future activity from audio~\citep{ekstedt2022vap}. Practical
+agents pair a voice activity detector with an end-of-turn classifier on the audio, such as Smart Turn, an
+8M-parameter model on a Whisper-Tiny encoder~\citep{smartturn_repo,daily2025smartturnv3}, or on the
+transcript, such as LiveKit's text turn detector~\citep{livekit_turndetector}. Sesame's TurnBench evaluates
+such detectors and concludes that ``no system is fast, selective, and high-recall at the same
+time''~\citep{sesame2026turnbench}.
+
+\paragraph{End-to-end full-duplex models.}
+dGSLM~\citep{nguyen2023dgslm}, Moshi~\citep{defossez2024moshi}, Freeze-Omni~\citep{wang2024freezeomni} and
+PersonaPlex~\citep{roy2026personaplex} model both sides of a conversation directly from audio; NemotronLabs VoiceChat
+adds tool calls but states that ``users cannot interrupt during tool execution''~\citep{nvidia2026voicechat}. None of
+the open models runs background work while it talks, and on Full-Duplex-Bench v1 their low turn latency often comes
+with a high rate of taking the floor during the user's pauses~\citep{fdb_repo}.
+
+\paragraph{Interaction models with a background model.}
+A fast responder backed by a slow deliberator echoes dual-process accounts of thinking~\citep{kahneman2011thinking}
+and talker--reasoner agent architectures~\citep{christakopoulou2024talker}. TML's interaction model works in
+200\,ms chunks beside an asynchronous background model with shared context and reports a Full-Duplex-Bench v1
+turn-taking latency of 0.40\,s and, with the background agent, a v3 Pass@1 of 68.0\% (SR)~\citep{tml2026interaction}.
+GPT-Live is a full-duplex voice layer that delegates to a backend text model, possibly a third-party one, priced at
+USD 0.05 per minute for the voice layer alone~\citep{openai2026gptliveapi}. Gemini 3.8 Live makes non-blocking
+function calls the default, with results delivered silently, when idle or by interrupting~\citep{google_livecap},
+and gpt-realtime supports asynchronous function calls, MCP and SIP~\citep{openai2025gptrealtime}. All are closed and
+hosted, use the vendor's own voices and recognisers, and do not expose the per-turn decision they make.
+
+\paragraph{Cascade frameworks and hosted platforms.}
+Pipecat (BSD-2-Clause) composes services from many vendors, with 38 speech-to-text, 59 text-to-speech, 32 language-model
+and 11 speech-to-speech services listed~\citep{pipecat_services}; its asynchronous functions keep the conversation
+going while they run, and it documents no caller-confirmation pattern~\citep{pipecat_fc}. LiveKit Agents (Apache-2.0)
+added asynchronous tools in June 2026, with immediate acknowledgement, progress and cancellation and an option that
+re-asks before a \emph{duplicate} call~\citep{livekit2026async}; its adaptive interruption model is
+cloud-only~\citep{livekit2026adaptive}. Kyutai's Unmute is an open cascade without a task layer~\citep{kyutai_unmute}.
+The documentation of Vapi, Retell, Deepgram's Voice Agent and ElevenLabs Agents describes neither talking while a tool
+runs (beyond an undocumented ``Async'' toggle in Vapi) nor a confirmation gate~\citep{vapi_tools,retell_interrupt,deepgram_fc,elevenlabs_toolint}.
+Table~\ref{tab:related} summarises the comparison.
+
+\begin{table}[t]
+\centering
+\caption{Systems for interactive voice agents as documented on 27 October 2026. ``Background'': the agent keeps
+talking while tools or agents run. ``Confirm'': a documented gate that asks the caller before a side-effecting
+action. Latencies use different metrics and are not comparable across rows; SR = self-reported.}
+\label{tab:related}
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{1.15cm}>{\raggedright\arraybackslash}p{1.75cm}>{\raggedright\arraybackslash}p{1.55cm}>{\raggedright\arraybackslash}p{2.75cm}@{}}
+\toprule
+System & Architecture & Open, self-host & Background & Confirm & Reported latency \\
+\midrule
+TML interaction models~\citep{tml2026interaction} & 276B MoE interaction model, 200\,ms micro-turns, background model & no & yes & not documented & FDB v1 turn 0.40\,s (SR) \\
+GPT-Live-1~\citep{openai2026gptliveapi} & voice layer + backend text model & no & yes & not documented & none published \\
+gpt-realtime~\citep{openai2025gptrealtime} & speech-to-speech model & no & async calls & not documented & FDB v1 turn 1.470\,s~\citep{fdb_repo} \\
+Gemini Live 3.8; 3.1 Flash~\citep{google2026g38,google_g31doc} & native audio & no & 3.8: yes; 3.1: no & not documented & 3.1 (minimal): FDB v1 turn 0.567\,s~\citep{fdb_repo} \\
+Moshi; PersonaPlex~\citep{defossez2024moshi,roy2026personaplex} & full-duplex, 7B backbone & yes & no tools & n/a & FDB v1 turn 0.265\,s; 0.070\,s (SR; 0.170\,s released) \\
+NemotronLabs VoiceChat~\citep{nvidia2026voicechat} & 11B full-duplex & research only & no interrupt during tools & not documented & FDB v1 turn 448\,ms (SR) \\
+Kyutai Unmute~\citep{kyutai_unmute} & open cascade & yes & no & no & ``below a second'' (SR) \\
+Pipecat; LiveKit Agents~\citep{pipecat_fc,livekit2026async} & cascade frameworks & yes; partly & async tools & duplicates only (LiveKit) & not reported \\
+Vapi, Retell, Deepgram, ElevenLabs~\citep{vapi_tools,retell_interrupt,deepgram_fc,elevenlabs_toolint} & hosted cascades & no & not documented & no & vendor claims \\
+\midrule
+Bud WaaV interaction mode & cascade + 2B front model; tasks on any LLM or agent & yes & yes, as tasks & voice, screen, keypad & FDB v1 turn 1.28\,s; pause TOR 0.029 (Sec.~\ref{sec:eval-v1}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Benchmarks.}
+Full-Duplex-Bench v1 scores pause handling, backchanneling, smooth turn-taking and user interruption with takeover rates
+(TOR) and latencies~\citep{lin2025fdbv1}; v1.5 adds overlap scenarios without defining an aggregate score, so TML's
+``v1.5 average'' is its own composite~\citep{lin2025fdbv15}; v2 runs multi-turn sessions with an automated
+examiner~\citep{lin2026fdbv2}; and v3 evaluates tool use on 100 real recordings with disfluencies~\citep{lin2026fdbv3}.
+FLEXI adds model-initiated interruptions~\citep{ge2025flexi}, while VoiceBench~\citep{chen2024voicebench}, Big Bench
+Audio~\citep{aa_bigbenchaudio} and Audio MultiChallenge~\citep{gosai2025audiomc} measure understanding rather than
+turn-taking; Talk Arena found that no static benchmark correlated strongly with interactive preference~\citep{li2025mindthegap}.

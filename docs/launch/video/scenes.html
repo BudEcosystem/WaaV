@@ -1,0 +1,236 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+@font-face { font-family: Inter; src: url(assets/Inter.ttf); font-weight: 100 900; }
+@font-face { font-family: JBM; src: url(assets/JetBrainsMono.ttf); font-weight: 100 900; }
+:root { --bg:#07050F; --v1:#8830E8; --v2:#B080F0; --v3:#D8B8F8; --ink:#F4F1FA; --mute:#A39FB8; --dim:#5E5873;
+        --green:#3DDC97; --amber:#F5B84B; --red:#FF6B6B; --cyan:#5CC8FF; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 1920px; height: 1080px; overflow: hidden; background: transparent; font-family: Inter, sans-serif; color: var(--ink); }
+.scene { position: absolute; inset: 0; opacity: 0; }
+.bgfill { position: absolute; inset: 0; background: radial-gradient(1200px 700px at 20% 10%, #1B0F33 0%, transparent 60%),
+          radial-gradient(1000px 700px at 90% 100%, #140A2A 0%, transparent 60%), var(--bg); }
+.center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+.h1 { font-size: 84px; font-weight: 800; letter-spacing: -2px; line-height: 1.05; }
+.h2 { font-size: 56px; font-weight: 700; letter-spacing: -1px; line-height: 1.15; }
+.h3 { font-size: 36px; font-weight: 600; letter-spacing: -0.5px; }
+.lede { font-size: 30px; color: var(--mute); font-weight: 450; }
+.mono { font-family: JBM, monospace; }
+.grad { background: linear-gradient(90deg, var(--v3), var(--v2) 45%, var(--v1)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.chip { display: inline-flex; align-items: center; gap: 10px; padding: 8px 16px; border-radius: 999px; border: 1px solid #ffffff22;
+        background: #ffffff0d; font-size: 20px; font-weight: 600; color: var(--v3); }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); box-shadow: 0 0 12px var(--red); }
+.foot { position: absolute; left: 0; right: 0; bottom: 34px; text-align: center; font-size: 17px; color: var(--dim); }
+/* demo */
+#demo .topbar { position: absolute; left: 48px; right: 48px; top: 36px; height: 76px; display: flex; align-items: center; justify-content: space-between; }
+#demo .brandrow { display: flex; align-items: center; gap: 22px; }
+#demo .brandrow img { height: 40px; }
+#demo .stack { font-size: 17px; color: var(--mute); }
+#demo .screenframe { position: absolute; left: 48px; top: 136px; width: 1248px; height: 702px; border-radius: 18px;
+        box-shadow: 0 0 0 1px #ffffff26, 0 30px 80px #00000099; pointer-events: none; }
+#demo .screenlabel { position: absolute; left: 64px; top: 852px; font-size: 18px; color: var(--mute); }
+#demo .panel { position: absolute; left: 1328px; top: 136px; width: 544px; height: 870px; display: flex; flex-direction: column; gap: 14px; }
+.card { background: #120B22E6; border: 1px solid #ffffff1c; border-radius: 18px; padding: 16px 18px; }
+.lane { display: grid; grid-template-columns: 112px 1fr 92px; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid #ffffff10; }
+.lane:last-child { border-bottom: 0; }
+.lane .who { font-weight: 700; font-size: 19px; }
+.lane .what { font-size: 16px; color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.state { font-size: 14px; font-weight: 700; text-align: center; border-radius: 999px; padding: 4px 8px; }
+.st-idle { color: var(--dim); border: 1px solid #ffffff1a; }
+.st-working { color: var(--amber); border: 1px solid #F5B84B66; background: #F5B84B14; }
+.st-asking { color: var(--cyan); border: 1px solid #5CC8FF66; background: #5CC8FF14; }
+.st-done { color: var(--green); border: 1px solid #3DDC9766; background: #3DDC9714; }
+.st-cancelled { color: var(--red); border: 1px solid #FF6B6B66; }
+.convo { flex: 1; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; gap: 10px; }
+.msg { max-width: 92%; padding: 11px 15px; border-radius: 16px; font-size: 19px; line-height: 1.32; }
+.msg.caller { align-self: flex-end; background: #2A2340; border: 1px solid #ffffff18; }
+.msg.agent { align-self: flex-start; background: linear-gradient(180deg, #8830E833, #8830E81f); border: 1px solid #B080F055; }
+.msg .tag { display: block; font-size: 12.5px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; margin-bottom: 4px; color: var(--v2); }
+.msg.caller .tag { color: var(--mute); text-align: right; }
+.metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+.metric { background: #120B22E6; border: 1px solid #ffffff1c; border-radius: 14px; padding: 12px 14px; }
+.metric .k { font-size: 13px; color: var(--mute); letter-spacing: .4px; }
+.metric .v { font-family: JBM, monospace; font-size: 30px; font-weight: 700; margin-top: 2px; }
+.metric .u { font-size: 15px; color: var(--mute); font-weight: 500; }
+.speedtag { position: absolute; left: 64px; top: 152px; padding: 8px 14px; border-radius: 10px; font-size: 18px; font-weight: 700;
+            background: #000000B3; border: 1px solid #ffffff33; color: var(--amber); }
+.zoomtag { position: absolute; right: 640px; top: 152px; padding: 8px 14px; border-radius: 10px; font-size: 16px; font-weight: 700;
+           letter-spacing: 1px; background: #000000B3; border: 1px solid #B080F066; color: var(--v3); }
+.floor { display: flex; align-items: center; gap: 10px; font-size: 16px; color: var(--mute); }
+.floorbar { flex: 1; height: 8px; border-radius: 4px; background: #ffffff12; position: relative; overflow: hidden; }
+.floorbar i { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
+/* how / benchmarks / benefits */
+.cols { display: flex; gap: 28px; }
+.col { width: 500px; padding: 30px; border-radius: 24px; background: #120B22; border: 1px solid #ffffff1c; text-align: left; }
+.col .t { font-size: 15px; letter-spacing: 2px; color: var(--v2); font-weight: 700; text-transform: uppercase; }
+.col .n { font-size: 38px; font-weight: 800; margin: 10px 0 8px; }
+.col .d { font-size: 21px; color: var(--mute); line-height: 1.4; }
+.bars { width: 1500px; text-align: left; }
+.bar { display: grid; grid-template-columns: 380px 1fr 130px; align-items: center; gap: 18px; margin: 14px 0; font-size: 24px; }
+.bar .track { height: 30px; border-radius: 8px; background: #ffffff0d; position: relative; overflow: hidden; }
+.bar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 8px; background: #ffffff33; }
+.bar.us .fill { background: linear-gradient(90deg, var(--v1), var(--v2)); }
+.bar .val { font-family: JBM, monospace; font-weight: 700; text-align: right; }
+.tiles { display: grid; grid-template-columns: repeat(3, 520px); gap: 24px; }
+.tile { padding: 28px 30px; border-radius: 22px; background: #120B22; border: 1px solid #ffffff1c; text-align: left; }
+.tile .n { font-size: 32px; font-weight: 800; }
+.tile .d { font-size: 20px; color: var(--mute); margin-top: 8px; line-height: 1.4; }
+</style></head>
+<body>
+<div id="root"></div>
+<script>
+const D = window.DATA;                  // injected by render.py
+const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
+const ease = x => { x = clamp(x); return x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x + 2, 3)/2; };
+const fade = (t, a, b, f=0.6) => Math.min(ease((t - a)/f), ease((b - t)/f));
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+const root = document.getElementById('root');
+
+function el(html) { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstChild; }
+
+// ---------- static scenes
+const S = {};
+for (const sc of D.scenes) {
+  const node = el(`<div class="scene" id="${sc.id}"></div>`);
+  if (sc.bg !== false) node.appendChild(el('<div class="bgfill"></div>'));
+  root.appendChild(node); S[sc.id] = { sc, node };
+}
+function build(id, html) { const n = el(html); if (S[id]) S[id].node.appendChild(n); return n; }
+
+// cold open
+const open1 = build('open', `<div class="center"><img src="assets/lockup.png" style="width:780px"><div class="h3" style="margin-top:34px;color:var(--v3)">introduces</div><div class="h1 grad" style="margin-top:12px">Interaction Mode</div></div>`);
+const open2 = build('open', `<div class="center"><div class="h2">One take. A real call. A real computer.</div><div class="lede" style="margin-top:20px">Nothing staged. Every number on screen comes from this run.</div></div>`);
+// problem
+const prob = build('problem', `<div class="center" style="align-items:flex-start;padding-left:220px;text-align:left">
+  <div class="lede" style="margin-bottom:26px">Voice agents today talk like walkie-talkies.</div>
+  <div class="h2 p1">They go quiet while they work. <span class="mono" style="color:var(--red);font-size:44px" id="silence"></span></div>
+  <div class="h2 p2" style="margin-top:22px">They talk over you.</div>
+  <div class="h2 p3" style="margin-top:22px">They can't take <span class="grad">“actually, make it eight.”</span></div>
+  <div class="h2 p4" style="margin-top:22px">They can't take the next task while one runs.</div></div>`);
+// thesis
+const thesis = build('thesis', `<div class="center"><div class="lede">What if the agent kept the conversation going</div><div class="h1" style="margin-top:14px">while the work <span class="grad">runs?</span></div></div>`);
+const title = build('thesis', `<div class="center"><img src="assets/lockup.png" style="width:520px;margin-bottom:40px"><div class="h1">Bud WaaV <span class="grad">Interaction Mode</span></div><div class="lede" style="margin-top:22px">Voice agents that keep talking while they work.</div></div>`);
+// how it works
+const how = build('how', `<div class="center"><div class="h2" style="margin-bottom:46px">How it works</div><div class="cols">
+  <div class="col c1"><div class="t">Front model</div><div class="n">Qwen3.5-2B</div><div class="d">Decides every turn in real time: a request, a correction, “stop”, an answer, a wait. Replies at once.</div></div>
+  <div class="col c2"><div class="t">Background</div><div class="n">Any LLM</div><div class="d">Requests run as tasks: here Claude Opus 5.5 plans and hands work to agents, in parallel.</div></div>
+  <div class="col c3"><div class="t">Your agents</div><div class="n">Real work</div><div class="d">Browser, terminal, apps, A2A, MCP, webhooks. Confirms before anything that changes the world.</div></div>
+  </div><div class="lede" style="margin-top:44px;font-size:24px">Speech in and out through any of 44 vendors · echo control · barge-in · backchannels · turn detection</div></div>`);
+// benchmarks (filled from data)
+const benchCard = key => build(key, `<div class="center"><div class="h2" id="${key}title" style="margin-bottom:12px"></div><div class="lede" id="${key}sub" style="margin-bottom:36px;font-size:24px"></div><div class="bars" id="${key}bars"></div><div class="foot" id="${key}foot"></div></div>`);
+benchCard('bench'); benchCard('bench2');
+// benefits
+const ben = build('benefits', `<div class="center"><div class="h2" style="margin-bottom:44px">Built to ship, not to demo</div><div class="tiles">
+  <div class="tile"><div class="n">Open source</div><div class="d">Apache-2.0. Read it, fork it, run it.</div></div>
+  <div class="tile"><div class="n">Self-hosted</div><div class="d">Your servers, your data, your keys. One Rust binary.</div></div>
+  <div class="tile"><div class="n">44 speech vendors</div><div class="d">Swap Deepgram, ElevenLabs, OpenAI, Google… in config.</div></div>
+  <div class="tile"><div class="n">Any LLM, any agent</div><div class="d">Claude, local models, A2A, MCP, webhooks.</div></div>
+  <div class="tile"><div class="n">Asks before acting</div><div class="d">Side effects are read back and confirmed by voice.</div></div>
+  <div class="tile"><div class="n">Phones and rooms</div><div class="d">Web, LiveKit and SIP calls, same agent.</div></div></div></div>`);
+// future
+const fut = build('future', `<div class="center"><div class="lede">What's next</div><div class="h2" style="margin-top:18px;line-height:1.35">More languages · faster turn-taking ·<br>more agent protocols · interaction mode everywhere</div></div>`);
+// end
+const end = build('end', `<div class="center"><img src="assets/lockup.png" style="width:760px"><div class="h2" style="margin-top:46px">Bud WaaV <span class="grad">1.1</span></div><div class="mono" style="margin-top:22px;font-size:30px;color:var(--v3)">github.com/BudEcosystem/WaaV</div><div class="lede" style="margin-top:18px;font-size:24px">Open source · Apache-2.0</div></div>`);
+
+// ---------- demo
+const demo = S.demo ? S.demo.node : null;
+let demoEls = null;
+if (demo) {
+  demo.innerHTML = '';  // transparent: the screen recording shows through
+  demo.appendChild(el(`<div class="topbar"><div class="brandrow"><img src="assets/lockup.png"><span class="chip"><span class="dot"></span>LIVE DEMO · one take</span></div>
+    <div class="stack">Front: Qwen3.5-2B · Agents: Claude Opus 5.5 · Speech: Deepgram · Sandboxed Linux desktop</div></div>`));
+  demo.appendChild(el(`<div class="screenframe"></div>`));
+  demo.appendChild(el(`<div class="screenlabel">The agent's computer · browser, terminal and LibreOffice driven by the agents</div>`));
+  const panel = el(`<div class="panel">
+    <div class="metrics"><div class="metric"><div class="k">REPLY AFTER YOU STOP</div><div class="v" id="m-reply">–</div></div>
+      <div class="metric"><div class="k">TASKS RUNNING</div><div class="v" id="m-tasks">0</div></div>
+      <div class="metric"><div class="k">CALL TIME</div><div class="v" id="m-clock">0:00</div></div></div>
+    <div class="card"><div class="floor"><span>Floor</span><div class="floorbar"><i id="floor-i"></i></div><span id="floor-who">–</span></div></div>
+    <div class="card" id="lanes"></div>
+    <div class="convo" id="convo"></div></div>`);
+  demo.appendChild(panel);
+  demo.appendChild(el(`<div class="speedtag" id="speedtag" style="display:none"></div>`));
+  demo.appendChild(el(`<div class="zoomtag" id="zoomtag" style="display:none"></div>`));
+  demoEls = { panel, lanes: panel.querySelector('#lanes'), convo: panel.querySelector('#convo'),
+              reply: panel.querySelector('#m-reply'), tasks: panel.querySelector('#m-tasks'), clock: panel.querySelector('#m-clock'),
+              floorI: panel.querySelector('#floor-i'), floorWho: panel.querySelector('#floor-who'), speed: demo.querySelector('#speedtag'), zoom: demo.querySelector('#zoomtag') };
+}
+
+function callTime(vt) {   // demo-local video time -> call time (piecewise)
+  let acc = 0;
+  for (const s of D.demo.segments) {
+    const len = (s.call_end - s.call_start) / s.speed;
+    if (vt < acc + len) return [s.call_start + (vt - acc) * s.speed, s.speed, s.label];
+    acc += len;
+  }
+  const last = D.demo.segments[D.demo.segments.length - 1];
+  return [last.call_end, 1];
+}
+
+function renderDemo(vt) {
+  const [ct, speed, speedLabel] = callTime(vt);
+  const T = D.demo.timeline;
+  // lanes
+  const lanes = ['browser', 'terminal', 'writer'].map(a => {
+    const ev = T.lanes[a].filter(x => x.t <= ct);
+    const last = ev.length ? ev[ev.length - 1] : null;
+    const st = last ? last.state : 'idle';
+    const what = last ? last.text : 'waiting';
+    const label = {idle: 'IDLE', working: 'WORKING', asking: 'ASKING YOU', done: 'DONE', cancelled: 'STOPPED'}[st];
+    const col = {browser: '#5CC8FF', terminal: '#3DDC97', writer: '#F5B84B'}[a];
+    return `<div class="lane"><div class="who"><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${col};margin-right:8px"></span>${a[0].toUpperCase() + a.slice(1)}</div><div class="what">${esc(what)}</div><div class="state st-${st}">${label}</div></div>`;
+  }).join('');
+  demoEls.lanes.innerHTML = lanes;
+  // conversation: lines started so far, the newest last
+  const msgs = T.messages.filter(m => m.t <= ct).slice(-6).map(m => {
+    const age = ct - m.t;
+    const op = clamp(age / 0.25);
+    return `<div class="msg ${m.who}" style="opacity:${op}"><span class="tag">${m.who === 'caller' ? 'You' : 'Agent · ' + m.kind}</span>${esc(m.text)}</div>`;
+  }).join('');
+  demoEls.convo.innerHTML = msgs;
+  // metrics
+  const replies = T.replies.filter(r => r.t <= ct);
+  demoEls.reply.innerHTML = replies.length ? `${(replies[replies.length - 1].ms / 1000).toFixed(2)}<span class="u"> s</span>` : '–';
+  demoEls.tasks.textContent = T.running.filter(r => r.from <= ct && ct < r.to).length;
+  const m = Math.floor(ct / 60), s = Math.floor(ct % 60);
+  demoEls.clock.textContent = `${m}:${String(s).padStart(2, '0')}`;
+  const fl = T.floor.filter(f => f.t <= ct); const who = fl.length ? fl[fl.length - 1].who : 'none';
+  demoEls.floorWho.textContent = {user: 'You', assistant: 'Agent', none: '—'}[who] || who;
+  demoEls.floorI.style.cssText = who === 'user' ? 'left:50%;right:0;background:#B9B4CC' : who === 'assistant' ? 'left:0;right:50%;background:linear-gradient(90deg,#8830E8,#B080F0)' : 'left:49%;right:49%;background:#5E5873';
+  // zoom label
+  const fz = (D.demo.focus || []).find(f => f.from <= ct && ct < f.to);
+  demoEls.zoom.style.display = fz ? 'block' : 'none';
+  if (fz) demoEls.zoom.textContent = `ZOOM · ${fz.label}`;
+  // speed tag
+  demoEls.speed.style.display = speed > 1 ? 'block' : 'none';
+  demoEls.speed.textContent = speed > 1 ? `⏩ ${speed}× · ${speedLabel || 'fast-forward'}` : '';
+}
+
+function renderBench(key, l) {   // one benchmark card: title, bars growing in turn, footnote
+  const b = D[key]; if (!b) return;
+  document.getElementById(key + 'title').innerHTML = b.title;
+  document.getElementById(key + 'sub').innerHTML = b.subtitle;
+  document.getElementById(key + 'foot').innerHTML = b.foot;
+  document.getElementById(key + 'bars').innerHTML = b.rows.map((r, i) => { const p = ease((l - 0.8 - i * 0.35) / 1.0); return `<div class="bar ${r.us ? 'us' : ''}"><div>${esc(r.name)}</div><div class="track"><div class="fill" style="width:${p * r.frac * 100}%"></div></div><div class="val">${p > .3 ? esc(r.label) : ''}</div></div>`; }).join('');
+}
+
+window.render = function (t) {
+  for (const id in S) {
+    const { sc, node } = S[id];
+    const op = (t >= sc.start - 0.01 && t <= sc.end + 0.01) ? fade(t, sc.start, sc.end, sc.fade ?? 0.5) : 0;
+    node.style.opacity = op;
+    node.style.display = op > 0 ? 'block' : 'none';
+  }
+  const at = id => S[id] ? t - S[id].sc.start : -1;
+  if (S.open) { const l = at('open'); open1.style.opacity = fade(l, 0, 3.4, 0.6); open1.style.transform = `scale(${0.97 + 0.03 * ease(l / 3)})`; open2.style.opacity = fade(l, 3.0, S.open.sc.end - S.open.sc.start + 1, 0.6); }
+  if (S.problem) { const l = at('problem'); [1,2,3,4].forEach((k, i) => { const p = prob.querySelector('.p' + k); const a = 0.6 + i * 2.4; p.style.opacity = ease((l - a) / .5); p.style.transform = `translateY(${(1 - ease((l - a) / .5)) * 18}px)`; });
+    const sil = prob.querySelector('#silence'); const s = clamp(l - 0.6, 0, 9.9); sil.textContent = l > 0.6 ? `· silence ${s.toFixed(1)} s` : ''; }
+  if (S.thesis) { const l = at('thesis'); const len = S.thesis.sc.end - S.thesis.sc.start; thesis.style.opacity = fade(l, 0, 3.4, .6); title.style.opacity = fade(l, 3.6, len + 1, .7); title.style.transform = `scale(${0.98 + 0.02 * ease((l - 3.6) / 2)})`; }
+  if (S.how) { const l = at('how'); ['.c1', '.c2', '.c3'].forEach((c, i) => { const n = how.querySelector(c); n.style.opacity = ease((l - 0.4 - i * 1.3) / .6); n.style.transform = `translateY(${(1 - ease((l - .4 - i * 1.3) / .6)) * 24}px)`; }); }
+  for (const key of ['bench', 'bench2']) if (S[key]) renderBench(key, at(key));
+  if (S.benefits) { const l = at('benefits'); ben.querySelectorAll('.tile').forEach((n, i) => { n.style.opacity = ease((l - .3 - i * .35) / .5); }); }
+  if (S.demo && demoEls) renderDemo(t - S.demo.sc.start);
+  return true;
+};
+window.render(0);
+</script></body></html>

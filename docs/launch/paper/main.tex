@@ -1,0 +1,92 @@
+\documentclass[11pt,a4paper]{article}
+
+% ---------------------------------------------------------------------------
+% Packages. The build machine's TeX Live lacks tikz/pgf, lmodern, cm-super,
+% enumitem, xurl and multirow, so the paper uses Computer Modern in OT1, plain
+% list environments and a matplotlib-drawn vector figure (figures/architecture.py).
+% ---------------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage[table]{xcolor}
+\usepackage[expansion=false]{microtype} % font expansion needs scalable fonts for every face used
+\usepackage{caption}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{url}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+% Allow long URLs and identifiers to break anywhere sensible.
+\makeatletter
+\g@addto@macro{\UrlBreaks}{\do\a\do\b\do\c\do\d\do\e\do\f\do\g\do\h\do\i\do\j\do\k\do\l\do\m
+  \do\n\do\o\do\p\do\q\do\r\do\s\do\t\do\u\do\v\do\w\do\x\do\y\do\z\do\_\do\-\do\.\do\/}
+\makeatother
+
+% Configuration keys and wire identifiers, e.g. \cfg{front.total_budget_ms}.
+\DeclareUrlCommand\cfg{\urlstyle{tt}}
+
+% Placeholder for numbers measured in the evaluation (written separately).
+\newcommand{\result}[1]{\textbf{[RESULT: #1]}}
+
+\setlength{\parskip}{0.35em}
+\renewcommand{\labelitemi}{$\bullet$} % avoids a bitmap TS1 bullet (cm-super is not installed)
+\renewcommand{\arraystretch}{1.12}
+
+\title{\textbf{Bud WaaV Interaction Mode:\\an Open, Self-Hosted Runtime for Voice Agents\\That Keep Talking While They Work}}
+\author{Bud Ecosystem\\[0.3em]
+  \normalsize Bud Ecosystem Inc.\\
+  \normalsize \texttt{waav@bud.studio}\\
+  \normalsize \url{https://github.com/BudEcosystem/WaaV}}
+\date{27 October 2026 \quad (WaaV Gateway release 1.1.0)}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+A voice agent that works with tools is caught between two failures: a turn-based pipeline goes silent while
+its model and tools run, and a fast end-to-end speech model tends to take the floor when the caller has only
+paused. Recent systems split the agent into a fast interaction model that stays in the conversation and a
+slower background model that does the work; the published ones are closed and hosted. We describe
+\emph{interaction mode} of Bud WaaV, an open-source (Apache-2.0), self-hosted implementation of this split in a
+real-time voice gateway. A 2B-parameter front model (Qwen3.5-2B on llama.cpp) decides every caller turn into
+one explicit, grammar-constrained act (a request, a correction, a cancellation, a conversation control, a status
+question or a wait) and acknowledges at once. Requests become tasks that run on any language model, on an
+orchestrator that hands work to agents as child tasks, or on agents reached over A2A, MCP, webhooks or the
+OpenAI Responses API; answers are relayed verbatim, sentence by sentence, and side-effecting actions wait for a
+confirmation the caller has heard. The audio path tracks the floor, ducks the agent at the caller's onset,
+classifies overlap within 900\,ms and gates echo, and every slot can be filled by one of 44 speech vendors or a
+local model. On Full-Duplex-Bench v3, which plays 100 real, disfluent spoken requests to an agent with tools,
+Bud WaaV with Claude Opus~5.5 as its background starts speaking sooner than every published system (2.48\,s
+mean against 3.88--8.78\,s) with the second-best response quality (0.73), but its strict task success is the
+lowest (Pass@1 0.39 judged, 0.31 exact-match, against 0.41--0.60), as is its tool-selection F1; most of the
+failures trace to the turn handling around the background model (a disfluent pause that ends the turn, one
+request split into several tasks), which we analyse. On
+Full-Duplex-Bench v1 it keeps quiet through the caller's pauses as well as the best closed systems (it takes
+the floor in 2.9\% of synthetic and 9.7\% of real pauses, the latter the lowest on the leaderboard) and makes
+listening sounds more often than any system on it, at the cost of fewer and slower turn takings (78\%, 1.28\,s) and slow replies to interruptions (2.21\,s). A case study shows a spoken conversation in which the caller hands a browser, a terminal and a word
+processor real work one request at a time, chatting in between, each request acknowledged within 1.8\,s and
+the one action that changes something confirmed by a heard yes; the takes behind it found gateway defects that
+we fixed and report.
+A cascade keeps a latency floor that end-to-end models avoid; we discuss what the
+explicit decision, the task layer and the confirmations buy in exchange.
+\end{abstract}
+
+\noindent\textbf{Keywords:} full-duplex spoken dialogue; voice agents; turn-taking; barge-in;
+asynchronous tool use; background tasks; human in the loop; open source.
+
+\input{sections/intro}
+\input{sections/related}
+\input{sections/system}
+\input{sections/eval}
+\input{sections/case_study}
+\input{sections/discussion}
+\input{sections/conclusion}
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

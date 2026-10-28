@@ -1,0 +1,7 @@
+FROM bud-desk:demo
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends x11-xserver-utils && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --break-system-packages --no-cache-dir playwright python-docx
+USER ava
+COPY --chown=ava:ava start.sh browserd.py /home/ava/
+CMD ["/bin/bash", "/home/ava/start.sh"]

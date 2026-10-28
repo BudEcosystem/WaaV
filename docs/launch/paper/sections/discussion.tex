@@ -1,0 +1,60 @@
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{The latency floor of a cascade.}
+In a cascade the time from the end of the caller's speech to the agent's first audio is a sum: the end-of-turn decision, the
+front's act and the synthesiser's first audio, each with a floor (in WaaV, Smart Turn is asked 200\,ms into a pause, an unsure
+pause on a dangling word is held for 800\,ms, and the acknowledgement is due 300\,ms after the turn). End-to-end models avoid
+much of this: on Full-Duplex-Bench v1 PersonaPlex reports 0.070\,s for its paper model (0.170\,s for the released checkpoint) and Moshi measures 0.265\,s~\citep{fdb_repo,roy2026personaplex},
+and TML reports 0.40\,s (SR)~\citep{tml2026interaction}, a figure WaaV's design documents call out of reach for a
+cascade~\citep{waav_design}; WaaV's 1.28\,s mean (median 0.68\,s; Section~\ref{sec:eval-v1}) should be read in that light. The
+same leaderboard shows the other side: the fastest models take the floor in most of the user's pauses (synthetic pause TOR
+0.985 for Moshi, 0.584 for PersonaPlex) while GPT-Realtime does so in 1.0\% of them~\citep{fdb_repo}; WaaV's hold rules aim at
+the latter, and reach it: 2.9\% of synthetic and 9.7\% of real pauses. WaaV works on \emph{perceived} latency instead: an acknowledgement shortly after
+the turn, a conversation that continues while work runs, and results delivered when they fit. For tool use the relevant
+quantity is the time to a useful response; on Full-Duplex-Bench v3 the naive cascade took 10.12\,s and the fastest system
+tested 4.25\,s~\citep{lin2026fdbv3}; WaaV spoke first after 2.48\,s, the soonest of all, but completed the task after
+14.19\,s on average (median 7.44\,s), the slowest (Section~\ref{sec:eval-v3}). The design trades some turn latency for
+control, composability and inspectability; it does not beat end-to-end models on every axis.
+
+\paragraph{What an explicit decision buys, and what it costs.}
+An explicit act is \emph{inspectable}, since every decision is logged with the observation the model saw;
+\emph{constrained}, since a grammar admits only legal acts and the acknowledgement cannot assert an outcome;
+\emph{separable} from the work, since the front never reports facts and the binding words come from templates and
+the background's verbatim text; and \emph{replaceable}, since any model llama.cpp serves can be the front and any
+model or agent the background, without retraining. The costs are real. A 2B model misreads some turns, and a
+misreading has consequences: a continuer read as a request starts a task, a request read as a continuer is lost.
+The reference documentation records misreadings found in live tests and the prompt changes made for them, such as
+short continuers over the agent sometimes read as a \texttt{hold}~\citep{waav_imdoc}. The safeguards (interims cut
+only on a sure reading, echo words are always a wait, a late decision asks the caller to repeat) add latency of
+their own: a stop is cut only once the front has read the words, although the voice is ducked at the first sound,
+and an answer to a question waits for a reading. The front also needs hardware that decides well within its
+budget while the recogniser and synthesiser share the machine; the design's measurements found CPU-only serving
+too slow for the budget it targeted, so a GPU or a fast accelerator is recommended~\citep{waav_design}.
+
+\paragraph{Limitations.}
+The release documents its limits~\citep{waav_imdoc}. Only the English language pack ships (a Hindi pack awaits review by
+native speakers). The front model is required: by design there is no rule-based fallback, and the mode ends if the front's
+server is not back within 150\,s. With some recognisers a long story's first comma pause ends the turn, and with a streaming
+recogniser whose words arrive late the 900\,ms barge-in deadline cuts the agent before the front has read a stop; both are
+recorded as known limits. The echo gate cannot separate a caller less than 3\,dB louder than the echo. Without a shared Redis
+a restart loses tasks. Bud voice agents and processing graphs run their own tools and get no voice confirmation from the
+gateway, and speech-to-speech providers are monitored and corrected but not prevented from speaking, except in the
+half-cascade. Deployments must check the licences of the models they download; the LiveKit text turn detector, for example,
+is distributed under the LiveKit Model License~\citep{livekit_turndetector}. Finally, Full-Duplex-Bench measures English
+turn-taking on recorded and synthetic audio, not confirmations, truthful cancellation, echo from real loudspeakers or long
+calls with several running tasks; Section~\ref{sec:case} gives a qualitative account of such a call.
+
+\paragraph{Safety and privacy.}
+Self-hosting keeps audio, transcripts and task data on the operator's infrastructure, although the speech vendors a session
+names still receive the audio they process. Confirmations bind only on what was heard, sensitive values stay off the voice
+channel, call text is quoted to the front as data, and background answers are checked for links, unsourced long numbers and
+leaked instructions. These are safeguards, not guarantees (a paraphrased prompt leak passes the check), and operators remain
+responsible for telling callers that they speak with an automated agent and for consent where calls are recorded.
+
+\paragraph{Future work.}
+The design documents name the next steps~\citep{waav_design}: reviewed language packs beyond English, starting with
+Hindi; a front model fine-tuned on teacher-labelled decisions and gated on held-out sets; approvals by voice for agents
+that run their own tools; and, only if an open duplex model meets the latency budget and hands work to a background
+reliably, a native full-duplex regime on WaaV's own inference engine. We also plan to evaluate on TurnBench's
+end-of-turn and interruption tracks~\citep{sesame2026turnbench} and on Full-Duplex-Bench v2, whose correction tasks
+exercise the \texttt{update} act directly~\citep{lin2026fdbv2}.

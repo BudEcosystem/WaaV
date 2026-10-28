@@ -1,0 +1,516 @@
+{"t": -12.0674, "type": "ready", "protocol_version": "1.1", "stream_id": "launch-day-1793156597", "livekit_url": "http://localhost:7880", "interaction": {"controls": {"allowed": ["stop", "hold", "resume", "repeat", "not_heard", "clarify", "spell", "rate", "volume", "verbosity", "language", "voice", "backchannels", "updates", "to_screen", "end", "human"], "answers_only": false, "from_agents": true, "from_clients": true, "human": false, "languages": [], "rate_max": 1.2999999523162842, "rate_min": 0.699999988079071, "volume_max_db": 9.0, "volume_min_db": -9.0}, "degraded": [], "duplex": {"backchannel": "auto", "barge_in": true, "decide_by_ms": 900, "duck_db": -15.0, "duck_ramp_ms": 60, "eager": true, "echo": {"aec": "auto", "auto_enable_after_echo_episodes": 2, "correlation_gate": true, "max_bulk_delay_ms": 1000, "tail_ms": 2000}, "max_pause_ms": 2500, "pause_after_ms": 400}, "enabled": true, "events": {"floor": true, "segments": true}, "failure": {"follow_up": false, "lines": "none", "max_wait_s": 30, "stall_after_ms": 8000}, "front": {"act_budget_ms": 300, "pace": null, "persona": "default", "preferred_name": null, "profile": "model", "total_budget_ms": 1500, "verbosity": null}, "hitl": {"channels": ["voice", "client"]}, "policy": {"ack_due_ms": 300, "ack_hard_deadline_ms": 2000, "agreed_wait_max_ms": 600000, "amend_ack_target_ms": 1200, "answer_window_ms": 4000, "fast_answer_min_turns": 3, "fast_answer_ms": 700, "heard_margin_ms": 150, "hitl_answer_timeout_ms": 20000, "hitl_key_gap_ms": 5000, "hitl_reprompt_after_ms": 8000, "hold_after_silence_ms": 8000, "progress_min_gap_ms": 5000, "progress_min_wait_ms": 4000, "quiet_checkin_ms": 30000, "updates_max_per_wait": 3}, "protocol_version": "1.1", "regime": "cascade", "tasks": {"agents": ["browser", "terminal", "writer"], "announce": "tell", "backend": "llm", "follow_up_ttl_s": 1800, "limits": {"max_live": null, "max_live_tenant": null}, "orchestrator": true, "orphan_max_s": 1800, "push": false, "reconnect_grace_s": 60, "resume": false, "session_end": "auto", "speculative_start": "auto", "tools": []}}, "stt": {"capability_source": "exact", "confidence_source": "vendor", "endpointing": "vendor", "final_deadline_ms": null, "final_latency_slow_ms": 326, "final_latency_slow_percentile": 99, "final_latency_typical_ms": null, "interim_results": "live", "latency_basis": "seed", "latency_class": "realtime", "lifecycle": "ga", "map_version": "2026-10-04.1", "model": "nova-3", "model_source": "request", "provider": "deepgram", "requested_mode": "auto", "requested_mode_source": "default", "speech_events": "none", "transcription_mode": "streaming"}}
+{"t": -11.3473, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -10.9859, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -10.6368, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -10.0545, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -9.2536, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -8.3147, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -7.4461, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -7.0662, "type": "heartbeat", "t_ms": 5106}
+{"t": -6.4679, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -6.3062, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -5.3797, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -4.3768, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -3.4917, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -3.3819, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -2.4708, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -2.066, "type": "heartbeat", "t_ms": 10106}
+{"t": -1.3714, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -0.2169, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": -0.2149, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 0.6085, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 1.1639, "type": "floor_state", "holder": "user", "lane": null, "reason": "user_speech", "t_ms": 13336}
+{"t": 1.6262, "type": "stt_result", "transcript": "More", "is_final": false, "is_speech_final": false, "confidence": 0.84765625}
+{"t": 2.6002, "type": "stt_result", "transcript": "Morning, Eva. Can you", "is_final": false, "is_speech_final": false, "confidence": 1.0}
+{"t": 2.6004, "type": "stt_result", "transcript": "Morning, Eva. Can you", "is_final": false, "is_speech_final": false, "confidence": 1.0}
+{"t": 3.583, "type": "stt_result", "transcript": "Morning, Eva. Can you pull up the GitHub release", "is_final": false, "is_speech_final": false, "confidence": 1.0}
+{"t": 4.5993, "type": "stt_result", "transcript": "Morning, Eva. Can you pull up the GitHub release for WaaV one", "is_final": false, "is_speech_final": false, "confidence": 0.99902344}
+{"t": 5.7266, "type": "stt_result", "transcript": "Morning, Eva. Can you pull up the GitHub release for WaaV 1.1 and check", "is_final": false, "is_speech_final": false, "confidence": 0.99902344}
+{"t": 6.1656, "type": "heartbeat", "t_ms": 18338}
+{"t": 6.6498, "type": "stt_result", "transcript": "Morning, Eva. Can you pull up the GitHub release for WaaV 1.1 and check it all looks right?", "is_final": false, "is_speech_final": false, "confidence": 0.9980469}
+{"t": 6.8536, "type": "stt_result", "transcript": "Morning, Eva. Can you pull up the GitHub release for WaaV 1.1 and check it all looks right?", "is_final": true, "is_speech_final": true, "confidence": 0.9980469}
+{"t": 6.8537, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 19026}
+{"t": 7.2485, "type": "task_created", "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "task_ref": "t1", "revision": 1, "state": "working", "cancelling": false, "title": "Morning, Eva. Can you pull up the GitHub release for WaaV", "kind": "action", "side_effects": true, "speculative": true, "origin": "front", "background": "llm", "t_ms": 19419, "parent_id": null, "agent": null, "trace_id": "33b9a344703349b381875f8c8b492d1f"}
+{"t": 7.7794, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 7.7923, "type": "assistant_transcript", "turn_index": 1, "delta": "Let me look into that.", "source": "gateway", "kind": "ack", "verbatim": false, "utterance_id": "u_11", "heard": "none"}
+{"t": 7.7923, "type": "audio_segment", "phase": "start", "utterance_id": "u_11", "lane": "front", "kind": "ack", "task_id": null, "t_ms": 19951}
+{"t": 7.7923, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 19965}
+{"t": 7.9791, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 20152}
+{"t": 8.1358, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 20308}
+{"t": 9.0058, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 9.1063, "type": "tts_playback_complete", "timestamp": 1793156621175}
+{"t": 9.1063, "type": "audio_segment", "phase": "end", "utterance_id": "u_11", "lane": "front", "kind": "ack", "task_id": null, "t_ms": 21279}
+{"t": 9.1063, "type": "assistant_transcript", "turn_index": 1, "delta": "", "source": "gateway", "kind": "ack", "verbatim": false, "utterance_id": "u_11", "heard": "full"}
+{"t": 9.1063, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 21279}
+{"t": 10.0463, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 10.2925, "type": "task_created", "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "task_ref": "t2", "revision": 1, "state": "working", "cancelling": false, "title": "Check the GitHub release: Open", "kind": "lookup", "side_effects": false, "speculative": false, "origin": "front", "background": "webhook:browser", "t_ms": 22465, "parent_id": "task_44e50b690f6745eb81740e0ce9503d3a", "agent": "browser", "trace_id": "33b9a344703349b381875f8c8b492d1f"}
+{"t": 10.8924, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 11.8304, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 12.7828, "type": "assistant_transcript", "turn_index": 1, "delta": "Morning!", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "utterance_id": "u_12", "sentence": {"attempt": 0, "seq": 0}, "heard": "none"}
+{"t": 12.7834, "type": "audio_segment", "phase": "start", "utterance_id": "u_12", "lane": "main", "kind": "relay", "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "t_ms": 24955}
+{"t": 12.7834, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 24955}
+{"t": 12.8009, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 12.8813, "type": "task_progress", "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "task_ref": "t2", "revision": 1, "state": "working", "cancelling": false, "seq": 2, "text": "Opening the release page.", "fraction": null, "spoken": false, "effects": null, "answer_stopped": null, "t_ms": 25054, "parent_id": "task_44e50b690f6745eb81740e0ce9503d3a", "agent": "browser", "trace_id": "33b9a344703349b381875f8c8b492d1f"}
+{"t": 13.6175, "type": "tts_playback_complete", "timestamp": 1793156625687}
+{"t": 13.6176, "type": "audio_segment", "phase": "end", "utterance_id": "u_12", "lane": "main", "kind": "relay", "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "t_ms": 25790}
+{"t": 13.6176, "type": "assistant_transcript", "turn_index": 1, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "utterance_id": "u_12", "sentence": {"attempt": 0, "seq": 0}, "heard": "full"}
+{"t": 13.6176, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 25790}
+{"t": 13.8445, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 13.9819, "type": "assistant_transcript", "turn_index": 1, "delta": "I'm pulling up the version one point one release on GitHub now to check it over.", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "utterance_id": "u_13", "sentence": {"attempt": 0, "seq": 1}, "heard": "none"}
+{"t": 13.9819, "type": "audio_segment", "phase": "start", "utterance_id": "u_13", "lane": "main", "kind": "relay", "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "t_ms": 26154}
+{"t": 13.9819, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 26154}
+{"t": 14.8468, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 14.9489, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 15.9653, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 16.7954, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 18.229, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 18.2291, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 18.313, "type": "tts_playback_complete", "timestamp": 1793156630382}
+{"t": 18.3131, "type": "audio_segment", "phase": "end", "utterance_id": "u_13", "lane": "main", "kind": "relay", "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "t_ms": 30486}
+{"t": 18.3131, "type": "assistant_transcript", "turn_index": 1, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "utterance_id": "u_13", "sentence": {"attempt": 0, "seq": 1}, "heard": "full"}
+{"t": 18.3131, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 30486}
+{"t": 18.3131, "type": "assistant_transcript", "turn_index": 1, "delta": "I'll tell you what I find.", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "utterance_id": "u_14", "sentence": {"attempt": 0, "seq": 2}, "heard": "none"}
+{"t": 18.3131, "type": "audio_segment", "phase": "start", "utterance_id": "u_14", "lane": "main", "kind": "relay", "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "t_ms": 30486}
+{"t": 18.3131, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 30486}
+{"t": 18.8282, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 19.9076, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 19.9939, "type": "tts_playback_complete", "timestamp": 1793156632063}
+{"t": 19.9939, "type": "audio_segment", "phase": "end", "utterance_id": "u_14", "lane": "main", "kind": "relay", "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "t_ms": 32166}
+{"t": 19.9939, "type": "assistant_transcript", "turn_index": 1, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "utterance_id": "u_14", "sentence": {"attempt": 0, "seq": 2}, "heard": "full"}
+{"t": 19.9939, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 32166}
+{"t": 20.5027, "type": "assistant_transcript", "turn_index": 1, "delta": "Opening the release page.", "source": "gateway", "kind": "progress", "verbatim": false, "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "utterance_id": "u_15", "heard": "none"}
+{"t": 20.5028, "type": "audio_segment", "phase": "start", "utterance_id": "u_15", "lane": "front", "kind": "progress", "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "t_ms": 32675}
+{"t": 20.5028, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 32675}
+{"t": 20.703, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 32876}
+{"t": 20.7915, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 20.9961, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 33168}
+{"t": 21.0773, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 33250}
+{"t": 21.1009, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 21.2112, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 33384}
+{"t": 21.9155, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 22.3829, "type": "tts_playback_complete", "timestamp": 1793156634452}
+{"t": 22.3829, "type": "audio_segment", "phase": "end", "utterance_id": "u_15", "lane": "front", "kind": "progress", "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "t_ms": 34555}
+{"t": 22.3829, "type": "assistant_transcript", "turn_index": 1, "delta": "", "source": "gateway", "kind": "progress", "verbatim": false, "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "utterance_id": "u_15", "heard": "full"}
+{"t": 22.3829, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 34555}
+{"t": 23.0819, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 23.8621, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 23.8622, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 25.1234, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 25.8297, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 26.3081, "type": "task_output", "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "task_ref": "t2", "revision": 1, "state": "completed", "text": "Release one point one point oh is published as Latest with notes covering interaction mode and all three files; the page didn't show its publish date.", "data": null, "artifacts": [], "effects": "none_committed", "t_ms": 38480, "parent_id": "task_44e50b690f6745eb81740e0ce9503d3a", "agent": "browser", "trace_id": "33b9a344703349b381875f8c8b492d1f"}
+{"t": 26.3082, "type": "task_result", "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "task_ref": "t2", "revision": 1, "state": "completed", "status": "completed", "cancelling": false, "summary": "Release one point one point oh is published as Latest with notes covering interaction mode and all three files; the page didn't show its publish date.", "effects": "none_committed", "spoken": "none", "streamed": true, "superseded": false, "t_ms": 38480, "parent_id": "task_44e50b690f6745eb81740e0ce9503d3a", "agent": "browser", "trace_id": "33b9a344703349b381875f8c8b492d1f"}
+{"t": 27.0306, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 27.0306, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 27.1413, "type": "assistant_transcript", "turn_index": 1, "delta": "The GitHub release page shows the latest version as 1.1.0 with notes on interaction mode and all three files. The details are on your screen.", "source": "front", "kind": "update", "verbatim": false, "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "utterance_id": "u_16", "heard": "none"}
+{"t": 27.1413, "type": "audio_segment", "phase": "start", "utterance_id": "u_16", "lane": "front", "kind": "update", "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "t_ms": 39314}
+{"t": 27.1413, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 39314}
+{"t": 27.3421, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 39515}
+{"t": 27.5551, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 39728}
+{"t": 27.9715, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 28.5763, "type": "task_output", "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "task_ref": "t1", "revision": 1, "state": "completed", "text": "Morning! I'm pulling up the version one point one release on GitHub now to check it over. I'll tell you what I find. It all looks right. Version one point one is published and marked as the latest release. The notes cover interaction mode, and all three files are there: both Linux builds and the checksums. The only thing missing is the publish date, which the page didn't show.", "data": null, "artifacts": [], "effects": "none_committed", "t_ms": 40749, "parent_id": null, "agent": null, "trace_id": "33b9a344703349b381875f8c8b492d1f"}
+{"t": 28.5763, "type": "task_result", "task_id": "task_44e50b690f6745eb81740e0ce9503d3a", "task_ref": "t1", "revision": 1, "state": "completed", "status": "completed", "cancelling": false, "summary": "Morning! I'm pulling up the version one point one release on GitHub now to check it over. I'll tell you what I find. It all looks right. Version one point one is published and marked as the latest release. The notes cover interaction mode, and all three files are there: both Linux builds and the checksums. The only thing missing is the publish date, which the page didn't show.", "effects": "none_committed", "spoken": "full", "streamed": true, "superseded": false, "t_ms": 40749, "parent_id": null, "agent": null, "trace_id": "33b9a344703349b381875f8c8b492d1f"}
+{"t": 28.9004, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 30.1254, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 30.1255, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 30.9312, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 32.1634, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 33.1082, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 33.1082, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 33.5778, "type": "heartbeat", "t_ms": 45750}
+{"t": 34.043, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 34.9009, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 35.8069, "type": "tts_playback_complete", "timestamp": 1793156647876}
+{"t": 35.8069, "type": "audio_segment", "phase": "end", "utterance_id": "u_16", "lane": "front", "kind": "update", "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "t_ms": 47979}
+{"t": 35.8069, "type": "assistant_transcript", "turn_index": 1, "delta": "", "source": "front", "kind": "update", "verbatim": false, "task_id": "task_d130b614a1b84872a8d4b6bcdd29eb40", "utterance_id": "u_16", "heard": "full"}
+{"t": 35.8069, "type": "floor_state", "holder": "none", "lane": null, "reason": "idle", "t_ms": 47979}
+{"t": 36.0543, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 36.0543, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 36.9753, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 37.1639, "type": "floor_state", "holder": "user", "lane": null, "reason": "user_speech", "t_ms": 49336}
+{"t": 37.994, "type": "stt_result", "transcript": "Thanks.", "is_final": false, "is_speech_final": false, "confidence": 0.8688965}
+{"t": 39.0334, "type": "stt_result", "transcript": "Thanks. Remind me, how many", "is_final": false, "is_speech_final": false, "confidence": 0.9897461}
+{"t": 39.0335, "type": "stt_result", "transcript": "Thanks. Remind me, how many", "is_final": false, "is_speech_final": false, "confidence": 0.9680176}
+{"t": 40.0522, "type": "stt_result", "transcript": "Thanks. Remind me, how many speech vendors do we", "is_final": false, "is_speech_final": false, "confidence": 0.99902344}
+{"t": 41.1199, "type": "stt_result", "transcript": "Thanks. Remind me, how many speech vendors do we support now?", "is_final": true, "is_speech_final": true, "confidence": 0.99902344}
+{"t": 41.1209, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 53292}
+{"t": 41.4954, "type": "task_created", "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "task_ref": "t3", "revision": 1, "state": "working", "cancelling": false, "title": "Thanks. Remind me, how many speech vendors do we support", "kind": "action", "side_effects": true, "speculative": true, "origin": "front", "background": "llm", "t_ms": 53668, "parent_id": null, "agent": null, "trace_id": "46bc18098669475898500a81d3f7c718"}
+{"t": 41.8725, "type": "assistant_transcript", "turn_index": 2, "delta": "Just a second.", "source": "gateway", "kind": "ack", "verbatim": false, "utterance_id": "u_17", "heard": "none"}
+{"t": 41.8725, "type": "audio_segment", "phase": "start", "utterance_id": "u_17", "lane": "front", "kind": "ack", "task_id": null, "t_ms": 54045}
+{"t": 41.8725, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 54045}
+{"t": 42.0733, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 54246}
+{"t": 42.0982, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 42.3059, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 54478}
+{"t": 42.9962, "type": "tts_playback_complete", "timestamp": 1793156655065}
+{"t": 42.9962, "type": "audio_segment", "phase": "end", "utterance_id": "u_17", "lane": "front", "kind": "ack", "task_id": null, "t_ms": 55169}
+{"t": 42.9962, "type": "assistant_transcript", "turn_index": 2, "delta": "", "source": "gateway", "kind": "ack", "verbatim": false, "utterance_id": "u_17", "heard": "full"}
+{"t": 42.9962, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 55169}
+{"t": 43.0234, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 43.5341, "type": "task_output", "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "task_ref": "t3", "revision": 1, "state": "completed", "text": "Forty-four speech vendors. That's thirty-one for speech-to-text, thirty-four for text-to-speech and eleven for speech-to-speech, and it works with any LLM.", "data": null, "artifacts": [], "effects": "none_committed", "t_ms": 55707, "parent_id": null, "agent": null, "trace_id": "46bc18098669475898500a81d3f7c718"}
+{"t": 43.5341, "type": "task_result", "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "task_ref": "t3", "revision": 1, "state": "completed", "status": "completed", "cancelling": false, "summary": "Forty-four speech vendors. That's thirty-one for speech-to-text, thirty-four for text-to-speech and eleven for speech-to-speech, and it works with any LLM.", "effects": "none_committed", "spoken": "full", "streamed": true, "superseded": false, "t_ms": 55707, "parent_id": null, "agent": null, "trace_id": "46bc18098669475898500a81d3f7c718"}
+{"t": 43.5832, "type": "assistant_transcript", "turn_index": 2, "delta": "Forty-four speech vendors.", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "utterance_id": "u_18", "sentence": {"attempt": 0, "seq": 0}, "heard": "none"}
+{"t": 43.5833, "type": "audio_segment", "phase": "start", "utterance_id": "u_18", "lane": "main", "kind": "relay", "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "t_ms": 55756}
+{"t": 43.5833, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 55756}
+{"t": 44.0544, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 44.4506, "type": "audio_segment", "phase": "end", "utterance_id": "u_18", "lane": "main", "kind": "relay", "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "t_ms": 56623}
+{"t": 44.4506, "type": "assistant_transcript", "turn_index": 2, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "utterance_id": "u_18", "sentence": {"attempt": 0, "seq": 0}, "heard": "full"}
+{"t": 44.4507, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 56623}
+{"t": 45.19, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 45.3016, "type": "tts_playback_complete", "timestamp": 1793156657371}
+{"t": 45.3016, "type": "assistant_transcript", "turn_index": 2, "delta": "That's thirty-one for speech-to-text, thirty-four for text-to-speech and eleven for speech-to-speech, and it works with any LLM.", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "utterance_id": "u_19", "sentence": {"attempt": 0, "seq": 1}, "heard": "none"}
+{"t": 45.3016, "type": "audio_segment", "phase": "start", "utterance_id": "u_19", "lane": "main", "kind": "relay", "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "t_ms": 57474}
+{"t": 45.3016, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 57474}
+{"t": 46.1141, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 47.0519, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 48.348, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 49.0444, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 49.0444, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 50.0468, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 50.3032, "type": "heartbeat", "t_ms": 62475}
+{"t": 51.0384, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 52.1404, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 52.1405, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 52.9013, "type": "tts_playback_complete", "timestamp": 1793156664970}
+{"t": 52.9014, "type": "audio_segment", "phase": "end", "utterance_id": "u_19", "lane": "main", "kind": "relay", "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "t_ms": 65074}
+{"t": 52.9014, "type": "assistant_transcript", "turn_index": 2, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_eeaf6dde5bc84e6d80c3e83b884453e9", "utterance_id": "u_19", "sentence": {"attempt": 0, "seq": 1}, "heard": "full"}
+{"t": 52.9014, "type": "floor_state", "holder": "none", "lane": null, "reason": "idle", "t_ms": 65074}
+{"t": 53.1646, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 54.0397, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 54.2032, "type": "floor_state", "holder": "user", "lane": null, "reason": "user_speech", "t_ms": 66376}
+{"t": 55.2551, "type": "stt_result", "transcript": "Great.", "is_final": false, "is_speech_final": false, "confidence": 0.96655273}
+{"t": 56.269, "type": "stt_result", "transcript": "Great. Can you also get the down", "is_final": false, "is_speech_final": false, "confidence": 1.0}
+{"t": 57.3579, "type": "stt_result", "transcript": "Great. Can you also get the download numbers in the", "is_final": false, "is_speech_final": false, "confidence": 1.0}
+{"t": 57.6757, "type": "stt_result", "transcript": "Great. Can you also get the download numbers in the terminal?", "is_final": true, "is_speech_final": true, "confidence": 1.0}
+{"t": 57.6757, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 69848}
+{"t": 57.894, "type": "task_created", "task_id": "task_011336a3670f46168f0ae4a737c0e177", "task_ref": "t4", "revision": 1, "state": "working", "cancelling": false, "title": "Great. Can you also get the download numbers in the", "kind": "action", "side_effects": true, "speculative": true, "origin": "front", "background": "llm", "t_ms": 70066, "parent_id": null, "agent": null, "trace_id": "70f84b59d3284125b687e3c53c38f716"}
+{"t": 58.391, "type": "assistant_transcript", "turn_index": 3, "delta": "Let me look into that.", "source": "gateway", "kind": "ack", "verbatim": false, "utterance_id": "u_20", "heard": "none"}
+{"t": 58.391, "type": "audio_segment", "phase": "start", "utterance_id": "u_20", "lane": "front", "kind": "ack", "task_id": null, "t_ms": 70563}
+{"t": 58.391, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 70564}
+{"t": 58.5921, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 70765}
+{"t": 58.7996, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 58.7997, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 70972}
+{"t": 59.6839, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 59.7705, "type": "tts_playback_complete", "timestamp": 1793156671840}
+{"t": 59.7705, "type": "audio_segment", "phase": "end", "utterance_id": "u_20", "lane": "front", "kind": "ack", "task_id": null, "t_ms": 71943}
+{"t": 59.7705, "type": "assistant_transcript", "turn_index": 3, "delta": "", "source": "gateway", "kind": "ack", "verbatim": false, "utterance_id": "u_20", "heard": "full"}
+{"t": 59.7705, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 71943}
+{"t": 60.3193, "type": "task_created", "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "task_ref": "t5", "revision": 1, "state": "working", "cancelling": false, "title": "Get the release download numbers: Run curl -s", "kind": "lookup", "side_effects": false, "speculative": false, "origin": "front", "background": "webhook:terminal", "t_ms": 72492, "parent_id": "task_011336a3670f46168f0ae4a737c0e177", "agent": "terminal", "trace_id": "70f84b59d3284125b687e3c53c38f716"}
+{"t": 60.7176, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 61.87, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 62.2495, "type": "assistant_transcript", "turn_index": 3, "delta": "I'm pulling the download numbers in the terminal now.", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_011336a3670f46168f0ae4a737c0e177", "utterance_id": "u_21", "sentence": {"attempt": 0, "seq": 0}, "heard": "none"}
+{"t": 62.2495, "type": "audio_segment", "phase": "start", "utterance_id": "u_21", "lane": "main", "kind": "relay", "task_id": "task_011336a3670f46168f0ae4a737c0e177", "t_ms": 74422}
+{"t": 62.2496, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 74422}
+{"t": 62.69, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 63.7218, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 63.8106, "type": "task_progress", "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "task_ref": "t5", "revision": 1, "state": "working", "cancelling": false, "seq": 2, "text": "Fetching release download counts.", "fraction": null, "spoken": false, "effects": null, "answer_stopped": null, "t_ms": 75983, "parent_id": "task_011336a3670f46168f0ae4a737c0e177", "agent": "terminal", "trace_id": "70f84b59d3284125b687e3c53c38f716"}
+{"t": 64.7384, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 65.2793, "type": "tts_playback_complete", "timestamp": 1793156677348}
+{"t": 65.2793, "type": "audio_segment", "phase": "end", "utterance_id": "u_21", "lane": "main", "kind": "relay", "task_id": "task_011336a3670f46168f0ae4a737c0e177", "t_ms": 77452}
+{"t": 65.2793, "type": "assistant_transcript", "turn_index": 3, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_011336a3670f46168f0ae4a737c0e177", "utterance_id": "u_21", "sentence": {"attempt": 0, "seq": 0}, "heard": "full"}
+{"t": 65.2794, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 77452}
+{"t": 65.2794, "type": "assistant_transcript", "turn_index": 3, "delta": "I'll read them out as soon as they're in.", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_011336a3670f46168f0ae4a737c0e177", "utterance_id": "u_22", "sentence": {"attempt": 0, "seq": 1}, "heard": "none"}
+{"t": 65.2794, "type": "audio_segment", "phase": "start", "utterance_id": "u_22", "lane": "main", "kind": "relay", "task_id": "task_011336a3670f46168f0ae4a737c0e177", "t_ms": 77452}
+{"t": 65.2794, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 77452}
+{"t": 65.7047, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 65.7898, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 66.7237, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 67.3193, "type": "tts_playback_complete", "timestamp": 1793156679388}
+{"t": 67.3194, "type": "audio_segment", "phase": "end", "utterance_id": "u_22", "lane": "main", "kind": "relay", "task_id": "task_011336a3670f46168f0ae4a737c0e177", "t_ms": 79492}
+{"t": 67.3194, "type": "assistant_transcript", "turn_index": 3, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_011336a3670f46168f0ae4a737c0e177", "utterance_id": "u_22", "sentence": {"attempt": 0, "seq": 1}, "heard": "full"}
+{"t": 67.3194, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 79492}
+{"t": 67.749, "type": "assistant_transcript", "turn_index": 3, "delta": "Fetching release download counts.", "source": "gateway", "kind": "progress", "verbatim": false, "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "utterance_id": "u_23", "heard": "none"}
+{"t": 67.749, "type": "audio_segment", "phase": "start", "utterance_id": "u_23", "lane": "front", "kind": "progress", "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "t_ms": 79922}
+{"t": 67.7491, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 79922}
+{"t": 67.7491, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 67.95, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 80123}
+{"t": 68.1213, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 80294}
+{"t": 68.7221, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 80895}
+{"t": 68.9432, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 81116}
+{"t": 68.9971, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 68.9971, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 69.8747, "type": "tts_playback_complete", "timestamp": 1793156681944}
+{"t": 69.8748, "type": "audio_segment", "phase": "end", "utterance_id": "u_23", "lane": "front", "kind": "progress", "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "t_ms": 82047}
+{"t": 69.8748, "type": "assistant_transcript", "turn_index": 3, "delta": "", "source": "gateway", "kind": "progress", "verbatim": false, "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "utterance_id": "u_23", "heard": "full"}
+{"t": 69.8748, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 82047}
+{"t": 69.9266, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 70.7193, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 71.8525, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 71.8531, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 72.8551, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 73.754, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 74.7968, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 74.7968, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 74.876, "type": "heartbeat", "t_ms": 87048}
+{"t": 75.8036, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 76.8265, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 77.0412, "type": "task_output", "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "task_ref": "t5", "revision": 1, "state": "completed", "text": "For release one point one point zero, the x86 build has zero downloads, the ARM build twelve, and the checksum list fourteen, twenty-six in total.", "data": null, "artifacts": [], "effects": "none_committed", "t_ms": 89213, "parent_id": "task_011336a3670f46168f0ae4a737c0e177", "agent": "terminal", "trace_id": "70f84b59d3284125b687e3c53c38f716"}
+{"t": 77.0412, "type": "task_result", "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "task_ref": "t5", "revision": 1, "state": "completed", "status": "completed", "cancelling": false, "summary": "For release one point one point zero, the x86 build has zero downloads, the ARM build twelve, and the checksum list fourteen, twenty-six in total.", "effects": "none_committed", "spoken": "none", "streamed": true, "superseded": false, "t_ms": 89213, "parent_id": "task_011336a3670f46168f0ae4a737c0e177", "agent": "terminal", "trace_id": "70f84b59d3284125b687e3c53c38f716"}
+{"t": 77.7494, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 77.7953, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 78.247, "type": "assistant_transcript", "turn_index": 3, "delta": "This one's taking a little longer. I'm still on it.", "source": "gateway", "kind": "hold", "verbatim": false, "utterance_id": "u_24", "heard": "none"}
+{"t": 78.247, "type": "audio_segment", "phase": "start", "utterance_id": "u_24", "lane": "front", "kind": "hold", "task_id": null, "t_ms": 90419}
+{"t": 78.247, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 90419}
+{"t": 78.3673, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 90540}
+{"t": 78.3704, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 90543}
+{"t": 78.4511, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 90624}
+{"t": 78.7732, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 90946}
+{"t": 78.8126, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 79.5184, "type": "task_output", "task_id": "task_011336a3670f46168f0ae4a737c0e177", "task_ref": "t4", "revision": 1, "state": "completed", "text": "I'm pulling the download numbers in the terminal now. I'll read them out as soon as they're in. Version one point one has twenty-six downloads in total. The ARM build has twelve and the checksum list has fourteen. The x86 build has zero, which seems odd, so it might be worth a look.", "data": null, "artifacts": [], "effects": "none_committed", "t_ms": 91691, "parent_id": null, "agent": null, "trace_id": "70f84b59d3284125b687e3c53c38f716"}
+{"t": 79.5184, "type": "task_result", "task_id": "task_011336a3670f46168f0ae4a737c0e177", "task_ref": "t4", "revision": 1, "state": "completed", "status": "completed", "cancelling": false, "summary": "I'm pulling the download numbers in the terminal now. I'll read them out as soon as they're in. Version one point one has twenty-six downloads in total. The ARM build has twelve and the checksum list has fourteen. The x86 build has zero, which seems odd, so it might be worth a look.", "effects": "none_committed", "spoken": "full", "streamed": true, "superseded": false, "t_ms": 91691, "parent_id": null, "agent": null, "trace_id": "70f84b59d3284125b687e3c53c38f716"}
+{"t": 80.055, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 81.1353, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 81.136, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 81.5448, "type": "tts_playback_complete", "timestamp": 1793156693614}
+{"t": 81.5452, "type": "audio_segment", "phase": "end", "utterance_id": "u_24", "lane": "front", "kind": "hold", "task_id": null, "t_ms": 93717}
+{"t": 81.5452, "type": "assistant_transcript", "turn_index": 3, "delta": "", "source": "gateway", "kind": "hold", "verbatim": false, "utterance_id": "u_24", "heard": "full"}
+{"t": 81.5452, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 93717}
+{"t": 81.5452, "type": "assistant_transcript", "turn_index": 3, "delta": "The release download counts are now available: one point one point zero for the x86 build, twelve for ARM. The details are on your screen.", "source": "front", "kind": "update", "verbatim": false, "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "utterance_id": "u_25", "heard": "none"}
+{"t": 81.5452, "type": "audio_segment", "phase": "start", "utterance_id": "u_25", "lane": "front", "kind": "update", "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "t_ms": 93717}
+{"t": 81.5452, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 93718}
+{"t": 81.8701, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 83.0449, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 83.8096, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 83.921, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 84.9216, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 85.8646, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 86.5468, "type": "heartbeat", "t_ms": 98719}
+{"t": 86.9707, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 86.9719, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 87.8774, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 88.9282, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 89.8436, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 90.0141, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 90.0644, "type": "tts_playback_complete", "timestamp": 1793156702134}
+{"t": 90.0645, "type": "audio_segment", "phase": "end", "utterance_id": "u_25", "lane": "front", "kind": "update", "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "t_ms": 102237}
+{"t": 90.0645, "type": "assistant_transcript", "turn_index": 3, "delta": "", "source": "front", "kind": "update", "verbatim": false, "task_id": "task_9e51fab6435c4b2cb17e64e43b074459", "utterance_id": "u_25", "heard": "full"}
+{"t": 90.0645, "type": "floor_state", "holder": "none", "lane": null, "reason": "idle", "t_ms": 102237}
+{"t": 90.8579, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 91.8851, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 92.1438, "type": "floor_state", "holder": "user", "lane": null, "reason": "user_speech", "t_ms": 104316}
+{"t": 92.9099, "type": "stt_result", "transcript": "Nice.", "is_final": false, "is_speech_final": false, "confidence": 0.97509766}
+{"t": 92.9099, "type": "stt_result", "transcript": "Nice.", "is_final": false, "is_speech_final": false, "confidence": 0.9851074}
+{"t": 93.9346, "type": "stt_result", "transcript": "Nice. Can you draft the", "is_final": false, "is_speech_final": false, "confidence": 0.99902344}
+{"t": 94.9539, "type": "stt_result", "transcript": "Nice. Can you draft the launch announcement now", "is_final": false, "is_speech_final": false, "confidence": 1.0}
+{"t": 95.8699, "type": "stt_result", "transcript": "Nice. Can you draft the launch announcement now with those numbers", "is_final": false, "is_speech_final": false, "confidence": 1.0}
+{"t": 95.8699, "type": "stt_result", "transcript": "Nice. Can you draft the launch announcement now?", "is_final": true, "is_speech_final": false, "confidence": 1.0}
+{"t": 96.1108, "type": "stt_result", "transcript": "", "is_final": true, "is_speech_final": true, "confidence": 1.0, "segment_transcript": "Nice. Can you draft the launch announcement now?"}
+{"t": 96.1109, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 108283}
+{"t": 96.2529, "type": "stt_result", "transcript": "With those numbers in", "is_final": false, "is_speech_final": false, "confidence": 1.0}
+{"t": 96.253, "type": "floor_state", "holder": "user", "lane": null, "reason": "user_speech", "t_ms": 108425}
+{"t": 96.5328, "type": "stt_result", "transcript": "With those numbers in it?", "is_final": true, "is_speech_final": true, "confidence": 1.0}
+{"t": 96.5329, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 108705}
+{"t": 96.8716, "type": "task_created", "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "task_ref": "t6", "revision": 1, "state": "working", "cancelling": false, "title": "Nice. Can you draft the launch announcement now? With those", "kind": "action", "side_effects": true, "speculative": true, "origin": "front", "background": "llm", "t_ms": 109044, "parent_id": null, "agent": null, "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 97.3172, "type": "assistant_transcript", "turn_index": 5, "delta": "Just a second.", "source": "gateway", "kind": "ack", "verbatim": false, "utterance_id": "u_26", "heard": "none"}
+{"t": 97.3172, "type": "audio_segment", "phase": "start", "utterance_id": "u_26", "lane": "front", "kind": "ack", "task_id": null, "t_ms": 109489}
+{"t": 97.3172, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 109490}
+{"t": 97.5183, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 109691}
+{"t": 97.527, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 97.729, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 109901}
+{"t": 98.1791, "type": "tts_playback_complete", "timestamp": 1793156710248}
+{"t": 98.1791, "type": "audio_segment", "phase": "end", "utterance_id": "u_26", "lane": "front", "kind": "ack", "task_id": null, "t_ms": 110352}
+{"t": 98.1791, "type": "assistant_transcript", "turn_index": 5, "delta": "", "source": "gateway", "kind": "ack", "verbatim": false, "utterance_id": "u_26", "heard": "full"}
+{"t": 98.1791, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 110352}
+{"t": 98.5334, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 99.5525, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 100.5321, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 101.5965, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 102.1321, "type": "task_created", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "revision": 1, "state": "working", "cancelling": false, "title": "Draft the launch announcement: Write a launch announcement", "kind": "action", "side_effects": true, "speculative": false, "origin": "front", "background": "webhook:writer", "t_ms": 114305, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 102.1336, "type": "task_progress", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "revision": 1, "state": "working", "cancelling": false, "seq": 2, "text": null, "fraction": null, "spoken": false, "effects": null, "answer_stopped": null, "t_ms": 114306, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 102.5276, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 103.5305, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 104.4999, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 104.5, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 104.9877, "type": "assistant_transcript", "turn_index": 5, "delta": "I've started drafting the announcement.", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "utterance_id": "u_27", "sentence": {"attempt": 0, "seq": 0}, "heard": "none"}
+{"t": 104.9877, "type": "audio_segment", "phase": "start", "utterance_id": "u_27", "lane": "main", "kind": "relay", "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "t_ms": 117160}
+{"t": 104.9877, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 117160}
+{"t": 105.5974, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 106.5221, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 106.8869, "type": "tts_playback_complete", "timestamp": 1793156718956}
+{"t": 106.887, "type": "audio_segment", "phase": "end", "utterance_id": "u_27", "lane": "main", "kind": "relay", "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "t_ms": 119059}
+{"t": 106.887, "type": "assistant_transcript", "turn_index": 5, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "utterance_id": "u_27", "sentence": {"attempt": 0, "seq": 0}, "heard": "full"}
+{"t": 106.887, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 119059}
+{"t": 106.887, "type": "assistant_transcript", "turn_index": 5, "delta": "Quick fix on what you heard before: the x86 build actually has zero downloads, ARM has twelve, and the checksum file has fourteen.", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "utterance_id": "u_28", "sentence": {"attempt": 0, "seq": 1}, "heard": "none"}
+{"t": 106.887, "type": "audio_segment", "phase": "start", "utterance_id": "u_28", "lane": "main", "kind": "relay", "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "t_ms": 119059}
+{"t": 106.8871, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 119059}
+{"t": 107.726, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 107.726, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 108.405, "type": "task_progress", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "revision": 1, "state": "working", "cancelling": false, "seq": 3, "text": "Typing the launch announcement now.", "fraction": null, "spoken": false, "effects": null, "answer_stopped": null, "t_ms": 120578, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 108.5265, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 109.5622, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 110.5073, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 110.7656, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 111.5869, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 112.5522, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 113.4068, "type": "heartbeat", "t_ms": 125579}
+{"t": 113.5752, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 113.5754, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 114.8494, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 115.6386, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 115.8066, "type": "tts_playback_complete", "timestamp": 1793156727876}
+{"t": 115.8067, "type": "audio_segment", "phase": "end", "utterance_id": "u_28", "lane": "main", "kind": "relay", "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "t_ms": 127979}
+{"t": 115.8067, "type": "assistant_transcript", "turn_index": 5, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "utterance_id": "u_28", "sentence": {"attempt": 0, "seq": 1}, "heard": "full"}
+{"t": 115.8067, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 127979}
+{"t": 115.8067, "type": "assistant_transcript", "turn_index": 5, "delta": "That's twenty-six in total.", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "utterance_id": "u_29", "sentence": {"attempt": 0, "seq": 2}, "heard": "none"}
+{"t": 115.8067, "type": "audio_segment", "phase": "start", "utterance_id": "u_29", "lane": "main", "kind": "relay", "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "t_ms": 127979}
+{"t": 115.8067, "type": "floor_state", "holder": "assistant", "lane": "main", "reason": "relay", "t_ms": 127979}
+{"t": 116.5934, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 116.6423, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 117.326, "type": "tts_playback_complete", "timestamp": 1793156729395}
+{"t": 117.3261, "type": "audio_segment", "phase": "end", "utterance_id": "u_29", "lane": "main", "kind": "relay", "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "t_ms": 129498}
+{"t": 117.3261, "type": "assistant_transcript", "turn_index": 5, "delta": "", "source": "background", "kind": "relay", "verbatim": true, "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "utterance_id": "u_29", "sentence": {"attempt": 0, "seq": 2}, "heard": "full"}
+{"t": 117.3261, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 129498}
+{"t": 117.3261, "type": "assistant_transcript", "turn_index": 5, "delta": "I'm still on it.", "source": "gateway", "kind": "hold", "verbatim": false, "utterance_id": "u_30", "heard": "none"}
+{"t": 117.3261, "type": "audio_segment", "phase": "start", "utterance_id": "u_30", "lane": "front", "kind": "hold", "task_id": null, "t_ms": 129498}
+{"t": 117.3261, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 129499}
+{"t": 117.7148, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 118.566, "type": "tts_playback_complete", "timestamp": 1793156730635}
+{"t": 118.5661, "type": "audio_segment", "phase": "end", "utterance_id": "u_30", "lane": "front", "kind": "hold", "task_id": null, "t_ms": 130738}
+{"t": 118.5661, "type": "assistant_transcript", "turn_index": 5, "delta": "", "source": "gateway", "kind": "hold", "verbatim": false, "utterance_id": "u_30", "heard": "full"}
+{"t": 118.5661, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 130738}
+{"t": 118.7068, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 118.9079, "type": "assistant_transcript", "turn_index": 5, "delta": "Typing the launch announcement now.", "source": "gateway", "kind": "progress", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_31", "heard": "none"}
+{"t": 118.908, "type": "audio_segment", "phase": "start", "utterance_id": "u_31", "lane": "front", "kind": "progress", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 131080}
+{"t": 118.908, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 131080}
+{"t": 118.9482, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 131121}
+{"t": 118.9923, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 131165}
+{"t": 119.1535, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 131326}
+{"t": 119.5493, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 131722}
+{"t": 119.6459, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 119.6459, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 120.6298, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 121.2, "type": "tts_playback_complete", "timestamp": 1793156733269}
+{"t": 121.2, "type": "audio_segment", "phase": "end", "utterance_id": "u_31", "lane": "front", "kind": "progress", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 133372}
+{"t": 121.2, "type": "assistant_transcript", "turn_index": 5, "delta": "", "source": "gateway", "kind": "progress", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_31", "heard": "full"}
+{"t": 121.2, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 133372}
+{"t": 121.696, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 122.5862, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 122.825, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 123.6235, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 124.1742, "type": "task_question", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "state": "input_required", "cancelling": false, "request_id": "q_task_5b9506635ae14b2e8540cf7db769ac4c_1", "kind": "confirm", "prompt": "To confirm: save the document, Bud WaaV 1.1.0 Is Out. Do you want me to do that?", "options": null, "schema": null, "sensitive": false, "irreversible": true, "channels": ["voice", "client"], "expires_at_ms": 156347, "spoken": true, "heard": "pending", "t_ms": 136347, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 124.6286, "type": "assistant_transcript", "turn_index": 5, "delta": "To confirm:", "source": "gateway", "kind": "confirm", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_32", "heard": "none"}
+{"t": 124.6286, "type": "audio_segment", "phase": "start", "utterance_id": "u_32", "lane": "front", "kind": "confirm", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 136801}
+{"t": 124.6287, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 136801}
+{"t": 124.6288, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 124.8292, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 137001}
+{"t": 125.0811, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 137254}
+{"t": 125.5722, "type": "tts_playback_complete", "timestamp": 1793156737641}
+{"t": 125.5722, "type": "audio_segment", "phase": "end", "utterance_id": "u_32", "lane": "front", "kind": "confirm", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 137745}
+{"t": 125.5722, "type": "assistant_transcript", "turn_index": 5, "delta": "", "source": "gateway", "kind": "confirm", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_32", "heard": "full"}
+{"t": 125.5723, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 137745}
+{"t": 125.6153, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 125.6614, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 125.7657, "type": "assistant_transcript", "turn_index": 5, "delta": "save the document, Bud WaaV 1.1.0 Is Out.", "source": "gateway", "kind": "confirm", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_33", "heard": "none"}
+{"t": 125.7658, "type": "audio_segment", "phase": "start", "utterance_id": "u_33", "lane": "front", "kind": "confirm", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 137938}
+{"t": 125.7658, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 137938}
+{"t": 125.8068, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 137979}
+{"t": 125.8915, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 138064}
+{"t": 126.6675, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 127.6586, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 128.6831, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 128.6831, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 129.5825, "type": "tts_playback_complete", "timestamp": 1793156741652}
+{"t": 129.5825, "type": "audio_segment", "phase": "end", "utterance_id": "u_33", "lane": "front", "kind": "confirm", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 141755}
+{"t": 129.5825, "type": "assistant_transcript", "turn_index": 5, "delta": "", "source": "gateway", "kind": "confirm", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_33", "heard": "full"}
+{"t": 129.5826, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 141755}
+{"t": 129.5826, "type": "assistant_transcript", "turn_index": 5, "delta": "Do you want me to do that?", "source": "gateway", "kind": "question", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_34", "heard": "none"}
+{"t": 129.5826, "type": "audio_segment", "phase": "start", "utterance_id": "u_34", "lane": "front", "kind": "question", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 141755}
+{"t": 129.5826, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 141755}
+{"t": 129.7343, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 130.7822, "type": "tts_playback_complete", "timestamp": 1793156742851}
+{"t": 130.7822, "type": "audio_segment", "phase": "end", "utterance_id": "u_34", "lane": "front", "kind": "question", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 142955}
+{"t": 130.7822, "type": "assistant_transcript", "turn_index": 5, "delta": "", "source": "gateway", "kind": "question", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_34", "heard": "full"}
+{"t": 130.7822, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 142955}
+{"t": 130.8216, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 131.6766, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 131.694, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 132.6798, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 133.7282, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 134.7463, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 134.7463, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 135.7691, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 135.7833, "type": "heartbeat", "t_ms": 147956}
+{"t": 136.7644, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 137.8211, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 137.8211, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 138.8643, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 139.4038, "type": "floor_state", "holder": "user", "lane": null, "reason": "user_speech", "t_ms": 151576}
+{"t": 139.4847, "type": "assistant_transcript", "turn_index": 5, "delta": "Do you want me to save the document?", "source": "gateway", "kind": "question", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_35", "heard": "none"}
+{"t": 139.4848, "type": "audio_segment", "phase": "start", "utterance_id": "u_35", "lane": "front", "kind": "question", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 151657}
+{"t": 139.4848, "type": "floor_state", "holder": "both", "lane": "front", "reason": "user_speech", "t_ms": 151657}
+{"t": 139.685, "type": "floor_state", "holder": "user", "lane": null, "reason": "user_speech", "t_ms": 151858}
+{"t": 139.7597, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 139.8645, "type": "floor_state", "holder": "both", "lane": "front", "reason": "user_speech", "t_ms": 152037}
+{"t": 141.1952, "type": "stt_result", "transcript": "Yes. Go ahead.", "is_final": true, "is_speech_final": true, "confidence": 1.0}
+{"t": 141.1954, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 153368}
+{"t": 141.2584, "type": "task_answer_received", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "state": "working", "cancelling": false, "request_id": "q_task_5b9506635ae14b2e8540cf7db769ac4c_1", "outcome": "accept", "reason": null, "correction": null, "by": "voice", "corroborated": false, "value": null, "value_redacted": false, "t_ms": 153431, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 141.2584, "type": "agent_audio_stopped", "utterance_ids": ["u_35"], "reason": "policy", "delivered_ms": [1760], "t_ms": 153431}
+{"t": 141.2584, "type": "audio_segment", "phase": "end", "utterance_id": "u_35", "lane": "front", "kind": "question", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 153431}
+{"t": 141.2584, "type": "assistant_transcript", "turn_index": 6, "delta": "", "source": "gateway", "kind": "question", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_35", "heard": "partial"}
+{"t": 141.2584, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 153431}
+{"t": 141.2592, "type": "task_progress", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "revision": 1, "state": "working", "cancelling": false, "seq": 6, "text": "Typing the launch announcement now.", "fraction": null, "spoken": false, "effects": null, "answer_stopped": null, "t_ms": 153432, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 141.6765, "type": "assistant_transcript", "turn_index": 6, "delta": "Okay.", "source": "gateway", "kind": "notice", "verbatim": false, "utterance_id": "u_36", "heard": "none"}
+{"t": 141.6766, "type": "audio_segment", "phase": "start", "utterance_id": "u_36", "lane": "front", "kind": "notice", "task_id": null, "t_ms": 153849}
+{"t": 141.6766, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 153849}
+{"t": 141.8123, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 142.1276, "type": "tts_playback_complete", "timestamp": 1793156754197}
+{"t": 142.1277, "type": "audio_segment", "phase": "end", "utterance_id": "u_36", "lane": "front", "kind": "notice", "task_id": null, "t_ms": 154300}
+{"t": 142.1277, "type": "assistant_transcript", "turn_index": 6, "delta": "", "source": "gateway", "kind": "notice", "verbatim": false, "utterance_id": "u_36", "heard": "full"}
+{"t": 142.1277, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 154300}
+{"t": 142.6292, "type": "assistant_transcript", "turn_index": 6, "delta": "Typing the launch announcement now.", "source": "gateway", "kind": "progress", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_37", "heard": "none"}
+{"t": 142.6292, "type": "audio_segment", "phase": "start", "utterance_id": "u_37", "lane": "front", "kind": "progress", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 154802}
+{"t": 142.6292, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "hold", "t_ms": 154802}
+{"t": 142.8176, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 143.8783, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 144.5204, "type": "tts_playback_complete", "timestamp": 1793156756590}
+{"t": 144.5204, "type": "audio_segment", "phase": "end", "utterance_id": "u_37", "lane": "front", "kind": "progress", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 156693}
+{"t": 144.5204, "type": "assistant_transcript", "turn_index": 6, "delta": "", "source": "gateway", "kind": "progress", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_37", "heard": "full"}
+{"t": 144.5204, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 156693}
+{"t": 144.8895, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 145.798, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 146.7267, "type": "task_progress", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "revision": 1, "state": "working", "cancelling": false, "seq": 7, "text": null, "fraction": null, "spoken": false, "effects": ["saved Bud WaaV 1.1.0 Is Out"], "answer_stopped": null, "t_ms": 158899, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 146.7267, "type": "task_progress", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "revision": 1, "state": "working", "cancelling": false, "seq": 8, "text": "Typing the launch announcement now.", "fraction": null, "spoken": false, "effects": null, "answer_stopped": null, "t_ms": 158899, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 146.9386, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 147.8472, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 148.5173, "type": "task_output", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "revision": 1, "state": "completed", "text": "I saved the launch announcement with the new features and the current download counts.", "data": null, "artifacts": [], "effects": ["saved Bud WaaV 1.1.0 Is Out"], "t_ms": 160690, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 148.5173, "type": "task_result", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "task_ref": "t7", "revision": 1, "state": "completed", "status": "completed", "cancelling": false, "summary": "I saved the launch announcement with the new features and the current download counts.", "effects": ["saved Bud WaaV 1.1.0 Is Out"], "spoken": "none", "streamed": true, "superseded": false, "t_ms": 160690, "parent_id": "task_4b8a8a08bba64a64895171c9075049bb", "agent": "writer", "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 148.8683, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 149.745, "type": "assistant_transcript", "turn_index": 6, "delta": "The launch announcement has been saved with new features and current download counts. The details are on your screen.", "source": "front", "kind": "update", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_38", "heard": "none"}
+{"t": 149.7451, "type": "audio_segment", "phase": "start", "utterance_id": "u_38", "lane": "front", "kind": "update", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 161917}
+{"t": 149.7451, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 161917}
+{"t": 149.8305, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 149.9457, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 162118}
+{"t": 150.3645, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 162537}
+{"t": 150.8724, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 151.7348, "type": "task_output", "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "task_ref": "t6", "revision": 1, "state": "completed", "text": "I've started drafting the announcement. Quick fix on what you heard before: the x86 build actually has zero downloads, ARM has twelve, and the checksum file has fourteen. That's twenty-six in total. The announcement is saved in your word processor, with the download numbers in it. It should have waited for your okay first, sorry about that. Have a look and tell me if you want anything changed.", "data": null, "artifacts": [], "effects": "none_committed", "t_ms": 163907, "parent_id": null, "agent": null, "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 151.7348, "type": "task_result", "task_id": "task_4b8a8a08bba64a64895171c9075049bb", "task_ref": "t6", "revision": 1, "state": "completed", "status": "completed", "cancelling": false, "summary": "I've started drafting the announcement. Quick fix on what you heard before: the x86 build actually has zero downloads, ARM has twelve, and the checksum file has fourteen. That's twenty-six in total. The announcement is saved in your word processor, with the download numbers in it. It should have waited for your okay first, sorry about that. Have a look and tell me if you want anything changed.", "effects": "none_committed", "spoken": "full", "streamed": true, "superseded": false, "t_ms": 163907, "parent_id": null, "agent": null, "trace_id": "dd0cf4571d9a48de95314ca1d7d427bb"}
+{"t": 151.8364, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 152.8206, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 153.8753, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 154.81, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 155.8869, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 155.9758, "type": "tts_playback_complete", "timestamp": 1793156768045}
+{"t": 155.9758, "type": "audio_segment", "phase": "end", "utterance_id": "u_38", "lane": "front", "kind": "update", "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "t_ms": 168148}
+{"t": 155.9758, "type": "assistant_transcript", "turn_index": 6, "delta": "", "source": "front", "kind": "update", "verbatim": false, "task_id": "task_5b9506635ae14b2e8540cf7db769ac4c", "utterance_id": "u_38", "heard": "full"}
+{"t": 155.9758, "type": "floor_state", "holder": "none", "lane": null, "reason": "idle", "t_ms": 168148}
+{"t": 156.9176, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 157.9685, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 158.1047, "type": "floor_state", "holder": "user", "lane": null, "reason": "user_speech", "t_ms": 170277}
+{"t": 158.9448, "type": "stt_result", "transcript": "Perfect.", "is_final": false, "is_speech_final": false, "confidence": 0.9765625}
+{"t": 159.8065, "type": "stt_result", "transcript": "Perfect. That's everything.", "is_final": false, "is_speech_final": false, "confidence": 0.9946289}
+{"t": 159.923, "type": "stt_result", "transcript": "Perfect. That's everything.", "is_final": true, "is_speech_final": true, "confidence": 0.99560547}
+{"t": 160.8162, "type": "stt_result", "transcript": "Eva.", "is_final": true, "is_speech_final": true, "confidence": 0.8720703}
+{"t": 160.8162, "type": "floor_state", "holder": "assistant", "lane": null, "reason": "hold", "t_ms": 172989}
+{"t": 161.4667, "type": "assistant_transcript", "turn_index": 7, "delta": "You're welcome.", "source": "gateway", "kind": "answer", "verbatim": false, "utterance_id": "u_39", "heard": "none"}
+{"t": 161.4667, "type": "audio_segment", "phase": "start", "utterance_id": "u_39", "lane": "front", "kind": "answer", "task_id": null, "t_ms": 173639}
+{"t": 161.4667, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 173639}
+{"t": 161.5079, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 173680}
+{"t": 161.5836, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 173756}
+{"t": 161.7446, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "relay", "t_ms": 173917}
+{"t": 161.8678, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 161.8679, "type": "floor_state", "holder": "assistant", "lane": "front", "reason": "front_ack", "t_ms": 174040}
+{"t": 162.3192, "type": "tts_playback_complete", "timestamp": 1793156774388}
+{"t": 162.3192, "type": "audio_segment", "phase": "end", "utterance_id": "u_39", "lane": "front", "kind": "answer", "task_id": null, "t_ms": 174492}
+{"t": 162.3192, "type": "assistant_transcript", "turn_index": 7, "delta": "", "source": "gateway", "kind": "answer", "verbatim": false, "utterance_id": "u_39", "heard": "full"}
+{"t": 162.3192, "type": "floor_state", "holder": "none", "lane": null, "reason": "idle", "t_ms": 174492}
+{"t": 162.7891, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 163.8106, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}
+{"t": 164.7364, "type": "stt_result", "transcript": "", "is_final": false, "is_speech_final": false, "confidence": 0.0}

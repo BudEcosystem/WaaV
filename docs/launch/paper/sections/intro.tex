@@ -1,0 +1,60 @@
+\section{Introduction}\label{sec:intro}
+
+People take turns quickly. In recordings of ten languages, answers to yes/no questions most often began
+within about 200\,ms of the end of the question~\citep{stivers2009universals}, which implies that
+listeners plan their response while the other person is still talking~\citep{levinson2015timing}.
+Listeners also signal attention while the other person talks, give way when interrupted, and do not
+treat every pause as an invitation to speak~\citep{sacks1974turntaking,skantze2021review}. A voice agent
+that must \emph{do} something on a call, such as look up an order or change a booking, faces a harder
+version of this problem: the work may take seconds or minutes, the caller keeps talking while it runs,
+and some of what the caller says changes the work (``actually, make it eight'').
+
+A classical cascade of speech-to-text, a language model and text-to-speech answers only after the whole
+chain has run. On Full-Duplex-Bench v3, a benchmark of tool use under real disfluency, a
+Whisper$\to$GPT-4o$\to$TTS cascade spoke its first words 8.78\,s after the end of the user's speech, later
+than any other system tested, and completed the task after 10.12\,s~\citep{lin2026fdbv3}. End-to-end full-duplex models remove most of that delay but
+trade it for floor control: on the Full-Duplex-Bench v1 leaderboard Moshi starts its response 0.265\,s
+after the user stops but takes the floor in 98.5\% of synthetic pauses, while the GPT-Realtime entry does
+so in 1.0\% of them and responds after 1.470\,s~\citep{fdb_repo,lin2025fdbv1}. Neither end of this
+trade-off suits an agent that must also act.
+
+In 2026 a third design became prominent. Thinking Machines Lab's \emph{interaction models} pair a
+real-time interaction model, which processes audio in 200\,ms micro-turns, with an asynchronous background
+model for reasoning and tool use that shares its context; the interaction model is a 276B-parameter
+mixture-of-experts (12B active) trained from scratch, and the system was announced as a research
+preview~\citep{tml2026interaction}. OpenAI's GPT-Live
+delegates search and reasoning to a backend model behind an asynchronous
+boundary~\citep{openai2026gptlive,openai2026gptlivesys}, Google's Gemini 3.8 Live runs tools in the
+background while it keeps talking~\citep{google2026g38}, and open frameworks have added asynchronous tool
+calls~\citep{livekit2026async,pipecat_fc}. The front/background split is therefore not new. What is
+missing is an implementation that an operator can run on its own hardware, with its own choice of speech
+vendors, models and agents, and inspect.
+
+This paper describes \emph{interaction mode}, released in Bud WaaV Gateway 1.1.0 on 27 October
+2026~\citep{waav_repo,waav_imdoc}. WaaV is an open-source (Apache-2.0) real-time voice gateway written in
+Rust. Interaction mode adds a small \emph{front model} (Qwen3.5-2B~\citep{qwen35_2b} on
+llama.cpp~\citep{llamacpp}) that names one explicit \emph{act} for every caller turn and acknowledges at
+once; a \emph{task layer} that runs each request on any language model, an orchestrator or remote agents
+and relays the answer verbatim; a \emph{duplex audio layer} that tracks the floor, yields to the caller and
+ignores its own echo; and a \emph{policy layer} that guarantees that the words that bind (confirmations and
+reports of what was done) come from templates and from the background's own text, never from the small
+model. Our contributions are:
+\begin{itemize}
+  \item an open, self-hostable design in which a 2B front model makes an explicit, grammar-constrained,
+    logged decision per caller turn while the gateway owns the binding words
+    (Sections~\ref{sec:sys-front}--\ref{sec:sys-policy});
+  \item background work as first-class tasks with revisions, committed-effect accounting, speculative
+    start, an update inbox, follow-ups and life after the call, behind one open task protocol over
+    webhooks, A2A, MCP and the OpenAI Responses API (Sections~\ref{sec:sys-tasks}--\ref{sec:sys-backgrounds});
+  \item duplex behaviour inside a cascade, with a timeline of what the caller heard that decides when a
+    spoken answer binds, and confirmations by voice, screen or keypad (Sections~\ref{sec:sys-audio}
+    and~\ref{sec:sys-hitl});
+  \item the same mode over 44 speech vendors, 11 speech-to-speech integrations, LiveKit rooms and SIP calls
+    (Section~\ref{sec:sys-surfaces}), with measurements on Full-Duplex-Bench v1 and v3
+    (Section~\ref{sec:eval}) and a case study (Section~\ref{sec:case}).
+\end{itemize}
+We do not claim that the design beats end-to-end models on every axis. A cascade has a latency floor
+(the time to settle the end of a turn plus the time to the first synthesised audio) that a single model
+trained on audio does not have. WaaV addresses \emph{perceived} latency, by acknowledging at once and
+keeping the caller informed while work runs, and makes the agent's decisions explicit;
+Section~\ref{sec:discussion} discusses the trade-off and the known limits of the release.

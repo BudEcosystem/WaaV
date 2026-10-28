@@ -1,0 +1,1091 @@
+{
+ "take": "/home/bud/launch/demo/take27",
+ "call_duration": 167.66945833333332,
+ "demo": {
+  "segments": [
+   {
+    "call_start": 0.0,
+    "call_end": 10.8,
+    "speed": 1
+   },
+   {
+    "call_start": 10.8,
+    "call_end": 11.3,
+    "speed": 3.0
+   },
+   {
+    "call_start": 11.3,
+    "call_end": 24.0,
+    "speed": 1
+   },
+   {
+    "call_start": 24.0,
+    "call_end": 25.700000000000003,
+    "speed": 3.0
+   },
+   {
+    "call_start": 25.700000000000003,
+    "call_end": 71.5,
+    "speed": 1
+   },
+   {
+    "call_start": 71.5,
+    "call_end": 76.80000000000001,
+    "speed": 3.0
+   },
+   {
+    "call_start": 76.80000000000001,
+    "call_end": 99.9,
+    "speed": 1
+   },
+   {
+    "call_start": 99.9,
+    "call_end": 103.5,
+    "speed": 3.0
+   },
+   {
+    "call_start": 103.5,
+    "call_end": 132.5,
+    "speed": 1
+   },
+   {
+    "call_start": 132.5,
+    "call_end": 137.8,
+    "speed": 3.0
+   },
+   {
+    "call_start": 137.8,
+    "call_end": 146.20000000000002,
+    "speed": 1
+   },
+   {
+    "call_start": 146.20000000000002,
+    "call_end": 148.3,
+    "speed": 3.0
+   },
+   {
+    "call_start": 148.3,
+    "call_end": 164.0,
+    "speed": 1
+   },
+   {
+    "call_start": 164.0,
+    "call_end": 164.5,
+    "speed": 3.0
+   }
+  ],
+  "timeline": {
+   "messages": [
+    {
+     "t": 1.06,
+     "who": "caller",
+     "kind": "you",
+     "text": "Morning, Ava! Can you pull up the GitHub release for WaaV one point one and check it all looks right?"
+    },
+    {
+     "t": 7.7923,
+     "who": "agent",
+     "kind": "acknowledges",
+     "text": "Let me look into that."
+    },
+    {
+     "t": 12.7828,
+     "who": "agent",
+     "kind": "answer",
+     "text": "Morning!"
+    },
+    {
+     "t": 13.9819,
+     "who": "agent",
+     "kind": "answer",
+     "text": "I'm pulling up the version one point one release on GitHub now to check it over."
+    },
+    {
+     "t": 18.3131,
+     "who": "agent",
+     "kind": "answer",
+     "text": "I'll tell you what I find."
+    },
+    {
+     "t": 20.5027,
+     "who": "agent",
+     "kind": "progress",
+     "text": "Opening the release page."
+    },
+    {
+     "t": 27.1413,
+     "who": "agent",
+     "kind": "update",
+     "text": "The GitHub release page shows the latest version as 1.1.0 with notes on interaction mode and all three files. The details are on your screen."
+    },
+    {
+     "t": 37.026,
+     "who": "caller",
+     "kind": "you",
+     "text": "Thanks. Remind me, how many speech vendors do we support now?"
+    },
+    {
+     "t": 41.8725,
+     "who": "agent",
+     "kind": "acknowledges",
+     "text": "Just a second."
+    },
+    {
+     "t": 43.5832,
+     "who": "agent",
+     "kind": "answer",
+     "text": "Forty-four speech vendors."
+    },
+    {
+     "t": 45.3016,
+     "who": "agent",
+     "kind": "answer",
+     "text": "That's thirty-one for speech-to-text, thirty-four for text-to-speech and eleven for speech-to-speech, and it works with any LLM."
+    },
+    {
+     "t": 54.084,
+     "who": "caller",
+     "kind": "you",
+     "text": "Great. Can you also get the download numbers in the terminal?"
+    },
+    {
+     "t": 58.391,
+     "who": "agent",
+     "kind": "acknowledges",
+     "text": "Let me look into that."
+    },
+    {
+     "t": 62.2495,
+     "who": "agent",
+     "kind": "answer",
+     "text": "I'm pulling the download numbers in the terminal now."
+    },
+    {
+     "t": 65.2794,
+     "who": "agent",
+     "kind": "answer",
+     "text": "I'll read them out as soon as they're in."
+    },
+    {
+     "t": 67.749,
+     "who": "agent",
+     "kind": "progress",
+     "text": "Fetching release download counts."
+    },
+    {
+     "t": 78.247,
+     "who": "agent",
+     "kind": "holding",
+     "text": "This one's taking a little longer. I'm still on it."
+    },
+    {
+     "t": 81.5452,
+     "who": "agent",
+     "kind": "update",
+     "text": "The release download counts are now available: one point one point zero for the x86 build, twelve for ARM. The details are on your screen."
+    },
+    {
+     "t": 92.046,
+     "who": "caller",
+     "kind": "you",
+     "text": "Nice. Can you draft the launch announcement now, with those numbers in it?"
+    },
+    {
+     "t": 97.3172,
+     "who": "agent",
+     "kind": "acknowledges",
+     "text": "Just a second."
+    },
+    {
+     "t": 104.9877,
+     "who": "agent",
+     "kind": "answer",
+     "text": "I've started drafting the announcement."
+    },
+    {
+     "t": 106.887,
+     "who": "agent",
+     "kind": "answer",
+     "text": "Quick fix on what you heard before: the x86 build actually has zero downloads, ARM has twelve, and the checksum file has fourteen."
+    },
+    {
+     "t": 115.8067,
+     "who": "agent",
+     "kind": "answer",
+     "text": "That's twenty-six in total."
+    },
+    {
+     "t": 117.3261,
+     "who": "agent",
+     "kind": "holding",
+     "text": "I'm still on it."
+    },
+    {
+     "t": 118.9079,
+     "who": "agent",
+     "kind": "progress",
+     "text": "Typing the launch announcement now."
+    },
+    {
+     "t": 124.6286,
+     "who": "agent",
+     "kind": "confirm",
+     "text": "To confirm:"
+    },
+    {
+     "t": 125.7657,
+     "who": "agent",
+     "kind": "confirm",
+     "text": "save the document, Bud WaaV 1.1.0 Is Out."
+    },
+    {
+     "t": 129.5826,
+     "who": "agent",
+     "kind": "confirm",
+     "text": "Do you want me to do that?"
+    },
+    {
+     "t": 139.284,
+     "who": "caller",
+     "kind": "you",
+     "text": "Yes, go ahead."
+    },
+    {
+     "t": 139.4847,
+     "who": "agent",
+     "kind": "confirm",
+     "text": "Do you want me to save the document?"
+    },
+    {
+     "t": 141.6765,
+     "who": "agent",
+     "kind": "",
+     "text": "Okay."
+    },
+    {
+     "t": 142.6292,
+     "who": "agent",
+     "kind": "progress",
+     "text": "Typing the launch announcement now."
+    },
+    {
+     "t": 149.745,
+     "who": "agent",
+     "kind": "update",
+     "text": "The launch announcement has been saved with new features and current download counts. The details are on your screen."
+    },
+    {
+     "t": 157.983,
+     "who": "caller",
+     "kind": "you",
+     "text": "Perfect, that's everything. Thanks, Ava!"
+    },
+    {
+     "t": 161.4667,
+     "who": "agent",
+     "kind": "answer",
+     "text": "You're welcome."
+    }
+   ],
+   "lanes": {
+    "browser": [
+     {
+      "t": 10.2925,
+      "state": "working",
+      "text": "Check the GitHub release: Open"
+     },
+     {
+      "t": 12.8813,
+      "state": "working",
+      "text": "Opening the release page."
+     },
+     {
+      "t": 26.3082,
+      "state": "done",
+      "text": "Release one point one point oh is published as Latest with notes covering interaction mode and all three files; the page didn't show its publish date."
+     }
+    ],
+    "terminal": [
+     {
+      "t": 60.3193,
+      "state": "working",
+      "text": "Get the release download numbers: Run curl -s"
+     },
+     {
+      "t": 63.8106,
+      "state": "working",
+      "text": "Fetching release download counts."
+     },
+     {
+      "t": 77.0412,
+      "state": "done",
+      "text": "For release one point one point zero, the x86 build has zero downloads, the ARM build twelve, and the checksum list fourteen, twenty-six in total."
+     }
+    ],
+    "writer": [
+     {
+      "t": 102.1321,
+      "state": "working",
+      "text": "Draft the launch announcement: Write a launch announcement"
+     },
+     {
+      "t": 108.405,
+      "state": "working",
+      "text": "Typing the launch announcement now."
+     },
+     {
+      "t": 124.1742,
+      "state": "asking",
+      "text": "waiting for your yes"
+     },
+     {
+      "t": 141.2592,
+      "state": "working",
+      "text": "Typing the launch announcement now."
+     },
+     {
+      "t": 146.7267,
+      "state": "working",
+      "text": "Typing the launch announcement now."
+     },
+     {
+      "t": 148.5173,
+      "state": "done",
+      "text": "I saved the launch announcement with the new features and the current download counts."
+     }
+    ]
+   },
+   "replies": [
+    {
+     "t": 7.88,
+     "ms": 1820,
+     "line": "open"
+    },
+    {
+     "t": 41.886,
+     "ms": 1520,
+     "line": "chat"
+    },
+    {
+     "t": 58.504,
+     "ms": 1480,
+     "line": "numbers"
+    },
+    {
+     "t": 97.326,
+     "ms": 1620,
+     "line": "draft"
+    },
+    {
+     "t": 161.643,
+     "ms": 1540,
+     "line": "thanks"
+    }
+   ],
+   "running": [
+    {
+     "from": 10.2925,
+     "to": 26.3082,
+     "agent": "browser"
+    },
+    {
+     "from": 7.2485,
+     "to": 28.5763,
+     "agent": null
+    },
+    {
+     "from": 41.4954,
+     "to": 43.5341,
+     "agent": null
+    },
+    {
+     "from": 60.3193,
+     "to": 77.0412,
+     "agent": "terminal"
+    },
+    {
+     "from": 57.894,
+     "to": 79.5184,
+     "agent": null
+    },
+    {
+     "from": 102.1321,
+     "to": 148.5173,
+     "agent": "writer"
+    },
+    {
+     "from": 96.8716,
+     "to": 151.7348,
+     "agent": null
+    }
+   ],
+   "floor": [
+    {
+     "t": 1.1639,
+     "who": "user"
+    },
+    {
+     "t": 6.8537,
+     "who": "assistant"
+    },
+    {
+     "t": 7.7923,
+     "who": "assistant"
+    },
+    {
+     "t": 7.9791,
+     "who": "assistant"
+    },
+    {
+     "t": 8.1358,
+     "who": "assistant"
+    },
+    {
+     "t": 9.1063,
+     "who": "assistant"
+    },
+    {
+     "t": 12.7834,
+     "who": "assistant"
+    },
+    {
+     "t": 13.6176,
+     "who": "assistant"
+    },
+    {
+     "t": 13.9819,
+     "who": "assistant"
+    },
+    {
+     "t": 18.3131,
+     "who": "assistant"
+    },
+    {
+     "t": 18.3131,
+     "who": "assistant"
+    },
+    {
+     "t": 19.9939,
+     "who": "assistant"
+    },
+    {
+     "t": 20.5028,
+     "who": "assistant"
+    },
+    {
+     "t": 20.703,
+     "who": "assistant"
+    },
+    {
+     "t": 20.9961,
+     "who": "assistant"
+    },
+    {
+     "t": 21.0773,
+     "who": "assistant"
+    },
+    {
+     "t": 21.2112,
+     "who": "assistant"
+    },
+    {
+     "t": 22.3829,
+     "who": "assistant"
+    },
+    {
+     "t": 27.1413,
+     "who": "assistant"
+    },
+    {
+     "t": 27.3421,
+     "who": "assistant"
+    },
+    {
+     "t": 27.5551,
+     "who": "assistant"
+    },
+    {
+     "t": 35.8069,
+     "who": "none"
+    },
+    {
+     "t": 37.1639,
+     "who": "user"
+    },
+    {
+     "t": 41.1209,
+     "who": "assistant"
+    },
+    {
+     "t": 41.8725,
+     "who": "assistant"
+    },
+    {
+     "t": 42.0733,
+     "who": "assistant"
+    },
+    {
+     "t": 42.3059,
+     "who": "assistant"
+    },
+    {
+     "t": 42.9962,
+     "who": "assistant"
+    },
+    {
+     "t": 43.5833,
+     "who": "assistant"
+    },
+    {
+     "t": 44.4507,
+     "who": "assistant"
+    },
+    {
+     "t": 45.3016,
+     "who": "assistant"
+    },
+    {
+     "t": 52.9014,
+     "who": "none"
+    },
+    {
+     "t": 54.2032,
+     "who": "user"
+    },
+    {
+     "t": 57.6757,
+     "who": "assistant"
+    },
+    {
+     "t": 58.391,
+     "who": "assistant"
+    },
+    {
+     "t": 58.5921,
+     "who": "assistant"
+    },
+    {
+     "t": 58.7997,
+     "who": "assistant"
+    },
+    {
+     "t": 59.7705,
+     "who": "assistant"
+    },
+    {
+     "t": 62.2496,
+     "who": "assistant"
+    },
+    {
+     "t": 65.2794,
+     "who": "assistant"
+    },
+    {
+     "t": 65.2794,
+     "who": "assistant"
+    },
+    {
+     "t": 67.3194,
+     "who": "assistant"
+    },
+    {
+     "t": 67.7491,
+     "who": "assistant"
+    },
+    {
+     "t": 67.95,
+     "who": "assistant"
+    },
+    {
+     "t": 68.1213,
+     "who": "assistant"
+    },
+    {
+     "t": 68.7221,
+     "who": "assistant"
+    },
+    {
+     "t": 68.9432,
+     "who": "assistant"
+    },
+    {
+     "t": 69.8748,
+     "who": "assistant"
+    },
+    {
+     "t": 78.247,
+     "who": "assistant"
+    },
+    {
+     "t": 78.3673,
+     "who": "assistant"
+    },
+    {
+     "t": 78.3704,
+     "who": "assistant"
+    },
+    {
+     "t": 78.4511,
+     "who": "assistant"
+    },
+    {
+     "t": 78.7732,
+     "who": "assistant"
+    },
+    {
+     "t": 81.5452,
+     "who": "assistant"
+    },
+    {
+     "t": 81.5452,
+     "who": "assistant"
+    },
+    {
+     "t": 90.0645,
+     "who": "none"
+    },
+    {
+     "t": 92.1438,
+     "who": "user"
+    },
+    {
+     "t": 96.1109,
+     "who": "assistant"
+    },
+    {
+     "t": 96.253,
+     "who": "user"
+    },
+    {
+     "t": 96.5329,
+     "who": "assistant"
+    },
+    {
+     "t": 97.3172,
+     "who": "assistant"
+    },
+    {
+     "t": 97.5183,
+     "who": "assistant"
+    },
+    {
+     "t": 97.729,
+     "who": "assistant"
+    },
+    {
+     "t": 98.1791,
+     "who": "assistant"
+    },
+    {
+     "t": 104.9877,
+     "who": "assistant"
+    },
+    {
+     "t": 106.887,
+     "who": "assistant"
+    },
+    {
+     "t": 106.8871,
+     "who": "assistant"
+    },
+    {
+     "t": 115.8067,
+     "who": "assistant"
+    },
+    {
+     "t": 115.8067,
+     "who": "assistant"
+    },
+    {
+     "t": 117.3261,
+     "who": "assistant"
+    },
+    {
+     "t": 117.3261,
+     "who": "assistant"
+    },
+    {
+     "t": 118.5661,
+     "who": "assistant"
+    },
+    {
+     "t": 118.908,
+     "who": "assistant"
+    },
+    {
+     "t": 118.9482,
+     "who": "assistant"
+    },
+    {
+     "t": 118.9923,
+     "who": "assistant"
+    },
+    {
+     "t": 119.1535,
+     "who": "assistant"
+    },
+    {
+     "t": 119.5493,
+     "who": "assistant"
+    },
+    {
+     "t": 121.2,
+     "who": "assistant"
+    },
+    {
+     "t": 124.6287,
+     "who": "assistant"
+    },
+    {
+     "t": 124.8292,
+     "who": "assistant"
+    },
+    {
+     "t": 125.0811,
+     "who": "assistant"
+    },
+    {
+     "t": 125.5723,
+     "who": "assistant"
+    },
+    {
+     "t": 125.7658,
+     "who": "assistant"
+    },
+    {
+     "t": 125.8068,
+     "who": "assistant"
+    },
+    {
+     "t": 125.8915,
+     "who": "assistant"
+    },
+    {
+     "t": 129.5826,
+     "who": "assistant"
+    },
+    {
+     "t": 129.5826,
+     "who": "assistant"
+    },
+    {
+     "t": 130.7822,
+     "who": "assistant"
+    },
+    {
+     "t": 139.4038,
+     "who": "user"
+    },
+    {
+     "t": 139.4848,
+     "who": "both"
+    },
+    {
+     "t": 139.685,
+     "who": "user"
+    },
+    {
+     "t": 139.8645,
+     "who": "both"
+    },
+    {
+     "t": 141.1954,
+     "who": "assistant"
+    },
+    {
+     "t": 141.2584,
+     "who": "assistant"
+    },
+    {
+     "t": 141.6766,
+     "who": "assistant"
+    },
+    {
+     "t": 142.1277,
+     "who": "assistant"
+    },
+    {
+     "t": 142.6292,
+     "who": "assistant"
+    },
+    {
+     "t": 144.5204,
+     "who": "assistant"
+    },
+    {
+     "t": 149.7451,
+     "who": "assistant"
+    },
+    {
+     "t": 149.9457,
+     "who": "assistant"
+    },
+    {
+     "t": 150.3645,
+     "who": "assistant"
+    },
+    {
+     "t": 155.9758,
+     "who": "none"
+    },
+    {
+     "t": 158.1047,
+     "who": "user"
+    },
+    {
+     "t": 160.8162,
+     "who": "assistant"
+    },
+    {
+     "t": 161.4667,
+     "who": "assistant"
+    },
+    {
+     "t": 161.5079,
+     "who": "assistant"
+    },
+    {
+     "t": 161.5836,
+     "who": "assistant"
+    },
+    {
+     "t": 161.7446,
+     "who": "assistant"
+    },
+    {
+     "t": 161.8679,
+     "who": "assistant"
+    },
+    {
+     "t": 162.3192,
+     "who": "none"
+    }
+   ]
+  },
+  "focus": [
+   {
+    "from": 14.3,
+    "to": 24.3,
+    "crop": [
+     962,
+     0,
+     958,
+     539
+    ],
+    "label": "Browser"
+   },
+   {
+    "from": 65.0412,
+    "to": 81.0412,
+    "crop": [
+     0,
+     541,
+     958,
+     539
+    ],
+    "label": "Terminal"
+   },
+   {
+    "from": 105.1321,
+    "to": 124.1742,
+    "crop": [
+     0,
+     0,
+     958,
+     539
+    ],
+    "label": "LibreOffice Writer"
+   },
+   {
+    "from": 147.5173,
+    "to": 153.5173,
+    "crop": [
+     0,
+     0,
+     958,
+     539
+    ],
+    "label": "LibreOffice Writer"
+   }
+  ]
+ },
+ "demo_window": [
+  27.5,
+  179.333
+ ],
+ "scenes": [
+  {
+   "id": "open",
+   "start": 0.0,
+   "end": 7.0
+  },
+  {
+   "id": "problem",
+   "start": 7.0,
+   "end": 19.0
+  },
+  {
+   "id": "thesis",
+   "start": 19.0,
+   "end": 27.5
+  },
+  {
+   "id": "demo",
+   "start": 27.5,
+   "end": 179.333,
+   "bg": false,
+   "fade": 0.4
+  },
+  {
+   "id": "how",
+   "start": 179.333,
+   "end": 197.973
+  },
+  {
+   "id": "bench",
+   "start": 197.973,
+   "end": 211.973
+  },
+  {
+   "id": "bench2",
+   "start": 211.973,
+   "end": 225.973
+  },
+  {
+   "id": "benefits",
+   "start": 225.973,
+   "end": 237.493
+  },
+  {
+   "id": "future",
+   "start": 237.493,
+   "end": 243.493
+  },
+  {
+   "id": "end",
+   "start": 243.493,
+   "end": 251.493
+  }
+ ],
+ "narration": [
+  {
+   "file": "problem.wav",
+   "at": 7.6
+  },
+  {
+   "file": "thesis.wav",
+   "at": 19.4
+  },
+  {
+   "file": "how.wav",
+   "at": 179.9333333333333
+  },
+  {
+   "file": "bench.wav",
+   "at": 198.5733333333333
+  },
+  {
+   "file": "pause.wav",
+   "at": 212.5733333333333
+  },
+  {
+   "file": "benefits.wav",
+   "at": 226.4733333333333
+  },
+  {
+   "file": "end.wav",
+   "at": 244.29333333333332
+  }
+ ],
+ "bench": {
+  "title": "Speaks first. Every time.",
+  "subtitle": "Full-Duplex-Bench v3 \u00b7 100 real, disfluent spoken requests with tool use \u00b7 time to the agent's first words (lower is better)",
+  "foot": "Bud WaaV 1.1.0 (Qwen3.5-2B front, Claude Opus 5.5 background, Deepgram speech), measured 27 Oct 2026 with our adapter; others from the FD-bench v3 paper (arXiv 2604.04847). Bud WaaV Pass@1 0.39 (lowest) and response quality 0.73 (2nd): see the paper.",
+  "rows": [
+   {
+    "name": "Bud WaaV \u00b7 interaction mode",
+    "frac": 0.282,
+    "label": "2.48 s",
+    "us": true
+   },
+   {
+    "name": "Ultravox v0.7",
+    "frac": 0.442,
+    "label": "3.88 s"
+   },
+   {
+    "name": "Gemini Live 3.1",
+    "frac": 0.45,
+    "label": "3.95 s"
+   },
+   {
+    "name": "Grok",
+    "frac": 0.68,
+    "label": "5.97 s"
+   },
+   {
+    "name": "GPT-Realtime 1.5",
+    "frac": 0.724,
+    "label": "6.36 s"
+   },
+   {
+    "name": "Gemini Live 2.5",
+    "frac": 0.801,
+    "label": "7.03 s"
+   },
+   {
+    "name": "Cascade (Whisper + GPT-4o)",
+    "frac": 1.0,
+    "label": "8.78 s"
+   }
+  ]
+ },
+ "bench2": {
+  "title": "Lets you think.",
+  "subtitle": "Full-Duplex-Bench v1 \u00b7 216 pauses in real conversations \u00b7 how often the agent cuts in (lower is better)",
+  "foot": "Bud WaaV 1.1.0 (Qwen3.5-2B front, Deepgram speech), measured 28 Oct 2026 with our adapter; others from the Full-Duplex-Bench leaderboard. The same care costs it elsewhere: it takes the turn at 78% of turn ends and answers interruptions after 2.2 s. See the paper.",
+  "rows": [
+   {
+    "name": "Bud WaaV \u00b7 interaction mode",
+    "frac": 0.099,
+    "label": "9.7%",
+    "us": true
+   },
+   {
+    "name": "Gemini 3.1 Flash Live (high)",
+    "frac": 0.104,
+    "label": "10.2%"
+   },
+   {
+    "name": "GPT-Realtime",
+    "frac": 0.122,
+    "label": "12.0%"
+   },
+   {
+    "name": "Gemini 3.1 Flash Live (minimal)",
+    "frac": 0.156,
+    "label": "15.3%"
+   },
+   {
+    "name": "Gemini Live 2.0",
+    "frac": 0.316,
+    "label": "31.0%"
+   },
+   {
+    "name": "Freeze-Omni",
+    "frac": 0.491,
+    "label": "48.1%"
+   },
+   {
+    "name": "PersonaPlex",
+    "frac": 0.676,
+    "label": "66.2%"
+   },
+   {
+    "name": "Moshi",
+    "frac": 1.0,
+    "label": "98.0%"
+   }
+  ]
+ }
+}
