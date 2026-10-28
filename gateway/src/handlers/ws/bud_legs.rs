@@ -768,6 +768,8 @@ pub async fn session_still_allowed(state: &AppState, meter: &LegMeter) -> bool {
                 plane.hash_reaches(hashed, &ep, *client_key).is_some()
             }
             CallerCheck::Jwt { sub } => plane.subject_reaches(sub, &ep).await.is_some(),
+            // A standalone `/v1/realtime` caller reaches no Bud deployment.
+            CallerCheck::Standalone { .. } => false,
         };
         if !serving || !reachable {
             return false;
@@ -791,6 +793,7 @@ async fn agent_still_allowed(
             .subject_reaches_alias(sub, &agent.alias)
             .await
             .is_some(),
+        CallerCheck::Standalone { .. } => false,
     };
     if !reachable {
         return false;

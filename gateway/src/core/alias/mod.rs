@@ -164,6 +164,45 @@ pub struct AliasLlm {
     pub credential_ref: Option<String>,
 }
 
+/// A vendor's own realtime (speech-to-speech) API behind an alias (the `[aliases.x.realtime]`
+/// block): what `/v1/realtime?model=<alias>` relays to on a standalone gateway, the way the Bud
+/// path relays a `realtime_session` deployment.
+///
+/// SERVER-CONFIG-ONLY, like every alias field: the client names the alias and nothing else, so it
+/// can never choose the vendor, the address or the credential. Read only by `/v1/realtime` (which
+/// needs `openai_compatible: true`); `/ws`, `/realtime` and `/v1/audio/*` ignore it. An alias with
+/// both this block and `stt`/`llm`/`tts` legs relays on `/v1/realtime` (this block wins there) and
+/// keeps serving its legs on the other routes.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AliasRealtime {
+    /// The vendor, by its realtime name: `openai`, `azure_openai` or `grok` (relayed: they speak
+    /// OpenAI Realtime GA), or `gemini`, `deepgram_voice_agent`, `elevenlabs_convai` or `hume_evi`
+    /// (translated by the GA facade). Required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The vendor model (`gpt-realtime`; the Azure deployment name; the ElevenLabs agent id).
+    /// Required: the client's `?model=` names the alias, never the vendor model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The vendor's address, instead of its own host (a proxy, a regional or self-hosted
+    /// endpoint; required for `azure_openai`, the resource endpoint). Validated at startup with
+    /// the egress rules, and SSRF-checked again before each dial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Operator credential (`core::credentials`) sent to `base_url`, which must be one of its
+    /// hosts. Needs `base_url`: a named credential is bound to the hosts it may reach.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    /// The session's default voice (the client may change it, as on a Bud deployment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// The session's default instructions (the client may replace them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
 /// One alias definition (one `[aliases.<name>]` table in `config.yaml`).
 ///
 /// SERVER-CONFIG-ONLY. Deserialized from the `aliases:` YAML section at startup;
@@ -196,9 +235,13 @@ pub struct AliasDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
     pub interaction: Option<serde_json::Value>,
+    /// A vendor's own realtime API, relayed by `/v1/realtime` on a standalone gateway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime: Option<AliasRealtime>,
     /// Whether the OpenAI-compatible routes may resolve this alias as a `model`
-    /// (`POST /v1/audio/speech` → its TTS leg, `/v1/audio/transcriptions` → its STT leg). Off by
-    /// default: only aliases the operator marks are reachable that way.
+    /// (`POST /v1/audio/speech` → its TTS leg, `/v1/audio/transcriptions` → its STT leg,
+    /// `/v1/realtime` → its `realtime` block, else its STT, LLM and TTS legs). Off by default:
+    /// only aliases the operator marks are reachable that way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub openai_compatible: bool,
 }
@@ -319,7 +362,11 @@ pub fn alias_leg_key(
 /// Startup checks for the server's aliases: a leg's `base_url` needs the leg's `provider` and
 /// must pass the egress rules (an http(s) URL, and a private target only where the operator
 /// allows it), so a mistake stops the server instead of failing every session; an alias marked
-/// `openai_compatible` needs an STT or TTS leg.
+/// `openai_compatible` needs an STT, TTS or realtime leg; a `realtime` block must be one the
+/// `/v1/realtime` relay can serve (see
+/// [`crate::handlers::openai_realtime::alias_relay::validate`]).
+///
+/// Run after the operator's credentials are loaded: a `credential_ref` is checked against them.
 pub fn validate_aliases(config: &AliasConfig) -> Result<(), String> {
     for (name, def) in &config.aliases {
         for (leg, provider, base) in [
@@ -363,10 +410,14 @@ pub fn validate_aliases(config: &AliasConfig) -> Result<(), String> {
                 }
             }
         }
-        if def.openai_compatible && def.stt.is_none() && def.tts.is_none() {
+        if def.openai_compatible && def.stt.is_none() && def.tts.is_none() && def.realtime.is_none()
+        {
             return Err(format!(
-                "alias '{name}': openai_compatible needs an stt or tts leg to serve"
+                "alias '{name}': openai_compatible needs an stt, tts or realtime leg to serve"
             ));
+        }
+        if let Some(leg) = &def.realtime {
+            crate::handlers::openai_realtime::alias_relay::validate(name, def, leg)?;
         }
     }
     Ok(())

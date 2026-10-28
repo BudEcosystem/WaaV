@@ -47,6 +47,9 @@ aliases:
 | `tts.request_timeout_secs` | Synthesis timeout when the client names none. The default is 60 s; values are clamped to 1–300 s. |
 | `llm.base_url`, `llm.model`, `llm.system_prompt`, `llm.reasoning_effort`, `llm.reasoning_model`, `llm.provider_kind`, `llm.credential_ref` | LLM defaults. |
 | `dag_template` | Route the session through a server DAG template instead. |
+| `realtime.provider`, `realtime.model` | A vendor's own realtime API, relayed by standalone `/v1/realtime` (see [below](#relaying-to-a-vendors-realtime-api)). Both required. |
+| `realtime.base_url`, `realtime.credential_ref` | The vendor's address instead of its own host, and the credential sent to it. |
+| `realtime.voice`, `realtime.instructions` | The session's defaults; the client may change them. |
 | `openai_compatible` | Lets `/v1/audio/speech`, `/v1/audio/transcriptions` and `/v1/realtime` resolve the alias as `model`. |
 
 ## A leg's own server
@@ -85,7 +88,8 @@ Without the Bud control plane, `/v1/audio/speech`, `/v1/audio/transcriptions`,
 
 - speech uses the alias's `tts` leg;
 - transcription and translation use its `stt` leg;
-- realtime uses all three legs, `stt`, `llm` and `tts` (below).
+- realtime relays to the vendor its `realtime` block names, or else runs all three legs, `stt`,
+  `llm` and `tts` (below).
 
 On these routes a leg's `base_url` must be on an `openai` leg, since it is served as an
 OpenAI-compatible server; the server refuses to start otherwise. An alias that isn't marked
@@ -120,8 +124,7 @@ the LLM and text-to-speech, with the reply's words as `response.output_audio_tra
   and the transcription language. Instructions and tools are the server's: the alias's
   `llm.system_prompt`, and no client tools. Text-only output and manual turn detection are refused.
 - **Refusals:** `404 model_not_found` for an alias that isn't marked, and
-  `400 alias_not_realtime` for one missing a leg. An alias that should relay to a vendor's own
-  realtime API (`kind: realtime`) isn't supported without the Bud control plane.
+  `400 alias_not_realtime` for one with neither a `realtime` block nor all three legs.
 
 ```python
 # OpenAI's Python SDK (GA)
@@ -129,3 +132,62 @@ async with client.realtime.connect(model="local-voice") as conn:
     await conn.session.update(session={"type": "realtime"})
     ...
 ```
+
+### Relaying to a vendor's realtime API
+
+An alias with a `realtime` block sends `/v1/realtime?model=<alias>` to that vendor's own realtime
+API, exactly as a Bud `realtime_session` deployment is served. Vendors that speak the OpenAI
+Realtime GA protocol (`openai`, `azure_openai`, `grok`) are relayed frame for frame. `gemini`,
+`deepgram_voice_agent`, `elevenlabs_convai` and `hume_evi` are translated to GA by the gateway.
+`nova_sonic` isn't available here: it signs with an AWS key pair in a region, which one alias
+credential can't carry.
+
+```yaml
+aliases:
+  voice-gpt:
+    openai_compatible: true            # required: only /v1/realtime reads `realtime`
+    realtime:
+      provider: openai
+      model: gpt-realtime              # the vendor model; the client's `?model=` is the alias
+      voice: marin                     # session defaults (optional)
+      instructions: "You are a concise support agent."
+  voice-azure:
+    openai_compatible: true
+    realtime:
+      provider: azure_openai
+      model: my-realtime-deployment    # the Azure deployment name
+      base_url: "https://my-resource.openai.azure.com"
+      credential_ref: azure-realtime   # declared in WAAV_CREDENTIALS_FILE for *.openai.azure.com
+```
+
+- **The vendor and its key are the server's.** The client names the alias and nothing else. The
+  vendor model, address and credential never come from the client, and the client sees the alias
+  as the session's `model`.
+- **Which key is sent:**
+  1. Without `base_url`, the session goes to the vendor's own host with the gateway's key for that
+     vendor (`OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`, `GROK_API_KEY`, `GEMINI_API_KEY`, or the
+     Deepgram, ElevenLabs or Hume key). `credential_ref` needs a `base_url`.
+  2. With `base_url` and `credential_ref`, that credential is sent. It must be declared for the
+     base's host.
+  3. With `base_url` alone, the gateway's key is sent only if you approved that host for it (see
+     [Egress and operator credentials](egress-and-credentials.md)). For Azure, xAI and Gemini, the
+     egress rules have no variable to declare, so use a `credential_ref` (or
+     `WAAV_PRIVATE_EGRESS_ALLOWLIST`).
+
+  A session that would end up with no key is refused with `502 deployment_misconfigured`. The
+  gateway's log says why; the client isn't told hosts or credential names.
+- **Checked at startup** (and by `waav-gateway check`): the provider, the model, the `base_url`
+  under the egress rules, the credential's hosts, and the vendor request itself, built the same
+  way each session builds it. A mistake stops the server.
+- **Everything around the session is the relay's**, as on a Bud deployment: the client-event
+  policy (the client may change the voice and instructions; MCP tools and stored prompts are
+  refused), idle and maximum-length limits, pings, the defaults `session.update` and the session's
+  metering span. The Bud deployment rate limits, concurrency caps and circuit breakers don't
+  apply; the gateway's connection limits do. Client secrets (`ek_bud_`) need the Bud control plane,
+  and so does [interaction mode](interaction_mode.md) on the relay: `interaction.realtime_default`
+  does not apply to these sessions (the log says `bud_mode_required`), nor does the alias's own
+  `interaction` block.
+- **Revalidation** re-checks, on every `response.create` and periodically, that the alias still
+  relays. API secrets are fixed for the life of the process, so the key isn't re-checked.
+- **With legs as well**, the `realtime` block wins on `/v1/realtime`. The `stt` and `tts` legs keep
+  serving `/v1/audio/*`, and `/ws` and `/realtime` ignore the block.

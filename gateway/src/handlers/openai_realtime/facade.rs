@@ -130,6 +130,17 @@ pub fn is_translate_vendor(vendor: &str) -> bool {
     vendor_info(vendor).is_some()
 }
 
+/// Every vendor the translate engine serves, by its `voice_table.vendor` name.
+pub fn translate_vendors() -> impl Iterator<Item = &'static str> {
+    VENDORS.iter().map(|t| t.vendor)
+}
+
+/// The provider a translated vendor runs on in WaaV's realtime registry
+/// (`deepgram_voice_agent` → `deepgram`): the name the gateway's own key for it is kept under.
+pub fn translate_provider(vendor: &str) -> Option<&'static str> {
+    vendor_info(vendor).map(|t| t.provider)
+}
+
 // =============================================================================================
 // The plan: everything decided before the upgrade
 // =============================================================================================
