@@ -74,7 +74,11 @@ The key a leg with a `base_url` sends is decided in this order:
 
 1. the client's own `api_key`, if it sent one;
 2. else the alias's `credential_ref`, which must be declared for that host (a credential bound
-   elsewhere is a session error, never a silent fallback);
+   elsewhere is a session error, never a silent fallback). The server checks this at startup, and
+   `waav-gateway check` does too: an undeclared credential, one not allowed to reach the
+   `base_url`, or a `stt`/`tts` `credential_ref` without a `base_url` (which would never be sent)
+   stops the server. An `llm.credential_ref` without `llm.base_url` must be declared; its host is
+   checked per session, against wherever that session's LLM is;
 3. else the gateway's key for the provider, but only if you approved that host (see
    [Egress and operator credentials](egress-and-credentials.md));
 4. else no key. If the gateway does hold a key for that provider, the session also gets a

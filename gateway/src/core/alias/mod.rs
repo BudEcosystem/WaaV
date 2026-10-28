@@ -359,10 +359,43 @@ pub fn alias_leg_key(
     })
 }
 
+/// A leg's `credential_ref` at startup, decided as each session binds it but without reading the
+/// secret (one that appears after startup, a mounted file, is read per session): the credential
+/// is declared and, with the leg's own server, may be sent there. `only_to_base`: the leg sends
+/// the credential to its `base_url` alone (`stt`, `tts`, `realtime`), so without one it would be
+/// silently unused; the `llm` leg's goes wherever the session's LLM is, checked per session.
+pub(crate) fn validate_leg_credential(
+    leg: &str,
+    credential: Option<&str>,
+    base_url: Option<&str>,
+    only_to_base: bool,
+) -> Result<(), String> {
+    let Some(credential) = credential else {
+        return Ok(());
+    };
+    let registry = crate::core::credentials::global_credentials();
+    match base_url {
+        Some(base) => registry
+            .bind(credential, base)
+            .map(drop)
+            .map_err(|e| format!("{leg}.credential_ref: {e}")),
+        None if only_to_base => Err(format!(
+            "{leg}.credential_ref needs {leg}.base_url: a named credential is bound to the hosts \
+             it may be sent to, so name the one it goes to"
+        )),
+        None if registry.is_declared(credential) => Ok(()),
+        None => Err(format!(
+            "{leg}.credential_ref: {}",
+            crate::core::credentials::CredentialError::Unknown(credential.to_string())
+        )),
+    }
+}
+
 /// Startup checks for the server's aliases: a leg's `base_url` needs the leg's `provider` and
 /// must pass the egress rules (an http(s) URL, and a private target only where the operator
 /// allows it), so a mistake stops the server instead of failing every session; an alias marked
-/// `openai_compatible` needs an STT, TTS or realtime leg; a `realtime` block must be one the
+/// `openai_compatible` needs an STT, TTS or realtime leg; a leg's `credential_ref` must be
+/// declared and allowed to reach the leg's server ([`validate_leg_credential`]); a `realtime` block must be one the
 /// `/v1/realtime` relay can serve (see
 /// [`crate::handlers::openai_realtime::alias_relay::validate`]).
 ///
@@ -394,6 +427,34 @@ pub fn validate_aliases(config: &AliasConfig) -> Result<(), String> {
                      address needs WAAV_PRIVATE_EGRESS_ALLOWLIST (host:port)"
                     )
                 })?;
+        }
+        let fail = |why: String| format!("alias '{name}': {why}");
+        if let Some(l) = &def.stt {
+            validate_leg_credential(
+                "stt",
+                l.credential_ref.as_deref(),
+                l.base_url.as_deref(),
+                true,
+            )
+            .map_err(fail)?;
+        }
+        if let Some(l) = &def.tts {
+            validate_leg_credential(
+                "tts",
+                l.credential_ref.as_deref(),
+                l.base_url.as_deref(),
+                true,
+            )
+            .map_err(fail)?;
+        }
+        if let Some(l) = &def.llm {
+            validate_leg_credential(
+                "llm",
+                l.credential_ref.as_deref(),
+                l.base_url.as_deref(),
+                false,
+            )
+            .map_err(fail)?;
         }
         // The OpenAI-compatible routes run a leg's own server through the self-hosted vendor,
         // which speaks OpenAI's API; another provider's base would be ignored there, silently.
