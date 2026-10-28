@@ -1022,6 +1022,17 @@ components:
             Operator credential (`core::credentials`) the LLM leg uses when the client sends no key.
             The NAME only — the secret stays in the credential's env var / file, bound to its hosts.
           default: null
+        max_history:
+          type:
+          - integer
+          - 'null'
+          description: |-
+            The session's history size, in messages with the system prompt, when the client names
+            none (the default is 20). Size it to the model's context window: the history is trimmed
+            in blocks to about half of it, so the LLM server's prefix cache holds between trims.
+          default: null
+          example: 40
+          minimum: 0
         model:
           type:
           - string
@@ -1051,6 +1062,16 @@ components:
           - 'null'
           description: Two-tier reasoning model (escalation tier).
           default: null
+        summarize_target_tokens:
+          type:
+          - integer
+          - 'null'
+          description: |-
+            Token-aware summarization of older turns (`conversation_config.summarize_target_tokens`)
+            when the client names none; 0 = off (the default). The summary is made by the session's
+            own LLM after a turn.
+          default: null
+          minimum: 0
         system_prompt:
           type:
           - string
@@ -1468,8 +1489,15 @@ components:
           example: 120000
           minimum: 0
         max_history:
-          type: integer
-          description: Max retained history messages (default 20).
+          type:
+          - integer
+          - 'null'
+          description: |-
+            Max retained history messages, the system prompt included. Omitted: the alias's
+            `llm.max_history`, else 20. Once over it, the oldest messages go in a block, down to about
+            half, so the prompt's start (and an LLM server's prefix cache) holds between trims; the
+            current turn is never removed.
+          example: 20
           minimum: 0
         max_llm_calls_per_turn:
           type:
@@ -1600,12 +1628,14 @@ components:
             TTS (C-G4). Default true — spoken asterisks and URLs ruin voice
             output.
         summarize_target_tokens:
-          type: integer
+          type:
+          - integer
+          - 'null'
           description: |-
             Token-aware context compaction (B-G6): when the session context's
             estimated tokens cross this value, older messages are summarized
-            after the turn (system + recent turns kept verbatim). Omitted/0 =
-            off.
+            after the turn (system + recent turns kept verbatim). Omitted: the
+            alias's `llm.summarize_target_tokens`, else off; 0 = off.
           example: 6000
           minimum: 0
         system_prompt:

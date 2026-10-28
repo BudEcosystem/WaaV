@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::auth::SessionCredential;
-use crate::core::llm::ChatMessage;
+use crate::core::llm::{ChatMessage, trim_history};
 
 use super::actor::{self, Background, Msg};
 use super::background::{Backend, Job};
@@ -52,7 +52,8 @@ use super::types::{
 /// The function a provider calls to hand a request to WaaV.
 pub const DELEGATE_TOOL: &str = "waav_delegate";
 
-/// The conversation a background run gets: the newest messages of the session.
+/// The conversation a background run gets: the newest messages of the session, trimmed in
+/// blocks to between half of this and this.
 const HISTORY_KEPT: usize = 40;
 /// The numbers the provider may repeat besides its instructions' own: the newest ones said.
 const SOURCE_NUMBERS_KEPT: usize = 512;
@@ -405,7 +406,7 @@ struct Session {
     /// The question answered last, and when: the provider may pass the caller's answer on
     /// as a request.
     answered: Option<(HitlRequest, Ms)>,
-    /// The newest [`HISTORY_KEPT`] messages.
+    /// The newest messages, at most [`HISTORY_KEPT`] (trimmed in blocks).
     history: Vec<ChatMessage>,
     /// What the provider may repeat: its instructions, the caller's words, results and the
     /// gateway's own lines.
@@ -2366,10 +2367,10 @@ impl Session {
     }
 
     fn remember(&mut self, message: ChatMessage) {
-        if self.history.len() == HISTORY_KEPT {
-            self.history.remove(0);
-        }
         self.history.push(message);
+        // In blocks, as a session's own history: each run's conversation then starts where the
+        // last one's did, and the run's server reuses its cached prefix.
+        trim_history(&mut self.history, HISTORY_KEPT);
     }
 
     /// What the provider said on its own: one verdict per sentence that no task supports.
@@ -3056,7 +3057,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         tx.send(Msg::Shutdown { clean: true }).await.unwrap();
         session.await.unwrap();
-        assert_eq!(*given.lock().unwrap(), [HISTORY_KEPT]);
+        // Held in blocks: never more than HISTORY_KEPT, never less than half of it.
+        let given = given.lock().unwrap().clone();
+        assert_eq!(given.len(), 1);
+        assert!(
+            (HISTORY_KEPT / 2..=HISTORY_KEPT).contains(&given[0]),
+            "{given:?}"
+        );
     }
 
     /// A backend that does nothing until it is cancelled, and reports that.

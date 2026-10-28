@@ -2,6 +2,16 @@
 
 All notable changes to WaaV Gateway will be documented in this file.
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **A long voice session keeps its prompt's start, so the LLM server's prefix cache works.** Once a session held `max_history` messages (20 by default), every new message removed the oldest one, so the message after the system prompt changed on every turn and llama.cpp, vLLM or OpenAI could reuse only the system prompt: each turn re-read the whole conversation before the first word. History is now trimmed in blocks, down to about half the window, starting at one of the caller's turns, so the start holds for the next several turns. The current turn is never removed (a window of 0 or 1 used to send the system prompt without the caller's message), system messages are kept, and a tool result is never kept without its call. The same rule trims the conversation interaction mode gives a background run. Reported by the Gaia team.
+
+### Features
+
+- **Aliases set the history of the sessions they serve:** `llm.max_history` and `llm.summarize_target_tokens` (see `docs/aliases.md`, Conversation history). A client's own value still wins, including one that sends the default; `conversation_config.max_history` and `summarize_target_tokens` may now be omitted or `null` on the wire. The `ready` message's `resolved_alias.llm` shows the window the session keeps.
+
 ## [1.1.0] - 2026-10-27
 
 Interaction mode is opt-in: it runs only when the server sets `interaction.enabled` and a session asks for it (or the operator sets a default block). Sessions without an `interaction` block, and servers without the switch, behave as in 1.0.0. The exceptions are the provider changes under Bug Fixes, which apply with interaction mode on or off; each realtime wire fix that is on by default has an escape flag that restores the 1.0.0 frames.

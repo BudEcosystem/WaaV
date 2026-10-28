@@ -162,6 +162,17 @@ pub struct AliasLlm {
     /// The NAME only — the secret stays in the credential's env var / file, bound to its hosts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    /// The session's history size, in messages with the system prompt, when the client names
+    /// none (the default is 20). Size it to the model's context window: the history is trimmed
+    /// in blocks to about half of it, so the LLM server's prefix cache holds between trims.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = 40))]
+    pub max_history: Option<usize>,
+    /// Token-aware summarization of older turns (`conversation_config.summarize_target_tokens`)
+    /// when the client names none; 0 = off (the default). The summary is made by the session's
+    /// own LLM after a turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summarize_target_tokens: Option<usize>,
 }
 
 /// A vendor's own realtime (speech-to-speech) API behind an alias (the `[aliases.x.realtime]`
@@ -701,12 +712,12 @@ fn fallback_alias_conversation() -> ConversationWebSocketConfig {
         temperature: None,
         max_tokens: None,
         streaming: true,
-        max_history: 20,
+        max_history: None,
         allow_interruption: true,
         eager_eot: false,
         provider_kind: None,
         barge_in_min_words: None,
-        summarize_target_tokens: 0,
+        summarize_target_tokens: None,
         mute_strategy: None,
         strip_markdown: true,
         user_idle_timeout_ms: 0,
@@ -744,7 +755,7 @@ fn alias_conversation_from_wire_defaults(value: serde_json::Value) -> Conversati
 
 /// A fresh conversation config carrying the EXACT serde defaults a client would get by
 /// sending `{"base_url":"","model":""}` (streaming on, allow_interruption on,
-/// strip_markdown on, max_history default, ...). Built by round-tripping through serde
+/// strip_markdown on, max_history unset, ...). Built by round-tripping through serde
 /// on the normal path so it tracks wire defaults, with a non-panicking fallback for
 /// future schema drift. `base_url`/`model` are left empty for the alias (then the
 /// client) to fill.
@@ -863,6 +874,16 @@ pub fn splice_alias(
         {
             cfg.credential_ref = Some(r.clone());
         }
+        if let Some(n) = a.max_history
+            && cfg.max_history.is_none()
+        {
+            cfg.max_history = Some(n);
+        }
+        if let Some(n) = a.summarize_target_tokens
+            && cfg.summarize_target_tokens.is_none()
+        {
+            cfg.summarize_target_tokens = Some(n);
+        }
     }
 
     // ── DAG template ──────────────────────────────────────────────────────────────
@@ -929,6 +950,12 @@ fn build_echo(
             provider_kind: c.provider_kind,
             // The credential's NAME is not a secret, but the echo stays minimal.
             credential_ref: None,
+            // What the session keeps, alias or client, so a developer can see the window.
+            max_history: Some(
+                c.max_history
+                    .unwrap_or(crate::core::llm::DEFAULT_MAX_HISTORY),
+            ),
+            summarize_target_tokens: c.summarize_target_tokens,
         });
     let echo_dag = def
         .dag_template
@@ -1020,6 +1047,9 @@ pub fn splice_alias_realtime(
             reasoning_model: l.reasoning_model.clone(),
             provider_kind: l.provider_kind,
             credential_ref: None,
+            // `/realtime` keeps no conversation history of its own.
+            max_history: None,
+            summarize_target_tokens: None,
         }),
         dag_template: None,
     }
