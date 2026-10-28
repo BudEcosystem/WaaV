@@ -157,6 +157,14 @@ Premium TTS with voice cloning and SSML support.
 - `rate`: 0.5-2.0 (speed)
 - `pitch`: 0.5-2.0
 
+**Voices:** CosyVoice v2 and v3 name their voices with the model's suffix (Model Studio's
+CosyVoice voice list): `longxiaochun_v3` on `cosyvoice-v3-flash`, `longxiaochun_v2` on
+`cosyvoice-v2`. `cosyvoice-v3-plus` has two voices, `longanyang` and `longanhuan`. The gateway
+sends a v1 name (`longxiaochun`, `longwan`, …) as its successor for the session's model, with a
+warning, and a session that names no voice gets the model's default in its region:
+`longxiaochun_v3` (Beijing) or `longwan_v3` (Singapore) on v3-flash, `longanhuan` on v3-plus,
+`longxiaochun_v2` on v2, `Cherry` on `qwen3-tts-flash-realtime`.
+
 ---
 
 ## Audio-to-Audio Models

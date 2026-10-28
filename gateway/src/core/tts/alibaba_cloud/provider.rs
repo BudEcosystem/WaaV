@@ -197,7 +197,7 @@ impl DashScopeTts {
     /// Create session update message for Qwen TTS.
     fn create_qwen_session_update(&self) -> String {
         let msg = QwenTtsSessionUpdate::new(
-            &self.config.voice,
+            &self.config.wire_voice(),
             self.config.audio_format.as_format_str(),
             self.config.sample_rate,
             Some(self.config.rate),
@@ -216,7 +216,7 @@ impl DashScopeTts {
         let msg = CosyVoiceRunTask::with_parameters(
             self.config.model.as_model_id(),
             CosyVoiceParameters {
-                voice: self.config.voice.clone(),
+                voice: self.config.wire_voice(),
                 format: self.config.audio_format.as_format_str().to_string(),
                 sample_rate: self.config.sample_rate,
                 volume: self.config.volume,
@@ -791,6 +791,19 @@ mod tests {
         assert!(json.contains("run-task"));
         assert!(json.contains("cosyvoice-v3-flash"));
         assert!(!task_id.is_empty());
+        // CosyVoice v1's "longxiaochun" goes out as v3-flash names it.
+        assert!(json.contains(r#""voice":"longxiaochun_v3""#), "{json}");
+    }
+
+    /// A Qwen session that names no voice speaks with a Qwen voice, not CosyVoice's default.
+    #[test]
+    fn a_qwen_session_without_a_voice_gets_a_qwen_voice() {
+        let mut config = create_test_config();
+        config.model = "qwen3-tts-flash-realtime".to_string();
+        config.voice_id = None;
+        let tts = DashScopeTts::new(config).unwrap();
+        let update = tts.create_qwen_session_update();
+        assert!(update.contains(r#""voice":"Cherry""#), "{update}");
     }
 
     // WIRE-LEVEL: the advanced CosyVoice features set through the standardized config must reach

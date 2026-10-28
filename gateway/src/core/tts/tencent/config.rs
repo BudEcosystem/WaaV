@@ -145,9 +145,14 @@ impl TencentVoiceCategory {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TencentTtsVoice {
-    // Standard voices
-    /// 亲和女声 - Friendly Female (ID: 0).
+    /// zhiyu (ID: 1001), a standard voice on Tencent's current `VoiceType` list (the SDKs'
+    /// `TextToVoiceRequest.VoiceType`, intl and China). The default.
     #[default]
+    Zhiyu,
+
+    // The original basic voices (IDs 0-6). Tencent's current `VoiceType` list no longer has
+    // them; one named explicitly is sent as given.
+    /// 亲和女声 - Friendly Female (ID: 0).
     FriendlyFemale,
     /// 亲和男声 - Friendly Male (ID: 1).
     FriendlyMale,
@@ -169,6 +174,7 @@ impl TencentTtsVoice {
     /// Get the voice type ID for API request.
     pub fn as_id(&self) -> i64 {
         match self {
+            TencentTtsVoice::Zhiyu => 1001,
             TencentTtsVoice::FriendlyFemale => 0,
             TencentTtsVoice::FriendlyMale => 1,
             TencentTtsVoice::MatureMale => 2,
@@ -182,6 +188,7 @@ impl TencentTtsVoice {
     /// Get the voice name.
     pub fn name(&self) -> &str {
         match self {
+            TencentTtsVoice::Zhiyu => "智瑜 (zhiyu)",
             TencentTtsVoice::FriendlyFemale => "亲和女声 (Friendly Female)",
             TencentTtsVoice::FriendlyMale => "亲和男声 (Friendly Male)",
             TencentTtsVoice::MatureMale => "成熟男声 (Mature Male)",
@@ -197,6 +204,7 @@ impl TencentTtsVoice {
         // Try to parse as numeric ID first
         if let Ok(id) = s.parse::<i64>() {
             return match id {
+                1001 => TencentTtsVoice::Zhiyu,
                 0 => TencentTtsVoice::FriendlyFemale,
                 1 => TencentTtsVoice::FriendlyMale,
                 2 => TencentTtsVoice::MatureMale,
@@ -209,6 +217,7 @@ impl TencentTtsVoice {
 
         // Try to parse as voice name
         match s.to_lowercase().as_str() {
+            "zhiyu" => TencentTtsVoice::Zhiyu,
             "friendly_female" | "friendlyfemale" | "female" | "0" => {
                 TencentTtsVoice::FriendlyFemale
             }
@@ -217,14 +226,21 @@ impl TencentTtsVoice {
             "warm_female" | "warmfemale" | "4" => TencentTtsVoice::WarmFemale,
             "emotional_female" | "emotionalfemale" | "5" => TencentTtsVoice::EmotionalFemale,
             "emotional_male" | "emotionalmale" | "6" => TencentTtsVoice::EmotionalMale,
-            _ => TencentTtsVoice::FriendlyFemale,
+            other => {
+                tracing::warn!(
+                    voice = other,
+                    "unknown Tencent voice name; using the default (zhiyu, 1001). Name a voice by \
+                     its numeric VoiceType"
+                );
+                TencentTtsVoice::default()
+            }
         }
     }
 
     /// Get the category of this voice.
     pub fn category(&self) -> TencentVoiceCategory {
         let id = self.as_id();
-        if id <= 10 {
+        if id <= 10 || (1001..=1051).contains(&id) || id == 10510000 {
             TencentVoiceCategory::Standard
         } else if (101001..=101030).contains(&id) {
             TencentVoiceCategory::Premium
@@ -893,8 +909,10 @@ mod tests {
 
     #[test]
     fn test_voice_default() {
+        // On Tencent's current VoiceType list (the original basic voices 0-6 are not).
         let voice = TencentTtsVoice::default();
-        assert_eq!(voice.as_id(), 0);
+        assert_eq!(voice.as_id(), 1001);
+        assert_eq!(voice.category(), TencentVoiceCategory::Standard);
     }
 
     #[test]
@@ -922,6 +940,20 @@ mod tests {
         assert_eq!(
             TencentTtsVoice::from_str_or_id("male"),
             TencentTtsVoice::FriendlyMale
+        );
+        assert_eq!(
+            TencentTtsVoice::from_str_or_id("zhiyu"),
+            TencentTtsVoice::Zhiyu
+        );
+        assert_eq!(
+            TencentTtsVoice::from_str_or_id("1001"),
+            TencentTtsVoice::Zhiyu
+        );
+        // An unknown name is the default voice (it used to be ID 0, which Tencent no longer
+        // lists), never silently another voice of the client's.
+        assert_eq!(
+            TencentTtsVoice::from_str_or_id("no-such-voice"),
+            TencentTtsVoice::Zhiyu
         );
     }
 

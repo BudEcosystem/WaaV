@@ -45,8 +45,27 @@ pub const DEFAULT_SAMPLE_RATE: u32 = 22050;
 /// Default audio format.
 pub const DEFAULT_AUDIO_FORMAT: &str = "mp3";
 
-/// Default voice.
-pub const DEFAULT_VOICE: &str = "longxiaochun";
+/// The default model's default voice (in the default region): see
+/// [`DashScopeTtsModel::default_voice`].
+pub const DEFAULT_VOICE: &str = "longxiaochun_v3";
+
+/// CosyVoice v1's voice names, which CosyVoice v2 and v3 renamed with the model's suffix
+/// (`longxiaochun_v2`, `longxiaochun_v3`), and whether each has a successor in v3-flash and in v2
+/// (Model Studio's CosyVoice voice list). A name without one is sent as given.
+const COSYVOICE_V1_VOICES: &[(&str, bool, bool)] = &[
+    ("longxiaochun", true, true),
+    ("longxiaoxia", true, true),
+    ("longlaotie", true, true),
+    ("longshu", true, true),
+    ("longyue", true, true),
+    ("longwan", true, true),
+    ("longfei", true, true),
+    ("longjielidou", true, true),
+    ("longshuo", true, true),
+    ("longjing", false, true),
+    ("longmiao", true, true),
+    ("longhua", true, true),
+];
 
 // =============================================================================
 // Region Enum
@@ -115,6 +134,33 @@ impl DashScopeTtsModel {
             DashScopeTtsModel::CosyVoiceV2 => "cosyvoice-v2",
             DashScopeTtsModel::Qwen3TtsFlashRealtime => "qwen3-tts-flash-realtime",
         }
+    }
+
+    /// The voice a session that names none speaks with: one Model Studio lists for this model in
+    /// `region` (`longxiaochun_v3` is offered in Beijing only; v3-plus has two voices).
+    pub fn default_voice(&self, region: DashScopeRegion) -> &'static str {
+        match (self, region) {
+            (DashScopeTtsModel::CosyVoiceV3Flash, DashScopeRegion::Beijing) => DEFAULT_VOICE,
+            (DashScopeTtsModel::CosyVoiceV3Flash, DashScopeRegion::Singapore) => "longwan_v3",
+            (DashScopeTtsModel::CosyVoiceV3Plus, _) => "longanhuan",
+            (DashScopeTtsModel::CosyVoiceV2, _) => "longxiaochun_v2",
+            (DashScopeTtsModel::Qwen3TtsFlashRealtime, _) => "Cherry",
+        }
+    }
+
+    /// `voice` as this model names it: a CosyVoice v1 name becomes its v2/v3 successor (with
+    /// the old name, for the caller to report); any other name is unchanged.
+    pub fn voice_name(&self, voice: &str) -> (String, Option<&'static str>) {
+        let successor = |old: &'static str, v3: bool, v2: bool| match self {
+            DashScopeTtsModel::CosyVoiceV3Flash if v3 => Some((format!("{old}_v3"), Some(old))),
+            DashScopeTtsModel::CosyVoiceV2 if v2 => Some((format!("{old}_v2"), Some(old))),
+            _ => None,
+        };
+        COSYVOICE_V1_VOICES
+            .iter()
+            .find(|(old, _, _)| *old == voice)
+            .and_then(|&(old, v3, v2)| successor(old, v3, v2))
+            .unwrap_or_else(|| (voice.to_string(), None))
     }
 
     /// Check if this is a Qwen model (uses realtime protocol).
@@ -279,8 +325,9 @@ pub struct DashScopeTtsConfig {
     pub endpoint_override: Option<String>,
 }
 
+/// Empty: the model's own default ([`DashScopeTtsConfig::wire_voice`]).
 fn default_voice() -> String {
-    DEFAULT_VOICE.to_string()
+    String::new()
 }
 
 fn default_sample_rate() -> u32 {
@@ -305,7 +352,7 @@ impl Default for DashScopeTtsConfig {
             api_key: String::new(),
             region: DashScopeRegion::default(),
             model: DashScopeTtsModel::default(),
-            voice: DEFAULT_VOICE.to_string(),
+            voice: String::new(),
             sample_rate: DEFAULT_SAMPLE_RATE,
             audio_format: DashScopeAudioFormat::default(),
             rate: 1.0,
@@ -331,12 +378,6 @@ impl DashScopeTtsConfig {
         if self.api_key.is_empty() {
             return Err(TTSError::InvalidConfiguration(
                 "DashScope API key is required".to_string(),
-            ));
-        }
-
-        if self.voice.is_empty() {
-            return Err(TTSError::InvalidConfiguration(
-                "Voice is required".to_string(),
             ));
         }
 
@@ -397,7 +438,8 @@ impl DashScopeTtsConfig {
             DashScopeTtsModel::from_str(&config.model)
         };
 
-        let voice = config.voice_id.unwrap_or_else(|| DEFAULT_VOICE.to_string());
+        // Empty when the session names none: the model's default, once region and model are final.
+        let voice = config.voice_id.unwrap_or_default();
         let sample_rate = config
             .sample_rate
             .unwrap_or_else(|| model.default_sample_rate());
@@ -519,25 +561,42 @@ impl DashScopeTtsConfig {
         Ok(cfg)
     }
 
+    /// The voice sent to DashScope: the session's (a CosyVoice v1 name as the model now names
+    /// it), else the model's default in the session's region.
+    pub fn wire_voice(&self) -> String {
+        if self.voice.trim().is_empty() {
+            return self.model.default_voice(self.region).to_string();
+        }
+        let (voice, renamed) = self.model.voice_name(self.voice.trim());
+        if let Some(old) = renamed {
+            tracing::warn!(
+                voice = %old,
+                replacement = %voice,
+                model = self.model.as_model_id(),
+                "CosyVoice v2/v3 name their voices with the model's suffix; using the successor"
+            );
+        }
+        voice
+    }
+
     /// Get list of supported voices.
     pub fn supported_voices() -> Vec<&'static str> {
         vec![
-            // CosyVoice voices
-            "longxiaochun",
-            "longxiaoxia",
-            "longlaotie",
-            "longshu",
-            "longyue",
-            "longwan",
-            "longfei",
-            "longbella",
-            "longjielidou",
-            "longshuo",
-            "longjing",
-            "longmiao",
-            "longchen",
-            "longhua",
-            "longtong",
+            // CosyVoice v3-flash voices (v1's names with the model's suffix)
+            "longxiaochun_v3",
+            "longxiaoxia_v3",
+            "longlaotie_v3",
+            "longshu_v3",
+            "longyue_v3",
+            "longwan_v3",
+            "longfei_v3",
+            "longjielidou_v3",
+            "longshuo_v3",
+            "longmiao_v3",
+            "longhua_v3",
+            // CosyVoice v3-plus voices
+            "longanyang",
+            "longanhuan",
             // Qwen TTS voices
             "Cherry",
             "Serena",
@@ -686,7 +745,7 @@ mod tests {
     fn test_config_default() {
         let config = DashScopeTtsConfig::default();
         assert!(config.api_key.is_empty());
-        assert_eq!(config.voice, DEFAULT_VOICE);
+        assert_eq!(config.wire_voice(), DEFAULT_VOICE);
         assert_eq!(config.sample_rate, DEFAULT_SAMPLE_RATE);
     }
 
@@ -815,8 +874,61 @@ mod tests {
     #[test]
     fn test_supported_voices() {
         let voices = DashScopeTtsConfig::supported_voices();
-        assert!(voices.contains(&"longxiaochun"));
+        assert!(voices.contains(&"longxiaochun_v3"));
         assert!(voices.contains(&"Cherry"));
+        // v1's names are no longer offered as such.
+        assert!(!voices.contains(&"longxiaochun"));
+    }
+
+    /// The voice on the wire is one Model Studio lists for the model (and region): a session that
+    /// names none gets the model's default, a CosyVoice v1 name its v2/v3 successor, any other
+    /// name is sent as given.
+    #[test]
+    fn the_wire_voice_is_one_the_model_offers() {
+        let config = |model: &str, voice: Option<&str>, region| {
+            let mut c = DashScopeTtsConfig::from_base(TTSConfig {
+                api_key: "test-key".to_string(),
+                model: model.to_string(),
+                voice_id: voice.map(str::to_string),
+                ..Default::default()
+            })
+            .unwrap();
+            c.region = region;
+            c
+        };
+        let (bj, sg) = (DashScopeRegion::Beijing, DashScopeRegion::Singapore);
+        for (model, region, want) in [
+            ("", bj, "longxiaochun_v3"),
+            ("cosyvoice-v3-flash", sg, "longwan_v3"),
+            ("cosyvoice-v3-plus", bj, "longanhuan"),
+            ("cosyvoice-v2", bj, "longxiaochun_v2"),
+            ("qwen3-tts-flash-realtime", bj, "Cherry"),
+        ] {
+            assert_eq!(config(model, None, region).wire_voice(), want, "{model}");
+        }
+        assert_eq!(DashScopeTtsConfig::default().wire_voice(), DEFAULT_VOICE);
+
+        for (model, old, want) in [
+            ("cosyvoice-v3-flash", "longxiaochun", "longxiaochun_v3"),
+            ("cosyvoice-v3-flash", "longwan", "longwan_v3"),
+            ("cosyvoice-v2", "longjing", "longjing_v2"),
+            // No v3-flash successor, or a model without suffixes: sent as given.
+            ("cosyvoice-v3-flash", "longjing", "longjing"),
+            ("cosyvoice-v3-flash", "longbella", "longbella"),
+            ("cosyvoice-v3-plus", "longxiaochun", "longxiaochun"),
+            // Already current, or not CosyVoice's: unchanged.
+            ("cosyvoice-v3-flash", "longanyang", "longanyang"),
+            ("cosyvoice-v3-flash", "longxiaochun_v3", "longxiaochun_v3"),
+            ("qwen3-tts-flash-realtime", "Serena", "Serena"),
+        ] {
+            assert_eq!(
+                config(model, Some(old), bj).wire_voice(),
+                want,
+                "{model} {old}"
+            );
+        }
+        let (_, renamed) = DashScopeTtsModel::CosyVoiceV2.voice_name("longxiaoxia");
+        assert_eq!(renamed, Some("longxiaoxia"));
     }
 
     #[test]
