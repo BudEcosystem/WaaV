@@ -1,0 +1,12 @@
+{"title": "Speaks first. Every time.",
+ "subtitle": "Full-Duplex-Bench v3 · 100 real, disfluent spoken requests with tool use · time to the agent's first words (lower is better)",
+ "foot": "Bud WaaV 1.1.0 (Qwen3.5-2B front, Claude Opus 5.5 background, Deepgram speech), measured 27 Oct 2026 with our adapter; others from the FD-bench v3 paper (arXiv 2604.04847). Bud WaaV Pass@1 0.39 (lowest) and response quality 0.73 (2nd): see the paper.",
+ "rows": [
+  {"name": "Bud WaaV · interaction mode", "frac": 0.282, "label": "2.48 s", "us": true},
+  {"name": "Ultravox v0.7", "frac": 0.442, "label": "3.88 s"},
+  {"name": "Gemini Live 3.1", "frac": 0.450, "label": "3.95 s"},
+  {"name": "Grok", "frac": 0.680, "label": "5.97 s"},
+  {"name": "GPT-Realtime 1.5", "frac": 0.724, "label": "6.36 s"},
+  {"name": "Gemini Live 2.5", "frac": 0.801, "label": "7.03 s"},
+  {"name": "Cascade (Whisper + GPT-4o)", "frac": 1.0, "label": "8.78 s"}
+ ]}

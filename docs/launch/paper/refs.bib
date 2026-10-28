@@ -1,0 +1,903 @@
+% ---------------------------------------------------------------------------
+% refs.bib — Bud WaaV interaction mode: related work
+% Web pages use misc entries with url + urldate (accessed 2026-10-27).
+% ---------------------------------------------------------------------------
+
+% ===== Thinking Machines Lab =====
+@misc{tml2026interaction,
+  author       = {{Thinking Machines Lab}},
+  title        = {Interaction Models},
+  year         = {2026},
+  month        = may,
+  howpublished = {Thinking Machines Lab: Connectionism (blog)},
+  doi          = {10.64434/tml.20260511},
+  url          = {https://thinkingmachines.ai/blog/interaction-models/},
+  urldate      = {2026-10-27},
+  note         = {Research preview; TML-Interaction-Small, 276B-total / 12B-active MoE, 200 ms micro-turns}
+}
+
+% ===== Full-Duplex-Bench family =====
+@article{lin2025fdbv1,
+  author  = {Lin, Guan-Ting and Lian, Jiachen and Li, Tingle and Wang, Qirui and Anumanchipalli, Gopala and Liu, Alexander H. and Lee, Hung-yi},
+  title   = {Full-Duplex-Bench: A Benchmark to Evaluate Full-duplex Spoken Dialogue Models on Turn-taking Capabilities},
+  journal = {arXiv preprint arXiv:2503.04721},
+  year    = {2025},
+  url     = {https://arxiv.org/abs/2503.04721}
+}
+
+@article{lin2025fdbv15,
+  author  = {Lin, Guan-Ting and Kuan, Shih-Yun Shan and Wang, Qirui and Lian, Jiachen and Li, Tingle and Watanabe, Shinji and Lee, Hung-yi},
+  title   = {Full-Duplex-Bench v1.5: Evaluating Overlap Handling for Full-Duplex Speech Models},
+  journal = {arXiv preprint arXiv:2507.23159},
+  year    = {2025},
+  url     = {https://arxiv.org/abs/2507.23159}
+}
+
+@article{lin2026fdbv2,
+  author  = {Lin, Guan-Ting and Kuan, Shih-Yun Shan and Shi, Jiatong and Chang, Kai-Wei and Arora, Siddhant and Watanabe, Shinji and Lee, Hung-yi},
+  title   = {Full-Duplex-Bench-v2: A Multi-Turn Evaluation Framework for Duplex Dialogue Systems with an Automated Examiner},
+  journal = {arXiv preprint arXiv:2510.07838},
+  year    = {2025},
+  url     = {https://arxiv.org/abs/2510.07838}
+}
+
+@article{lin2026fdbv3,
+  author  = {Lin, Guan-Ting and Chen, Chen and Chen, Zhehuai and Lee, Hung-yi},
+  title   = {Full-Duplex-Bench-v3: Benchmarking Tool Use for Full-Duplex Voice Agents Under Real-World Disfluency},
+  journal = {arXiv preprint arXiv:2604.04847},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2604.04847}
+}
+
+@misc{fdb_repo,
+  author       = {Lin, Guan-Ting and others},
+  title        = {{Full-Duplex-Bench}: A Benchmark Suite for Evaluating Full-Duplex Spoken Dialogue Models and Systems (GitHub repository, v1/v1.5 leaderboard)},
+  year         = {2026},
+  url          = {https://github.com/DanielLin94144/Full-Duplex-Bench},
+  urldate      = {2026-10-27}
+}
+
+% ===== Other interactive-voice benchmarks =====
+@article{ge2025flexi,
+  author  = {Ge, Yuan and Chen, Saihan and Xiao, Jingqi and Liu, Xiaoqian and Xiao, Tong and Xiang, Yan and Yu, Zhengtao and Zhu, Jingbo},
+  title   = {{FLEXI}: Benchmarking Full-duplex Human-{LLM} Speech Interaction},
+  journal = {arXiv preprint arXiv:2509.22243},
+  year    = {2025},
+  url     = {https://arxiv.org/abs/2509.22243}
+}
+
+@inproceedings{li2025mindthegap,
+  author    = {Li, Minzhi and Held, William Barr and Ryan, Michael J. and Pipatanakul, Kunat and Manakul, Potsawee and Zhu, Hao and Yang, Diyi},
+  title     = {Mind the Gap! Static and Interactive Evaluations of Large Audio Models},
+  booktitle = {Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (ACL)},
+  pages     = {8749--8766},
+  year      = {2025},
+  url       = {https://arxiv.org/abs/2502.15919}
+}
+
+@misc{talkarena,
+  author       = {Li, Minzhi and Held, Will and Ryan, Michael J. and Pipatanakul, Kunat and Manakul, Potsawee and Zhu, Hao and Yang, Diyi},
+  title        = {Talk Arena: Interactive Evaluation of Large Audio Models},
+  year         = {2024},
+  url          = {https://talkarena.org/},
+  urldate      = {2026-10-27}
+}
+
+@article{chen2024voicebench,
+  author  = {Chen, Yiming and Yue, Xianghu and Zhang, Chen and Gao, Xiaoxue and Tan, Robby T. and Li, Haizhou},
+  title   = {{VoiceBench}: Benchmarking {LLM}-Based Voice Assistants},
+  journal = {arXiv preprint arXiv:2410.17196},
+  year    = {2024},
+  url     = {https://arxiv.org/abs/2410.17196}
+}
+
+@misc{aa_bigbenchaudio,
+  author       = {Hill-Smith, Micah and Cameron, George and Bosler, Will},
+  title        = {Big Bench Audio (dataset)},
+  howpublished = {Artificial Analysis, Hugging Face Datasets},
+  year         = {2024},
+  url          = {https://huggingface.co/datasets/ArtificialAnalysis/big_bench_audio},
+  urldate      = {2026-10-27}
+}
+
+@misc{aa_s2s_leaderboard,
+  author       = {{Artificial Analysis}},
+  title        = {Speech to Speech: Big Bench Audio leaderboard},
+  year         = {2026},
+  url          = {https://artificialanalysis.ai/speech-to-speech},
+  urldate      = {2026-10-27}
+}
+
+@inproceedings{gosai2025audiomc,
+  author    = {Gosai, Advait and Vuong, Tyler and Tyagi, Utkarsh and Li, Steven and You, Wenjia and Bavare, Miheer and U{\c{c}}ar, Arda and Fang, Zhongwang and Jang, Brian and Liu, Bing and He, Yunzhong},
+  title     = {Audio {MultiChallenge}: A Multi-Turn Evaluation of Spoken Dialogue Systems on Natural Human Interaction},
+  booktitle = {Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (ACL)},
+  pages     = {35740--35770},
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2512.14865}
+}
+
+% ===== Open full-duplex / speech models =====
+@article{defossez2024moshi,
+  author  = {D{\'e}fossez, Alexandre and Mazar{\'e}, Laurent and Orsini, Manu and Royer, Am{\'e}lie and P{\'e}rez, Patrick and J{\'e}gou, Herv{\'e} and Grave, Edouard and Zeghidour, Neil},
+  title   = {Moshi: a speech-text foundation model for real-time dialogue},
+  journal = {arXiv preprint arXiv:2410.00037},
+  year    = {2024},
+  url     = {https://arxiv.org/abs/2410.00037}
+}
+
+@misc{kyutai_moshi_repo,
+  author  = {{Kyutai}},
+  title   = {Moshi (GitHub repository)},
+  year    = {2024},
+  url     = {https://github.com/kyutai-labs/moshi},
+  urldate = {2026-10-27}
+}
+
+@misc{kyutai_unmute,
+  author  = {{Kyutai}},
+  title   = {Unmute: make any {LLM} listen and speak},
+  year    = {2025},
+  url     = {https://kyutai.org/unmute/},
+  note    = {Code: \url{https://github.com/kyutai-labs/unmute}},
+  urldate = {2026-10-27}
+}
+
+@misc{kyutai_stt,
+  author  = {{Kyutai}},
+  title   = {Kyutai {STT} (with semantic {VAD})},
+  year    = {2025},
+  url     = {https://kyutai.org/stt},
+  note    = {See also arXiv:2509.08753 (delayed streams modeling)},
+  urldate = {2026-10-27}
+}
+
+@article{roy2026personaplex,
+  author  = {Roy, Rajarshi and Raiman, Jonathan and Lee, Sang-gil and Ene, Teodor-Dumitru and Kirby, Robert and Kim, Sungwon and Kim, Jaehyeon and Catanzaro, Bryan},
+  title   = {{PersonaPlex}: Voice and Role Control for Full Duplex Conversational Speech Models},
+  journal = {arXiv preprint arXiv:2602.06053},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2602.06053}
+}
+
+@misc{nvidia_personaplex_card,
+  author  = {{NVIDIA}},
+  title   = {personaplex-7b-v1 (model card)},
+  year    = {2026},
+  url     = {https://huggingface.co/nvidia/personaplex-7b-v1},
+  urldate = {2026-10-27}
+}
+
+@misc{nvidia2026voicechat,
+  author  = {{NVIDIA}},
+  title   = {{NemotronLabs VoiceChat} (model card)},
+  year    = {2026},
+  url     = {https://catalog.ngc.nvidia.com/orgs/nim/nvidia/models/nemotron-labs-voicechat},
+  urldate = {2026-10-27},
+  note    = {11B hybrid Mamba/Transformer full-duplex model; released 16 July 2026; OpenMDW 1.1, research use only}
+}
+
+@article{wang2024freezeomni,
+  author  = {Wang, Xiong and Li, Yangze and Fu, Chaoyou and Shen, Yunhang and Xie, Lei and Li, Ke and Sun, Xing and Ma, Long},
+  title   = {{Freeze-Omni}: A Smart and Low Latency Speech-to-speech Dialogue Model with Frozen {LLM}},
+  journal = {arXiv preprint arXiv:2411.00774},
+  year    = {2024},
+  url     = {https://arxiv.org/abs/2411.00774}
+}
+
+@article{nguyen2023dgslm,
+  author  = {Nguyen, Tu Anh and Kharitonov, Eugene and Copet, Jade and Adi, Yossi and Hsu, Wei-Ning and Elkahky, Ali and Tomasello, Paden and Algayres, Robin and Sagot, Beno{\^\i}t and Mohamed, Abdelrahman and Dupoux, Emmanuel},
+  title   = {Generative Spoken Dialogue Language Modeling},
+  journal = {Transactions of the Association for Computational Linguistics},
+  volume  = {11},
+  pages   = {250--266},
+  year    = {2023},
+  doi     = {10.1162/tacl_a_00545},
+  url     = {https://arxiv.org/abs/2203.16502}
+}
+
+@misc{sesame2025csm,
+  author  = {Schalkwyk, Johan and Kumar, Ankit and Lyth, Dan and Eskimez, Sefik Emre and Hodari, Zack and Resnick, Cinjon and Sanabria, Ramon and Jiang, Raven},
+  title   = {Crossing the uncanny valley of conversational voice},
+  year    = {2025},
+  month   = feb,
+  howpublished = {Sesame Research blog},
+  url     = {https://www.sesame.com/research/crossing_the_uncanny_valley_of_voice},
+  urldate = {2026-10-27}
+}
+
+@misc{sesame_csm1b,
+  author  = {{Sesame}},
+  title   = {csm-1b (model card)},
+  year    = {2025},
+  url     = {https://huggingface.co/sesame/csm-1b},
+  urldate = {2026-10-27}
+}
+
+@article{xu2025qwen3omni,
+  author  = {Xu, Jin and others},
+  title   = {{Qwen3-Omni} Technical Report},
+  journal = {arXiv preprint arXiv:2509.17765},
+  year    = {2025},
+  url     = {https://arxiv.org/abs/2509.17765}
+}
+
+@article{qwen2026qwen35omni,
+  author  = {{Qwen Team}},
+  title   = {{Qwen3.5-Omni} Technical Report},
+  journal = {arXiv preprint arXiv:2604.15804},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2604.15804}
+}
+
+% ===== WaaV component references =====
+@misc{qwen35_2b,
+  author  = {{Qwen Team}},
+  title   = {{Qwen3.5-2B} (model card)},
+  year    = {2026},
+  url     = {https://huggingface.co/Qwen/Qwen3.5-2B},
+  urldate = {2026-10-27},
+  note    = {Apache-2.0; hybrid Gated DeltaNet + gated attention; 262,144-token native context}
+}
+
+@misc{llamacpp,
+  author  = {Gerganov, Georgi and {ggml-org contributors}},
+  title   = {llama.cpp: {LLM} inference in {C/C++}},
+  year    = {2023},
+  url     = {https://github.com/ggml-org/llama.cpp},
+  urldate = {2026-10-27}
+}
+
+@article{openai2025gptoss,
+  author  = {{OpenAI}},
+  title   = {gpt-oss-120b \& gpt-oss-20b Model Card},
+  journal = {arXiv preprint arXiv:2508.10925},
+  year    = {2025},
+  url     = {https://arxiv.org/abs/2508.10925}
+}
+
+@misc{silero_vad,
+  author  = {{Silero Team}},
+  title   = {Silero {VAD}: pre-trained enterprise-grade Voice Activity Detector},
+  year    = {2021},
+  url     = {https://github.com/snakers4/silero-vad},
+  urldate = {2026-10-27}
+}
+
+@misc{mcp_spec,
+  author  = {{Anthropic and MCP contributors}},
+  title   = {Model Context Protocol Specification},
+  year    = {2024},
+  url     = {https://modelcontextprotocol.io/specification},
+  urldate = {2026-10-27}
+}
+
+@misc{a2a_spec,
+  author  = {{A2A Project (Linux Foundation)}},
+  title   = {Agent2Agent ({A2A}) Protocol},
+  year    = {2025},
+  url     = {https://github.com/a2aproject/A2A},
+  urldate = {2026-10-27}
+}
+
+@misc{lf_a2a_press,
+  author  = {{Linux Foundation}},
+  title   = {Linux Foundation Launches the Agent2Agent Protocol Project},
+  year    = {2025},
+  month   = jun,
+  url     = {https://linuxfoundation.org/press/linux-foundation-launches-the-agent2agent-protocol-project-to-enable-secure-intelligent-communication-between-ai-agents},
+  urldate = {2026-10-27}
+}
+
+% ===== Google =====
+@misc{google2024gemini2,
+  author  = {{Google}},
+  title   = {Introducing {Gemini 2.0}: our new {AI} model for the agentic era},
+  year    = {2024}, month = dec,
+  url     = {https://blog.google/innovation-and-ai/models-and-research/google-deepmind/google-gemini-ai-update-december-2024/},
+  urldate = {2026-10-27}
+}
+@misc{deepmind_astra,
+  author  = {{Google DeepMind}},
+  title   = {Project Astra},
+  year    = {2025},
+  url     = {https://deepmind.google/models/project-astra/},
+  urldate = {2026-10-27}
+}
+@misc{google2025nativeaudio,
+  author  = {{Google}},
+  title   = {Improved {Gemini} audio models for powerful voice interactions},
+  year    = {2025}, month = dec,
+  url     = {https://blog.google/products-and-platforms/products/gemini/gemini-audio-model-updates/},
+  urldate = {2026-10-27}
+}
+@misc{google2026g31,
+  author  = {{Google}},
+  title   = {{Gemini 3.1 Flash Live}: Making audio {AI} more natural and reliable},
+  year    = {2026}, month = mar,
+  url     = {https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-1-flash-live/},
+  urldate = {2026-10-27}
+}
+@misc{deepmind_g31card,
+  author  = {{Google DeepMind}},
+  title   = {{Gemini 3.1 Flash Live} model card},
+  year    = {2026},
+  url     = {https://deepmind.google/models/model-cards/gemini-3-1-flash-live},
+  urldate = {2026-10-27}
+}
+@misc{deepmind_g31eval,
+  author  = {{Google DeepMind}},
+  title   = {Model Evaluation -- {Gemini 3.1 Flash Live}},
+  year    = {2026},
+  url     = {https://storage.googleapis.com/deepmind-media/gemini/gemini-3-1-flash-live-model-evaluation.pdf},
+  urldate = {2026-10-27}
+}
+@misc{google_g31doc,
+  author  = {{Google}},
+  title   = {{Gemini 3.1 Flash Live Preview} ({Gemini API} documentation)},
+  year    = {2026},
+  url     = {https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-live-preview},
+  urldate = {2026-10-27}
+}
+@misc{google2026g38,
+  author  = {{Google}},
+  title   = {Introducing {Gemini 3.8 Live} and {3.8 Live Extended Thinking}},
+  year    = {2026}, month = sep,
+  url     = {https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-8-live-gemini-3-8-live-extended-thinking/},
+  urldate = {2026-10-27}
+}
+@misc{google_g38doc,
+  author  = {{Google}},
+  title   = {{Gemini 3.8 Live} ({Gemini API} documentation)},
+  year    = {2026},
+  url     = {https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live},
+  urldate = {2026-10-27}
+}
+@misc{deepmind_g38card,
+  author  = {{Google DeepMind}},
+  title   = {{Gemini 3.8 Audio} model card},
+  year    = {2026},
+  url     = {https://deepmind.google/models/model-cards/gemini-3-8-audio/},
+  urldate = {2026-10-27}
+}
+@misc{google_livecap,
+  author  = {{Google}},
+  title   = {{Live API} capabilities guide},
+  year    = {2026},
+  url     = {https://ai.google.dev/gemini-api/docs/live-api/capabilities},
+  urldate = {2026-10-27}
+}
+@misc{google_livesession,
+  author  = {{Google}},
+  title   = {{Live API} session management},
+  year    = {2026},
+  url     = {https://ai.google.dev/gemini-api/docs/live-session},
+  urldate = {2026-10-27}
+}
+@misc{google_pricing,
+  author  = {{Google}},
+  title   = {{Gemini Developer API} pricing},
+  year    = {2026},
+  url     = {https://ai.google.dev/gemini-api/docs/pricing},
+  urldate = {2026-10-27}
+}
+
+% ===== OpenAI =====
+@misc{openai2024gpt4o,
+  author  = {{OpenAI}},
+  title   = {Hello {GPT-4o}},
+  year    = {2024}, month = may,
+  url     = {https://openai.com/index/hello-gpt-4o/},
+  urldate = {2026-10-27}
+}
+@misc{openai2025gptrealtime,
+  author  = {{OpenAI}},
+  title   = {Introducing gpt-realtime and {Realtime API} updates for production voice agents},
+  year    = {2025}, month = aug,
+  url     = {https://openai.com/index/introducing-gpt-realtime/},
+  urldate = {2026-10-27}
+}
+@misc{openai2026realtime2,
+  author  = {{OpenAI}},
+  title   = {Advancing voice intelligence with new models in the {API}},
+  year    = {2026}, month = may,
+  url     = {https://openai.com/index/advancing-voice-intelligence-with-new-models-in-the-api/},
+  urldate = {2026-10-27}
+}
+@misc{openai_rt2_model,
+  author  = {{OpenAI}},
+  title   = {{GPT-Realtime-2} model page},
+  year    = {2026},
+  url     = {https://developers.openai.com/api/docs/models/gpt-realtime-2},
+  urldate = {2026-10-27}
+}
+@misc{openai_rt21,
+  author  = {{OpenAI}},
+  title   = {New Realtime models on the {API}: gpt-realtime-2.1 and gpt-realtime-2.1-mini},
+  year    = {2026}, month = jul,
+  howpublished = {OpenAI Developer Community},
+  url     = {https://community.openai.com/t/new-realtime-models-on-the-api-gpt-realtime-2-1-and-gpt-realtime-2-1-mini/1385896},
+  urldate = {2026-10-27}
+}
+@misc{openai_changelog,
+  author  = {{OpenAI}},
+  title   = {{API} changelog},
+  year    = {2026},
+  url     = {https://developers.openai.com/api/docs/changelog},
+  urldate = {2026-10-27}
+}
+@misc{openai_rtconv,
+  author  = {{OpenAI}},
+  title   = {Realtime conversations guide},
+  year    = {2026},
+  url     = {https://platform.openai.com/docs/guides/realtime-conversations},
+  urldate = {2026-10-27}
+}
+@misc{openai2026gptlive,
+  author  = {{OpenAI}},
+  title   = {Introducing {GPT-Live}},
+  year    = {2026},
+  url     = {https://openai.com/index/introducing-gpt-live/},
+  urldate = {2026-10-27}
+}
+@misc{openai2026gptlivesys,
+  author  = {{OpenAI}},
+  title   = {How we built a realtime system for responsive voice {AI} in six months},
+  year    = {2026},
+  url     = {https://openai.com/index/continuous-voice-interaction-with-gpt-live/},
+  urldate = {2026-10-27}
+}
+@misc{openai2026gptliveapi,
+  author  = {{OpenAI}},
+  title   = {Build more natural voice experiences with {GPT-Live-1} in the {API}},
+  year    = {2026}, month = sep,
+  url     = {https://openai.com/index/introducing-gpt-live-1-in-the-api/},
+  urldate = {2026-10-27}
+}
+@misc{openai_gptlive1_model,
+  author  = {{OpenAI}},
+  title   = {{GPT-Live 1} model page},
+  year    = {2026},
+  url     = {https://developers.openai.com/api/docs/models/gpt-live-1},
+  urldate = {2026-10-27}
+}
+@misc{openai_gptlive11_card,
+  author  = {{OpenAI}},
+  title   = {{GPT-Live-1.1} system card},
+  year    = {2026},
+  url     = {https://deploymentsafety.openai.com/gpt-live-1-1},
+  urldate = {2026-10-27}
+}
+
+% ===== Cascade / agent frameworks =====
+@misc{pipecat_repo,
+  author  = {{Daily / Pipecat contributors}},
+  title   = {Pipecat: open source framework for voice and multimodal conversational {AI}},
+  year    = {2026},
+  url     = {https://github.com/pipecat-ai/pipecat},
+  urldate = {2026-10-27}
+}
+@misc{pipecat_fc,
+  author  = {{Pipecat}},
+  title   = {Function calling (Pipecat documentation)},
+  year    = {2026},
+  url     = {https://docs.pipecat.ai/pipecat/learn/function-calling.md},
+  urldate = {2026-10-27}
+}
+@misc{pipecat_services,
+  author  = {{Pipecat}},
+  title   = {Supported services (Pipecat documentation)},
+  year    = {2026},
+  url     = {https://docs.pipecat.ai/server/services/supported-services},
+  urldate = {2026-10-27}
+}
+@misc{smartturn_repo,
+  author  = {{Pipecat}},
+  title   = {Smart Turn: open source turn detection model (GitHub repository)},
+  year    = {2026},
+  url     = {https://github.com/pipecat-ai/smart-turn},
+  urldate = {2026-10-27}
+}
+@misc{daily2025smartturnv3,
+  author  = {{Daily}},
+  title   = {Announcing {Smart Turn v3}, with {CPU} inference in just 12ms},
+  year    = {2025}, month = sep,
+  url     = {https://www.daily.co/blog/announcing-smart-turn-v3-with-cpu-inference-in-just-12ms/},
+  urldate = {2026-10-27}
+}
+@misc{daily2025smartturnv31,
+  author  = {{Daily}},
+  title   = {Improved accuracy in {Smart Turn v3.1}},
+  year    = {2025}, month = dec,
+  url     = {https://www.daily.co/blog/improved-accuracy-in-smart-turn-v3-1/},
+  urldate = {2026-10-27}
+}
+@misc{livekit_turndetector,
+  author  = {{LiveKit}},
+  title   = {Turn detector (LiveKit Agents documentation)},
+  year    = {2026},
+  url     = {https://docs.livekit.io/agents/logic/turns/turn-detector},
+  urldate = {2026-10-27}
+}
+@misc{livekit2025eot,
+  author  = {{LiveKit}},
+  title   = {Improved end-of-turn model cuts voice {AI} interruptions 39\%},
+  year    = {2025}, month = dec,
+  url     = {https://livekit.com/blog/improved-end-of-turn-model-cuts-voice-ai-interruptions-39},
+  urldate = {2026-10-27}
+}
+@misc{livekit2026eot,
+  author  = {{LiveKit}},
+  title   = {Solving end-of-turn detection},
+  year    = {2026}, month = jun,
+  url     = {https://livekit.com/blog/solving-end-of-turn-detection},
+  urldate = {2026-10-27}
+}
+@misc{livekit2026adaptive,
+  author  = {{LiveKit}},
+  title   = {Adaptive interruption handling},
+  year    = {2026}, month = mar,
+  url     = {https://livekit.com/blog/adaptive-interruption-handling},
+  urldate = {2026-10-27}
+}
+@misc{livekit2026async,
+  author  = {{LiveKit}},
+  title   = {Async tools for voice agents},
+  year    = {2026}, month = jul,
+  url     = {https://livekit.com/blog/async-tools-voice-agents},
+  urldate = {2026-10-27}
+}
+@misc{livekit_pricing,
+  author  = {{LiveKit}},
+  title   = {Pricing},
+  year    = {2026},
+  url     = {https://livekit.com/pricing},
+  urldate = {2026-10-27}
+}
+@misc{vapi_pricing,
+  author  = {{Vapi}},
+  title   = {Pricing},
+  year    = {2026},
+  url     = {https://vapi.ai/pricing},
+  urldate = {2026-10-27}
+}
+@misc{vapi_home,
+  author  = {{Vapi}},
+  title   = {Vapi: Voice {AI} agents for developers},
+  year    = {2026},
+  url     = {https://vapi.ai/},
+  urldate = {2026-10-27}
+}
+@misc{vapi_speech,
+  author  = {{Vapi}},
+  title   = {Speech configuration (Vapi documentation)},
+  year    = {2026},
+  url     = {https://docs.vapi.ai/customization/speech-configuration},
+  urldate = {2026-10-27}
+}
+@misc{vapi_tools,
+  author  = {{Vapi}},
+  title   = {Custom tools (Vapi documentation)},
+  year    = {2026},
+  url     = {https://docs.vapi.ai/tools/custom-tools},
+  urldate = {2026-10-27}
+}
+@misc{retell_pricing,
+  author  = {{Retell AI}},
+  title   = {Pricing},
+  year    = {2026},
+  url     = {https://www.retellai.com/pricing},
+  urldate = {2026-10-27}
+}
+@misc{retell2026turn,
+  author  = {{Retell AI}},
+  title   = {Turn-taking in voice {AI}: the hidden problem},
+  year    = {2026}, month = oct,
+  url     = {https://www.retellai.com/blog/turn-taking-voice-ai-hidden-problem},
+  urldate = {2026-10-27}
+}
+@misc{retell_interrupt,
+  author  = {{Retell AI}},
+  title   = {How {AI} voice agents handle interruptions and natural turn-taking},
+  year    = {2026},
+  url     = {https://www.retellai.com/learn/how-ai-voice-agents-handle-interruptions-and-natural-turn-taking},
+  urldate = {2026-10-27}
+}
+@misc{deepgram_pricing,
+  author  = {{Deepgram}},
+  title   = {Pricing},
+  year    = {2026},
+  url     = {https://deepgram.com/pricing},
+  urldate = {2026-10-27}
+}
+@misc{deepgram_flux,
+  author  = {{audioXpress}},
+  title   = {Deepgram launches advanced conversational speech recognition model ({Flux})},
+  year    = {2025}, month = oct,
+  url     = {https://audioxpress.com/news/deepgram-launches-advanced-conversational-speech-recognition-model},
+  urldate = {2026-10-27}
+}
+@misc{deepgram_fc,
+  author  = {{Deepgram}},
+  title   = {Voice Agent function call request (Deepgram documentation)},
+  year    = {2026},
+  url     = {https://developers.deepgram.com/docs/voice-agent-function-call-request},
+  urldate = {2026-10-27}
+}
+@misc{elevenlabs_pricing,
+  author  = {{ElevenLabs}},
+  title   = {{API} pricing},
+  year    = {2026},
+  url     = {https://elevenlabs.io/pricing/api},
+  urldate = {2026-10-27}
+}
+@misc{elevenlabs_flow,
+  author  = {{ElevenLabs}},
+  title   = {Conversation flow ({ElevenLabs Agents} documentation)},
+  year    = {2026},
+  url     = {https://elevenlabs.io/docs/eleven-agents/customization/conversation-flow},
+  urldate = {2026-10-27}
+}
+@misc{elevenlabs_toolint,
+  author  = {{ElevenLabs}},
+  title   = {Tool interruptions ({ElevenLabs Agents} documentation)},
+  year    = {2026},
+  url     = {https://elevenlabs.io/docs/eleven-agents/customization/tools/tool-configuration/tool-interruptions},
+  urldate = {2026-10-27}
+}
+@misc{elevenlabs_realtime,
+  author  = {{ElevenLabs}},
+  title   = {{Eleven Realtime}},
+  year    = {2026}, month = oct,
+  url     = {https://elevenlabs.io/realtime},
+  urldate = {2026-10-27}
+}
+
+% ===== Turn-taking benchmark =====
+@misc{sesame2026turnbench,
+  author  = {Eskimez, Sefik Emre and Kumar, Ankit and Beaufays, Fran{\c{c}}oise and Jiang, Freeman and Sanabria, Ramon and Deshmukh, Soham and Veluri, Bandhav and Krishna, Satyapriya},
+  title   = {{TurnBench}: an open benchmark for turn-taking in spoken dialogue},
+  year    = {2026}, month = aug,
+  howpublished = {Sesame blog},
+  url     = {https://www.sesame.com/blog/turnbench},
+  urldate = {2026-10-27}
+}
+
+% ===== Launch videos and press =====
+@misc{tml_video_2026,
+  author  = {{Thinking Machines Lab}},
+  title   = {Introducing interaction models},
+  year    = {2026}, month = may,
+  howpublished = {YouTube},
+  url     = {https://www.youtube.com/watch?v=A12AVongNN4},
+  urldate = {2026-10-27}
+}
+@misc{goedecke2026im,
+  author  = {Goedecke, Sean},
+  title   = {Interaction models},
+  year    = {2026},
+  url     = {https://www.seangoedecke.com/interaction-models/},
+  urldate = {2026-10-27}
+}
+@misc{rift2026scifi,
+  author  = {{Rift Dispatch}},
+  title   = {When sci-fi loses the fi},
+  year    = {2026},
+  url     = {https://riftdispatch.beehiiv.com/p/when-sci-fi-loses-the-fi},
+  urldate = {2026-10-27}
+}
+@misc{openai_springupdate_2024,
+  author  = {{OpenAI}},
+  title   = {Introducing {GPT-4o} ({OpenAI} Spring Update livestream)},
+  year    = {2024}, month = may,
+  howpublished = {YouTube},
+  url     = {https://www.youtube.com/watch?v=DQacCB9tDaw},
+  urldate = {2026-10-27}
+}
+@misc{openai_translation_2024,
+  author  = {{OpenAI}},
+  title   = {Live demo of {GPT-4o} realtime translation},
+  year    = {2024}, month = may,
+  howpublished = {YouTube},
+  url     = {https://www.youtube.com/watch?v=c2DFg53Zhvw},
+  urldate = {2026-10-27}
+}
+@misc{google_astra_video_2024,
+  author  = {{Google}},
+  title   = {Project Astra: Our vision for the future of {AI} assistants},
+  year    = {2024}, month = may,
+  howpublished = {YouTube},
+  url     = {https://www.youtube.com/watch?v=nXVvvRhiGjI},
+  urldate = {2026-10-27}
+}
+@misc{google_gemini_handson_2023,
+  author  = {{Google}},
+  title   = {Hands-on with {Gemini}: Interacting with multimodal {AI}},
+  year    = {2023}, month = dec,
+  howpublished = {YouTube},
+  url     = {https://www.youtube.com/watch?v=UIZAiXYceBI},
+  urldate = {2026-10-27}
+}
+@misc{techcrunch_gemini_faked_2023,
+  author  = {Coldewey, Devin},
+  title   = {{Google's} best {Gemini} demo was faked},
+  year    = {2023}, month = dec,
+  howpublished = {TechCrunch},
+  url     = {https://techcrunch.com/2023/12/07/googles-best-gemini-demo-was-faked/},
+  urldate = {2026-10-27}
+}
+@misc{engadget_gemini_staged_2023,
+  author  = {{Engadget}},
+  title   = {Google admits that a {Gemini AI} demo video was staged},
+  year    = {2023}, month = dec,
+  url     = {https://www.engadget.com/google-admits-that-a-gemini-ai-demo-video-was-staged-055718855.html},
+  urldate = {2026-10-27}
+}
+@misc{kyutai_moshi_keynote_2024,
+  author  = {{Kyutai}},
+  title   = {Unveiling of {Moshi}: the first voice-enabled {AI} openly accessible to all},
+  year    = {2024}, month = jul,
+  howpublished = {YouTube},
+  url     = {https://www.youtube.com/watch?v=hm2IJSKcYvo},
+  urldate = {2026-10-27}
+}
+@misc{kyutai_moshi_pr_2024,
+  author  = {{Kyutai}},
+  title   = {Moshi press release},
+  year    = {2024}, month = jul,
+  url     = {https://kyutai.org/cp_moshi.pdf},
+  urldate = {2026-10-27}
+}
+@misc{decoder_moshi_2024,
+  author  = {{The Decoder}},
+  title   = {French {AI} lab {Kyutai} unveils conversational {AI} assistant {Moshi}, plans open-source release},
+  year    = {2024}, month = jul,
+  url     = {https://the-decoder.com/french-ai-lab-kyutai-unveils-conversational-ai-assistant-moshi-plans-open-source-release},
+  urldate = {2026-10-27}
+}
+@misc{coai_sesame_2025,
+  author  = {{CO/AI}},
+  title   = {Sesame's {AI} voice presence creates emotional bonds with human-like imperfections},
+  year    = {2025},
+  url     = {https://getcoai.com/news/sesames-ai-voice-presence-creates-emotional-bonds-with-human-like-imperfections},
+  urldate = {2026-10-27}
+}
+@misc{openai_gptlive_video_2026,
+  author  = {{OpenAI}},
+  title   = {This is the new {ChatGPT} Voice, powered by {GPT-Live}},
+  year    = {2026}, month = jul,
+  howpublished = {YouTube},
+  url     = {https://www.youtube.com/watch?v=EAN5Cj347PY},
+  urldate = {2026-10-27}
+}
+@misc{openai_gptlive_video2_2026,
+  author  = {{OpenAI}},
+  title   = {Listening \& Speaking with {GPT-Live}},
+  year    = {2026}, month = jul,
+  howpublished = {YouTube},
+  url     = {https://www.youtube.com/watch?v=K-fYBO8t3-A},
+  urldate = {2026-10-27}
+}
+@misc{venturebeat_gptlive_2026,
+  author  = {{VentureBeat}},
+  title   = {{OpenAI} launches {GPT-Live}, a full-duplex voice upgrade that lets {ChatGPT} talk more like a person},
+  year    = {2026}, month = jul,
+  url     = {https://venturebeat.com/technology/openai-launches-gpt-live-a-full-duplex-voice-upgrade-that-lets-chatgpt-talk-more-like-a-person},
+  urldate = {2026-10-27}
+}
+
+% ===== Added for the paper (2026-10-27) =====
+@misc{waav_repo,
+  author       = {{Bud Ecosystem}},
+  title        = {{WaaV}: the real-time voice gateway for {AI} agents ({GitHub} repository, release 1.1.0)},
+  year         = {2026},
+  month        = oct,
+  url          = {https://github.com/BudEcosystem/WaaV},
+  urldate      = {2026-10-27},
+  note         = {Apache-2.0}
+}
+
+@misc{waav_imdoc,
+  author       = {{Bud Ecosystem}},
+  title        = {Interaction Mode (reference documentation, {WaaV} Gateway 1.1.0)},
+  year         = {2026},
+  month        = oct,
+  url          = {https://github.com/BudEcosystem/WaaV/blob/main/gateway/docs/interaction_mode.md},
+  urldate      = {2026-10-27}
+}
+
+@misc{waav_design,
+  author       = {{Bud Ecosystem}},
+  title        = {Full-duplex interaction agent: design chapters 1--10 and shared contracts},
+  year         = {2026},
+  url          = {https://github.com/BudEcosystem/WaaV/tree/main/docs/duplex-agent},
+  urldate      = {2026-10-27}
+}
+
+@article{sacks1974turntaking,
+  author  = {Sacks, Harvey and Schegloff, Emanuel A. and Jefferson, Gail},
+  title   = {A Simplest Systematics for the Organization of Turn-Taking for Conversation},
+  journal = {Language},
+  volume  = {50},
+  number  = {4},
+  pages   = {696--735},
+  year    = {1974}
+}
+
+@article{stivers2009universals,
+  author  = {Stivers, Tanya and Enfield, N. J. and others},
+  title   = {Universals and Cultural Variation in Turn-Taking in Conversation},
+  journal = {Proceedings of the National Academy of Sciences},
+  volume  = {106},
+  number  = {26},
+  pages   = {10587--10592},
+  year    = {2009}
+}
+
+@article{levinson2015timing,
+  author  = {Levinson, Stephen C. and Torreira, Francisco},
+  title   = {Timing in Turn-Taking and Its Implications for Processing Models of Language},
+  journal = {Frontiers in Psychology},
+  volume  = {6},
+  pages   = {731},
+  year    = {2015}
+}
+
+@article{skantze2021review,
+  author  = {Skantze, Gabriel},
+  title   = {Turn-Taking in Conversational Systems and Human-Robot Interaction: A Review},
+  journal = {Computer Speech \& Language},
+  volume  = {67},
+  pages   = {101178},
+  year    = {2021}
+}
+
+@article{ekstedt2022vap,
+  author  = {Ekstedt, Erik and Skantze, Gabriel},
+  title   = {Voice Activity Projection: Self-supervised Learning of Turn-taking Events},
+  journal = {arXiv preprint arXiv:2205.09812},
+  year    = {2022},
+  note    = {Submitted to Interspeech 2022},
+  url     = {https://arxiv.org/abs/2205.09812}
+}
+
+@article{christakopoulou2024talker,
+  author  = {Christakopoulou, Konstantina and Mourad, Shibl and Matari{\'c}, Maja},
+  title   = {Agents Thinking Fast and Slow: A Talker-Reasoner Architecture},
+  journal = {arXiv preprint arXiv:2410.08328},
+  year    = {2024},
+  url     = {https://arxiv.org/abs/2410.08328}
+}
+
+@book{kahneman2011thinking,
+  author    = {Kahneman, Daniel},
+  title     = {Thinking, Fast and Slow},
+  publisher = {Farrar, Straus and Giroux},
+  address   = {New York},
+  year      = {2011}
+}
+
+@article{schroeter2022deepfilternet,
+  author  = {Schr{\"o}ter, Hendrik and Escalante-B., Alberto N. and Rosenkranz, Tobias and Maier, Andreas},
+  title   = {{DeepFilterNet}: A Low Complexity Speech Enhancement Framework for Full-Band Audio based on Deep Filtering},
+  journal = {arXiv preprint arXiv:2110.05588},
+  year    = {2021},
+  note    = {Accepted to ICASSP 2022},
+  url     = {https://arxiv.org/abs/2110.05588}
+}
+
+@misc{webrtc_src,
+  author       = {{The WebRTC Project}},
+  title        = {{WebRTC} source repository (audio processing module, echo canceller {AEC3})},
+  year         = {2026},
+  url          = {https://webrtc.googlesource.com/src},
+  urldate      = {2026-10-27}
+}
+
+@misc{w3c_tracecontext,
+  author       = {{W3C}},
+  title        = {Trace Context ({W3C} Recommendation)},
+  year         = {2021},
+  url          = {https://www.w3.org/TR/trace-context/},
+  urldate      = {2026-10-27}
+}

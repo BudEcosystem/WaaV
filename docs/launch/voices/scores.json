@@ -1,0 +1,194 @@
+[
+ {
+  "file_path": "cand/agent_andromeda.wav",
+  "predicted_mos": 3.3764233589172363
+ },
+ {
+  "file_path": "cand/agent_apollo.wav",
+  "predicted_mos": 3.582947254180908
+ },
+ {
+  "file_path": "cand/agent_arcas.wav",
+  "predicted_mos": 3.455368995666504
+ },
+ {
+  "file_path": "cand/agent_aries.wav",
+  "predicted_mos": 3.315758466720581
+ },
+ {
+  "file_path": "cand/agent_athena.wav",
+  "predicted_mos": 4.085412502288818
+ },
+ {
+  "file_path": "cand/agent_cora.wav",
+  "predicted_mos": 3.267427444458008
+ },
+ {
+  "file_path": "cand/agent_cordelia.wav",
+  "predicted_mos": 3.323951005935669
+ },
+ {
+  "file_path": "cand/agent_delia.wav",
+  "predicted_mos": 3.7810192108154297
+ },
+ {
+  "file_path": "cand/agent_draco.wav",
+  "predicted_mos": 3.5545496940612793
+ },
+ {
+  "file_path": "cand/agent_harmonia.wav",
+  "predicted_mos": 3.197904586791992
+ },
+ {
+  "file_path": "cand/agent_helena.wav",
+  "predicted_mos": 3.6300535202026367
+ },
+ {
+  "file_path": "cand/agent_hera.wav",
+  "predicted_mos": 3.602384090423584
+ },
+ {
+  "file_path": "cand/agent_hermes.wav",
+  "predicted_mos": 3.643558979034424
+ },
+ {
+  "file_path": "cand/agent_juno.wav",
+  "predicted_mos": 3.845407009124756
+ },
+ {
+  "file_path": "cand/agent_luna.wav",
+  "predicted_mos": 3.2915563583374023
+ },
+ {
+  "file_path": "cand/agent_mars.wav",
+  "predicted_mos": 3.415947437286377
+ },
+ {
+  "file_path": "cand/agent_minerva.wav",
+  "predicted_mos": 2.838016986846924
+ },
+ {
+  "file_path": "cand/agent_odysseus.wav",
+  "predicted_mos": 3.496061325073242
+ },
+ {
+  "file_path": "cand/agent_orion.wav",
+  "predicted_mos": 3.7565529346466064
+ },
+ {
+  "file_path": "cand/agent_orpheus.wav",
+  "predicted_mos": 3.618605613708496
+ },
+ {
+  "file_path": "cand/agent_pandora.wav",
+  "predicted_mos": 3.306758403778076
+ },
+ {
+  "file_path": "cand/agent_pluto.wav",
+  "predicted_mos": 3.472869634628296
+ },
+ {
+  "file_path": "cand/agent_thalia.wav",
+  "predicted_mos": 3.7527413368225098
+ },
+ {
+  "file_path": "cand/agent_vesta.wav",
+  "predicted_mos": 2.761242389678955
+ },
+ {
+  "file_path": "cand/vo_andromeda.wav",
+  "predicted_mos": 3.5528054237365723
+ },
+ {
+  "file_path": "cand/vo_apollo.wav",
+  "predicted_mos": 3.5974678993225098
+ },
+ {
+  "file_path": "cand/vo_arcas.wav",
+  "predicted_mos": 3.541195869445801
+ },
+ {
+  "file_path": "cand/vo_aries.wav",
+  "predicted_mos": 3.508479595184326
+ },
+ {
+  "file_path": "cand/vo_athena.wav",
+  "predicted_mos": 3.9495229721069336
+ },
+ {
+  "file_path": "cand/vo_cora.wav",
+  "predicted_mos": 3.5870609283447266
+ },
+ {
+  "file_path": "cand/vo_cordelia.wav",
+  "predicted_mos": 3.909712553024292
+ },
+ {
+  "file_path": "cand/vo_delia.wav",
+  "predicted_mos": 3.829763889312744
+ },
+ {
+  "file_path": "cand/vo_draco.wav",
+  "predicted_mos": 3.5297465324401855
+ },
+ {
+  "file_path": "cand/vo_harmonia.wav",
+  "predicted_mos": 3.4313559532165527
+ },
+ {
+  "file_path": "cand/vo_helena.wav",
+  "predicted_mos": 3.7280349731445312
+ },
+ {
+  "file_path": "cand/vo_hera.wav",
+  "predicted_mos": 3.6636295318603516
+ },
+ {
+  "file_path": "cand/vo_hermes.wav",
+  "predicted_mos": 3.4723782539367676
+ },
+ {
+  "file_path": "cand/vo_juno.wav",
+  "predicted_mos": 3.7550368309020996
+ },
+ {
+  "file_path": "cand/vo_luna.wav",
+  "predicted_mos": 3.086148262023926
+ },
+ {
+  "file_path": "cand/vo_mars.wav",
+  "predicted_mos": 3.723381757736206
+ },
+ {
+  "file_path": "cand/vo_minerva.wav",
+  "predicted_mos": 3.387582778930664
+ },
+ {
+  "file_path": "cand/vo_odysseus.wav",
+  "predicted_mos": 3.444035053253174
+ },
+ {
+  "file_path": "cand/vo_orion.wav",
+  "predicted_mos": 3.7527551651000977
+ },
+ {
+  "file_path": "cand/vo_orpheus.wav",
+  "predicted_mos": 3.5524539947509766
+ },
+ {
+  "file_path": "cand/vo_pandora.wav",
+  "predicted_mos": 3.6528615951538086
+ },
+ {
+  "file_path": "cand/vo_pluto.wav",
+  "predicted_mos": 3.413649082183838
+ },
+ {
+  "file_path": "cand/vo_thalia.wav",
+  "predicted_mos": 3.8627166748046875
+ },
+ {
+  "file_path": "cand/vo_vesta.wav",
+  "predicted_mos": 3.169180393218994
+ }
+]

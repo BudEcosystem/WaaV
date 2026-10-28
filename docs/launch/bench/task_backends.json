@@ -1,0 +1,30 @@
+[
+ {
+  "name": "browser",
+  "type": "webhook",
+  "url": "http://127.0.0.1:19800/browser",
+  "secret_env": "DESK_SECRET",
+  "side_effects": "none",
+  "timeout_s": 900,
+  "description": "Operates a real web browser: opens pages, reads them, follows links, and reports what it found."
+ },
+ {
+  "name": "terminal",
+  "type": "webhook",
+  "url": "http://127.0.0.1:19800/terminal",
+  "secret_env": "DESK_SECRET",
+  "side_effects": "none",
+  "timeout_s": 900,
+  "description": "Runs shell commands on a sandboxed Linux machine with internet access: downloads, verifies checksums, unpacks, starts and health-checks programs."
+ },
+ {
+  "name": "writer",
+  "type": "webhook",
+  "url": "http://127.0.0.1:19800/writer",
+  "secret_env": "DESK_SECRET",
+  "side_effects": "possible",
+  "confirm": false,
+  "timeout_s": 900,
+  "description": "Drafts documents such as announcements, emails and notes, and saves them in the word processor on the caller's screen after the caller approves."
+ }
+]

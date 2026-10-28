@@ -1,0 +1,175 @@
+\section{Evaluation}\label{sec:eval}
+
+We evaluate Bud WaaV~1.1.0 in three ways: on the public Full-Duplex-Bench~v3, which scores tool use under
+real, disfluent speech~\citep{lin2026fdbv3}; on Full-Duplex-Bench~v1, which scores turn-taking behaviour
+(Section~\ref{sec:eval-v1}); and with the gateway's own live end-to-end suite, which exercises the mechanisms
+of Section~\ref{sec:system} one by one. Every number in this section was measured on the released binary
+(commit \texttt{c7fadbf}); none is taken from design targets.
+
+\paragraph{Setup.} All runs used one NVIDIA GB10 (128\,GB unified memory) shared with unrelated workloads:
+host load averages were 70--86 during the FDB-v3 run and 20--30 during the FDB-v1 run, and other processes held the GPU at over 90\%
+utilisation for long stretches. The front model was Qwen3.5-2B (Q4\_K\_M) on llama.cpp with eight slots;
+speech recognition and synthesis were Deepgram nova-3 (streaming) and Aura-2 over the public internet from
+the same host; the background was either Claude Opus~5.5 through the Anthropic API or a local
+Qwen2.5-3B. These are realistic but unfavourable conditions for latency: on an idle host the front model's
+first byte arrived in 135--182\,ms, and with three sessions at once on the shared host in 410--941\,ms
+(Section~\ref{sec:eval-limits}).
+
+\subsection{Tool use under disfluent speech: Full-Duplex-Bench v3}\label{sec:eval-v3}
+
+FDB-v3 plays 100 human-recorded requests (79 scenarios, 12 speakers, 4 domains, 1--3 expected tool calls)
+to a voice agent with 12 mock tools and scores the calls it makes and what it says~\citep{lin2026fdbv3}. We
+ran Bud WaaV in interaction mode with Claude Opus~5.5 as the background, the benchmark's tools declared as
+session tools (served by the benchmark's own \texttt{MockAPIRegistry}), and the benchmark's own ASR and
+scoring scripts. Our adapter streams each recording in real time over the \texttt{/ws} socket instead of a
+LiveKit room. Two deviations matter: confirmations were off (a recorded single turn cannot answer a
+read-back), and the LLM judge for argument matching and response quality was a local gpt-oss-20b instead of
+GPT-4o; we therefore also report the judge-free strict score.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Full-Duplex-Bench v3 (100 examples). Published systems from \citet{lin2026fdbv3} (Tables 2 and 6).
+``First word'', ``Tool call'' and ``Task compl.'' are mean latencies in seconds from the end of the user's
+speech; the paper's ``Latency'' column is task completion. Bud WaaV: judged with a local gpt-oss-20b (strict
+exact-match Pass@1 in parentheses).}
+\label{tab:fdbv3}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccc}
+\toprule
+System & Tool F1 & Arg.\ acc. & Resp.\ qual. & Pass@1 & First word & Tool call & Task compl. \\
+\midrule
+GPT-Realtime (1.5) & 0.876 & 0.680 & 0.792 & \textbf{0.600} & 6.36 & 3.89 & 6.89 \\
+Gemini Live 3.1 & 0.817 & 0.588 & 0.718 & 0.540 & 3.95 & 2.21 & \textbf{4.25} \\
+Gemini Live 2.5 & 0.786 & 0.593 & 0.554 & 0.490 & 7.03 & 4.61 & 7.26 \\
+Cascade (Whisper + GPT-4o + TTS) & 0.803 & 0.562 & 0.600 & 0.450 & 8.78 & 3.15 & 10.12 \\
+Grok & 0.797 & 0.542 & 0.617 & 0.430 & 5.97 & \textbf{0.63} & 6.65 \\
+Ultravox v0.7 & 0.794 & 0.513 & 0.510 & 0.410 & 3.88 & 6.01 & 8.40 \\
+\midrule
+Bud WaaV 1.1.0 + Claude Opus 5.5 & 0.763 & 0.590 & 0.730 & 0.39 (0.31) & \textbf{2.48} & 2.50 & 14.19 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Table~\ref{tab:fdbv3} gives the result. Bud WaaV starts speaking soonest of all systems (2.48\,s mean, median
+1.84\,s, against 3.88--8.78\,s), because the front model acknowledges every request at once while the
+background works; its response quality (0.73) is second only to GPT-Realtime (0.79). Its strict task success
+is the lowest in the table (Pass@1 0.39 judged, 0.31 strict), as is its tool-selection F1 (0.763), and its mean
+task completion is the slowest (14.2\,s; median 7.4\,s).
+
+\paragraph{Why tasks failed.} Most of the losses come from the turn handling around the background model,
+and some from the model itself. Of the 61 judged failures (an example can have several causes), 18 started a task on half a
+request because a disfluent pause ended the caller's turn, after which the background asked a clarifying
+question nobody answered (17 timed out; 11 of them were form questions addressed to a screen the benchmark's
+client does not have); 13 split one request into two or three tasks that repeated earlier calls; 7 re-ran a
+revised task's calls; 18 had a wrong argument (partly the benchmark's own typing, partly real errors such as
+\texttt{800} for \texttt{1,800}); 7 called an unexpected tool and 3 missed a call. By domain the judged
+Pass@1 was travel 14/20, finance 15/25, e-commerce 8/29 and housing 2/26. The turn-handling causes (the
+early turn end, the split requests and the re-run revisions) are in the gateway, not in the models, and are
+listed for repair in the project's issue tracker; the wrong arguments and unexpected tools are partly the
+model's.
+
+\paragraph{Comparison with Thinking Machines Lab.} TML reports 82.8 response quality and 68.0 Pass@1 on FDB-v3
+for TML-interaction-small with its background agent enabled~\citep{tml2026interaction}. Those numbers are
+self-reported on TML's own setup and are not directly comparable to Table~\ref{tab:fdbv3}; on Pass@1 they are
+well ahead of every system we measured or that the benchmark's authors published, including ours.
+
+\subsection{Turn-taking: Full-Duplex-Bench v1}\label{sec:eval-v1}
+
+FDB-v1 streams recorded speech to a system and scores what it does in four situations~\citep{lin2025fdbv1}:
+pauses inside a user's turn, where it should keep quiet (takeover rate, TOR, lower is better; synthetic and
+Candor recordings); a listener's backchannels in a long user turn (TOR lower, frequency higher, and the
+divergence of their timing from human listeners, JSD, lower); the end of a turn in real conversation, where it
+should take the floor (TOR higher) quickly (latency); and a user who interrupts the agent with a new request
+(TOR higher, relevance of the reply on a 0--5 scale, latency). We ran all 727 samples through the same
+\texttt{/ws} adapter as for FDB-v3, with Qwen2.5-3B as the background and Deepgram for speech, and scored them
+with the benchmark's own scripts and its parakeet recogniser. The relevance judge was a local gpt-oss-20b, not
+the repository's GPT-4-class model, so that column is indicative only.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Full-Duplex-Bench v1. Other systems from the benchmark's leaderboard~\citep{fdb_repo}; arrows give
+the better direction. Bud WaaV measured on the 1.1.0 release on a shared host (Section~\ref{sec:eval-limits});
+its relevance column uses a local gpt-oss-20b judge.}
+\label{tab:fdbv1}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcc ccc cc ccc}
+\toprule
+& \multicolumn{2}{c}{Pause handling} & \multicolumn{3}{c}{Backchannel} & \multicolumn{2}{c}{Smooth turn-taking}
+& \multicolumn{3}{c}{User interruption} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-6}\cmidrule(lr){7-8}\cmidrule(lr){9-11}
+System & Synth.\ TOR$\downarrow$ & Candor TOR$\downarrow$ & TOR$\downarrow$ & Freq$\uparrow$ & JSD$\downarrow$
+& TOR$\uparrow$ & Latency (s)$\downarrow$ & TOR$\uparrow$ & Relevance$\uparrow$ & Latency (s)$\downarrow$ \\
+\midrule
+PersonaPlex & 0.584 & 0.662 & 0.327 & 0.025 & 0.649 & 0.992 & \textbf{0.070} & \textbf{1.000} & \textbf{4.210} & 0.400 \\
+dGSLM & 0.934 & 0.935 & 0.691 & 0.015 & 0.934 & 0.975 & 0.352 & 0.917 & 0.201 & 2.531 \\
+Moshi & 0.985 & 0.980 & 1.000 & 0.001 & 0.957 & 0.941 & 0.265 & \textbf{1.000} & 0.765 & \textbf{0.257} \\
+Freeze-Omni & 0.642 & 0.481 & 0.636 & 0.001 & 0.997 & 0.336 & 0.953 & 0.867 & 3.615 & 1.409 \\
+Gemini Live 2.0 & 0.255 & 0.310 & 0.091 & 0.012 & 0.896 & 0.655 & 1.301 & 0.891 & 3.376 & 1.183 \\
+GPT-Realtime & 0.010 & 0.120 & \textbf{0.000} & 0.007 & 0.980 & \textbf{1.000} & 1.470 & 0.970 & 3.850 & 1.500 \\
+Gemini 3.1 Flash Live (minimal) & 0.022 & 0.153 & 0.727 & 0.044 & \textbf{0.807} & \textbf{1.000} & 0.567 & \textbf{1.000} & 3.575 & 0.337 \\
+Gemini 3.1 Flash Live (high) & \textbf{0.007} & 0.102 & 0.491 & 0.030 & 0.853 & 0.992 & 0.940 & 0.995 & 4.121 & 0.651 \\
+\midrule
+Bud WaaV 1.1.0 & 0.029 & \textbf{0.097} & 0.055 & \textbf{0.054} & 0.820 & 0.782 & 1.275 & 0.916 & 2.72$^{*}$ & 2.213 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Table~\ref{tab:fdbv1} gives the result. WaaV's hold rules do what they were built for: it took the floor in
+2.9\% of synthetic pauses, close to GPT-Realtime and Gemini~3.1, and 9.7\% of the pauses in real
+conversation (Candor), the lowest of all systems on the leaderboard (Gemini~3.1 10.2\%, GPT-Realtime 12.0\%);
+the end-to-end models speak into most pauses (Moshi 98.5\%, PersonaPlex 58.4\% synthetic). In a long user turn it makes listening sounds more often than any system on the leaderboard (0.054 per second,
+against 0.044 for Gemini~3.1) while taking the floor in only 5.5\% of them, and
+the timing of those sounds is the second closest to human listeners' (JSD 0.820, Gemini~3.1 minimal 0.807).
+The cost appears at the end of a turn and after an interruption.
+
+\paragraph{Turn-taking.} WaaV took the floor at 78.2\% of Candor turn ends, after a mean of 1.28\,s (median
+0.68\,s), faster than GPT-Realtime (1.47\,s) and Gemini Live~2.0 (1.30\,s) but slower than Gemini~3.1 and
+the end-to-end models. Of the 26 turn ends where it never spoke, 13 settled as \texttt{wait}: the front read
+the end of a speaker's story, often a complete sentence or a question tag (``Right?''), as a pause, which is
+the same rule that keeps it quiet in pauses; in 7 the front settled a short \texttt{social} reply that was
+never spoken, five of them after the front's first call ran to its 1.5\,s budget on the loaded GPU; 4 asked
+the caller to repeat, 1 started a task with a holding line and 1 came too close to the end of the recording.
+
+\paragraph{User interruption.} WaaV yielded and answered 91.6\% of interruptions, after a mean of 2.21\,s;
+only dGSLM is slower. Of the 181 judged replies, 59 were rated 5 and 58 were rated 0: 32 of the zeros were
+``Sorry, I didn't catch that'' after the front missed its budget, 14 went on answering the earlier question
+instead of the new one, 10 were a canned self-introduction from the front and 2 were holding lines. The
+relevance mean (2.72) is therefore an average of mostly right and plainly wrong replies, not of vague ones;
+both failure kinds are in the gateway's handling and are listed for repair.
+
+\subsection{Mechanisms, live: the gateway's end-to-end suite}\label{sec:eval-live}
+
+The release was gated on the project's live suite, which drives real sessions through a running gateway with
+the production models (Qwen3.5-2B front, gpt-oss-20b orchestrator, Qwen2.5-3B background) and a local or
+Deepgram recogniser. The final run on the release binary (27 October 2026) passed every request-mode scenario
+it exercised (10 of 10) and 6 of 7 streaming scenarios. Selected measurements:
+
+\begin{itemize}
+\item \textbf{Response latency (L1).} From the end of turn the agent's first audio came after a median of
+561\,ms (runs 11--808\,ms; the shortest when the eager end of turn had already started the reply); from the
+caller's last voiced sample, a median of 948\,ms (575--1177\,ms).
+\item \textbf{Barge-in (S1).} A caller who says ``stop talking'' over the agent cut its audio 431--900\,ms after
+their first voiced frame (five cues); the agent was at least 10\,dB down within 107\,ms. The release's
+900\,ms backstop is a known limit: one cue was cut at the backstop rather than by the classifier.
+\item \textbf{Backchannels and pauses (BC1, S3).} In a 9.8\,s turn with three pauses the agent made listening
+sounds in the pauses and none after the turn ended; an eager end of turn was adopted when the caller stayed
+silent and withdrawn when they went on, with one final transcript and one task.
+\item \textbf{Confirmation and questions (C1, H1, RG3).} A side-effecting booking was read back from its exact
+arguments and booked once after the answer; a spoken choice (``the tulips'') said over the question was not
+taken as its answer, and the one said after it was.
+\item \textbf{Agents (PR7P, X2, B1).} An A2A agent over gRPC streamed its progress (spoken at 1.96\,s) and
+result (3.47\,s); an OpenAI-Realtime-protocol client's function call ran through the gateway; a Bud voice agent
+answered with its own greeting and relayed answers sentence by sentence.
+\end{itemize}
+
+\subsection{Limitations of this evaluation}\label{sec:eval-limits}
+
+The host was shared. One session alone got the front model's first byte in 135--182\,ms; three concurrent
+sessions on the same eight-slot server got it in 410--941\,ms (headers in 191--253\,ms). In the FDB-v3 first pass, 52 of 245 front-model decisions missed their 1.5\,s budget, and
+the agent asked callers to repeat clear speech; we re-ran those 34 sessions (final set: 0 timeouts in 249 turns)
+and report the as-run result as well (Pass@1 0.32). Deepgram's streaming synthesis ran slower than real time
+from this host (0.2--0.8$\times$), which adds gaps to some agent speech. Our adapter differs from the official
+LiveKit client and listens past the end of the input; the variant cut to the input's length scores Pass@1 0.38.
+The judge is not GPT-4o. We have not yet run FDB-v1.5 or v2.

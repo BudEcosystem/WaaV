@@ -1,0 +1,48 @@
+{
+ "title": "Lets you think.",
+ "subtitle": "Full-Duplex-Bench v1 \u00b7 216 pauses in real conversations \u00b7 how often the agent cuts in (lower is better)",
+ "foot": "Bud WaaV 1.1.0 (Qwen3.5-2B front, Deepgram speech), measured 28 Oct 2026 with our adapter; others from the Full-Duplex-Bench leaderboard. The same care costs it elsewhere: it takes the turn at 78% of turn ends and answers interruptions after 2.2 s. See the paper.",
+ "rows": [
+  {
+   "name": "Bud WaaV \u00b7 interaction mode",
+   "frac": 0.099,
+   "label": "9.7%",
+   "us": true
+  },
+  {
+   "name": "Gemini 3.1 Flash Live (high)",
+   "frac": 0.104,
+   "label": "10.2%"
+  },
+  {
+   "name": "GPT-Realtime",
+   "frac": 0.122,
+   "label": "12.0%"
+  },
+  {
+   "name": "Gemini 3.1 Flash Live (minimal)",
+   "frac": 0.156,
+   "label": "15.3%"
+  },
+  {
+   "name": "Gemini Live 2.0",
+   "frac": 0.316,
+   "label": "31.0%"
+  },
+  {
+   "name": "Freeze-Omni",
+   "frac": 0.491,
+   "label": "48.1%"
+  },
+  {
+   "name": "PersonaPlex",
+   "frac": 0.676,
+   "label": "66.2%"
+  },
+  {
+   "name": "Moshi",
+   "frac": 1.0,
+   "label": "98.0%"
+  }
+ ]
+}
