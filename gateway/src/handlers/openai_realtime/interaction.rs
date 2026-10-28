@@ -129,18 +129,20 @@ fn gateway_response(pcm: &[u8], n: u64, kind: &str) -> Vec<String> {
 }
 
 /// The session's interaction mode, when the operator's block applies and the resolver says
-/// so. Findings are logged: the client did not ask.
+/// so. Findings are logged: the client did not ask. `bud_mode` is the caller's: the relay is a
+/// Bud surface, so a standalone alias's session gets the resolver's `bud_mode_required`.
 pub(super) fn prepare(
     vendor: &str,
     model: Option<&str>,
     stream_id: &str,
     owner: &str,
+    bud_mode: bool,
     state: &std::sync::Arc<crate::state::AppState>,
 ) -> Option<(RelayIx, Channels)> {
     let server = config::server();
     let block = server.realtime_default.clone().filter(|_| server.enabled)?;
     let ctx = ParseCtx {
-        bud_mode: true,
+        bud_mode,
         operator: true,
     };
     let (planned, findings) = plan(&block, ctx, &server, "v1_realtime_relay", vendor, model);
@@ -785,5 +787,47 @@ mod tests {
                 "{frame}"
             );
         }
+    }
+
+    /// The relay is a Bud surface: the operator's `realtime_default` reaches a Bud caller's
+    /// session, never a standalone alias's (no Bud principal owns its tasks).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_realtime_default_reaches_bud_callers_only() {
+        use crate::core::interaction::config::{
+            FrontModelServer, ServerInteraction, set_server_for_tests,
+        };
+        set_server_for_tests(ServerInteraction {
+            enabled: true,
+            realtime_default: Some(
+                json!({"tasks": {"llm": {"base_url": "https://llm.example.com/v1", "model": "m"}}}),
+            ),
+            truth_ack: vec!["openai".to_owned()],
+            front_model: Some(FrontModelServer {
+                url: "http://127.0.0.1:9".to_owned(),
+                ..Default::default()
+            }),
+            ..ServerInteraction::default()
+        });
+        let state = crate::state::AppState::new(crate::test_support::minimal_config()).await;
+        let standalone = prepare("openai", None, "s1", "", false, &state);
+        let bud = prepare("openai", None, "s2", "owner", true, &state);
+        let server = config::server();
+        let block = server.realtime_default.clone().unwrap_or_default();
+        let findings = |bud_mode| {
+            let ctx = ParseCtx {
+                bud_mode,
+                operator: true,
+            };
+            plan(&block, ctx, &server, "v1_realtime_relay", "openai", None).1
+        };
+        let (refused, planned) = (findings(false), findings(true));
+        set_server_for_tests(ServerInteraction::default());
+        assert!(standalone.is_none());
+        assert!(
+            refused.iter().any(|f| f.0 == "bud_mode_required"),
+            "{refused:?}"
+        );
+        assert!(bud.is_some(), "{planned:?}");
     }
 }

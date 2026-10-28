@@ -144,6 +144,13 @@ pub enum CallerCheck {
     },
 }
 
+impl CallerCheck {
+    /// Whether the caller came through the Bud control plane (every check but `Standalone`).
+    pub fn is_bud(&self) -> bool {
+        !matches!(self, Self::Standalone { .. })
+    }
+}
+
 /// An authenticated caller.
 #[derive(Debug, Clone)]
 pub struct Caller {
@@ -1153,6 +1160,7 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
         p.endpoint.model.as_deref(),
         &session_id,
         &owner,
+        p.caller.check.is_bud(),
         &state,
     ) {
         Some((ix, channels)) => {

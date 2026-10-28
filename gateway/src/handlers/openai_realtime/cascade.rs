@@ -60,7 +60,8 @@ pub struct PreparedCascade {
     pub source: CascadeSource,
 }
 
-/// Who answers the session's turns.
+/// Who answers the session's turns. Made once per session, so the variants' sizes don't matter.
+#[allow(clippy::large_enum_variant)]
 pub enum CascadeSource {
     /// A Bud voice agent (`?model=prompt:<agent>`), acting as its caller.
     Agent {

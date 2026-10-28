@@ -183,7 +183,10 @@ aliases:
   policy (the client may change the voice and instructions; MCP tools and stored prompts are
   refused), idle and maximum-length limits, pings, the defaults `session.update` and the session's
   metering span. The Bud deployment rate limits, concurrency caps and circuit breakers don't
-  apply; the gateway's connection limits do. Client secrets (`ek_bud_`) need the Bud control plane.
+  apply; the gateway's connection limits do. Client secrets (`ek_bud_`) need the Bud control plane,
+  and so does [interaction mode](interaction_mode.md) on the relay: `interaction.realtime_default`
+  does not apply to these sessions (the log says `bud_mode_required`), nor does the alias's own
+  `interaction` block.
 - **Revalidation** re-checks, on every `response.create` and periodically, that the alias still
   relays. API secrets are fixed for the life of the process, so the key isn't re-checked.
 - **With legs as well**, the `realtime` block wins on `/v1/realtime`. The `stt` and `tts` legs keep
