@@ -1399,15 +1399,7 @@ impl Persona {
     pub fn resolve(&self, say: &Say, n: u64) -> Option<String> {
         match say {
             Say::Bank { group, intent } => {
-                let lines: Vec<&BankLine> = self
-                    .bank(group)
-                    .iter()
-                    .filter(|line| match *intent {
-                        Some(POLAR_QUESTION) => !line.polar && !line.policy_only,
-                        Some(intent) => line.intent.as_deref() == Some(intent),
-                        None => !line.policy_only,
-                    })
-                    .collect();
+                let lines = self.bank_lines(group, *intent);
                 let pick = (n % lines.len().max(1) as u64) as usize;
                 lines.get(pick).map(|line| line.text.clone())
             }
@@ -1415,6 +1407,27 @@ impl Persona {
             Say::Front(text) | Say::Verbatim(text) => Some(text.clone()),
             Say::Repeat => None,
         }
+    }
+
+    /// How many lines [`Persona::resolve`] chooses among for `say`: its bank's lines for the
+    /// intent; 1 for any other line.
+    pub fn bank_choices(&self, say: &Say) -> usize {
+        match say {
+            Say::Bank { group, intent } => self.bank_lines(group, *intent).len(),
+            _ => 1,
+        }
+    }
+
+    /// The lines of bank `group` that may be said for `intent`.
+    fn bank_lines(&self, group: &str, intent: Option<&str>) -> Vec<&BankLine> {
+        self.bank(group)
+            .iter()
+            .filter(|line| match intent {
+                Some(POLAR_QUESTION) => !line.polar && !line.policy_only,
+                Some(intent) => line.intent.as_deref() == Some(intent),
+                None => !line.policy_only,
+            })
+            .collect()
     }
 
     fn render(&self, id: &str, slots: &[(&'static str, String)]) -> Option<String> {

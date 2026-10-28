@@ -81,14 +81,23 @@ impl WsTtsProtocol for DeepgramAuraProtocol {
             }
             Some("Cleared") => WsTtsEvent::Cleared,
             Some("Metadata") => WsTtsEvent::Metadata,
-            Some("Warning") => WsTtsEvent::Warning(
-                value
+            // A flush over Deepgram's rate limit is refused with a warning, not an error: the
+            // text before it stays unsynthesised and no `Flushed` comes (launch demo take
+            // 22, 28 Oct: `{"type":"Warning","warn_code":"EXCESSIVE_FLUSH","warn_msg":"Rate
+            // limit exceeded for flushes. Please try again later."}`).
+            Some("Warning") => {
+                let message = value
                     .get("description")
                     .or_else(|| value.get("message"))
+                    .or_else(|| value.get("warn_msg"))
                     .and_then(|m| m.as_str())
                     .unwrap_or(raw)
-                    .to_string(),
-            ),
+                    .to_string();
+                match value.get("warn_code").and_then(|c| c.as_str()) {
+                    Some("EXCESSIVE_FLUSH") => WsTtsEvent::FlushRefused(message),
+                    _ => WsTtsEvent::Warning(message),
+                }
+            }
             Some("Error") => WsTtsEvent::Error(
                 value
                     .get("description")
@@ -449,6 +458,16 @@ mod tests {
         assert!(matches!(
             p.classify_text_frame(r#"{"type":"Warning","description":"slow"}"#),
             WsTtsEvent::Warning(m) if m == "slow"
+        ));
+        // Live take 22: a flush over the rate limit.
+        let refused = r#"{"type":"Warning","warn_code":"EXCESSIVE_FLUSH","warn_msg":"Rate limit exceeded for flushes. Please try again later."}"#;
+        assert!(matches!(
+            p.classify_text_frame(refused),
+            WsTtsEvent::FlushRefused(m) if m.starts_with("Rate limit exceeded for flushes")
+        ));
+        assert!(matches!(
+            p.classify_text_frame(r#"{"type":"Warning","warn_code":"OTHER","warn_msg":"hm"}"#),
+            WsTtsEvent::Warning(m) if m == "hm"
         ));
         assert!(matches!(
             p.classify_text_frame(r#"{"type":"Error","description":"bad"}"#),

@@ -317,7 +317,15 @@ search just started, was `delegate` 10 of 10 (a second task) against `wait` 10 o
 those words "Wait a second." decided over the agent is a `hold` 2 of 10 (10 of 10 with them; its interim stays a `hold`
 10 of 10), the control gate set 51 of 53 and the reading gate set 46 of 47, as before. Every
 example `say` can be produced by the default phrase banks and the compose grammar, so the examples never teach a line
-the grammar would refuse.
+the grammar would refuse. After a finished task the 2B front names
+almost every turn `follow_up` (live rehearsal 1 of the launch demo, 28 October: "Oh, and while you're at it, grab the
+download numbers in the terminal.", "Let's draft the launch announcement and mention those numbers." and "Thanks, Eva."
+after the browser's release check, each 10 of 10 offline). Examples of other work and of thanks after a finished task
+were tried here (r18): they moved the requests part of the way (50 to 88 of the finished-task gate's 130 decisions) and
+the thanks not at all, and cost the control gate set one or two cases (57 to 56 of 59, "Do I have a note about the
+dentist?" then `social`), so this prompt is unchanged. The follow-up is read apart instead, against what the task's
+agent does, with a label for thanks (`FOLLOW_SYSTEM` in `front_model.rs`): 130 of 130 settled right, the control gate
+57 of 59 and the reading gate 46 of 47 as before.
 
 ## 2. Call header (the first user message, once per call)
 

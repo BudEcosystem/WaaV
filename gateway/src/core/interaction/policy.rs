@@ -140,6 +140,8 @@ const NONE: &str = "none";
 /// A choice answered "any of them": the caller's words go to the agent, which picks.
 const ANY: &str = "any";
 pub(super) const NEW: [(&str, &str); 1] = [("new", "asks for something else")];
+/// A follow-up the front named that asks for nothing: the turn is the persona's thanks line.
+const THANKS: (&str, &str) = ("thanks", "only thanks or says goodbye");
 
 /// The labels the front reads a caller's answer to an open question against (chapter 9: no
 /// phrase list decides what the caller meant): one per option of a choice, then the kind's own.
@@ -210,8 +212,9 @@ enum Asked {
     Which(Repeat),
     /// A request the front delegated that may ask for one of these tasks again.
     Same(ActDecision, Vec<(TaskRef, String)>),
-    /// A follow-up the front named of this finished task (its title): whether it is about it.
-    Follows(ActDecision, TaskRef, String),
+    /// A follow-up the front named of this finished task (its title, and what the agent that
+    /// did it does): whether it is about it.
+    Follows(ActDecision, TaskRef, String, Option<String>),
     /// A request the front delegated while this task (its title) had just started: whether it
     /// is about it (owner, 26 Oct).
     Started(ActDecision, TaskRef, String),
@@ -350,6 +353,8 @@ struct Update {
     offered: bool,
     /// The narrator gave no line for it this many times.
     tries: u8,
+    /// The rule that refused the narrator's last line for it.
+    refused: Option<&'static str>,
 }
 
 impl Update {
@@ -461,6 +466,8 @@ pub struct Policy {
     step_down: bool,
     /// The agents that are one MCP tool each: a task on one is a single call.
     single_calls: Vec<String>,
+    /// What each agent of the session does (its name, its own description).
+    agent_topics: Vec<(String, String)>,
     /// Stepped down: every turn goes to the background, and only its answer is spoken.
     plain: bool,
     /// The task whose caller was last told that a value is never taken by voice.
@@ -506,6 +513,9 @@ pub struct Policy {
     /// before each step).
     left_ms: Ms,
     queued: Vec<ItemId>,
+    /// The agent's recent lines and when each ended (the floor's heard timeline, before each
+    /// step): what a task's update may not say again.
+    said: Vec<(Ms, String)>,
     /// The results of finished tasks, for follow-ups.
     results: VecDeque<(TaskId, String)>,
     /// The session has an orchestrator with agents, whose questions may break in.
@@ -541,6 +551,7 @@ impl Policy {
             foreign_turns: 0,
             step_down: false,
             single_calls: Vec::new(),
+            agent_topics: Vec::new(),
             plain: false,
             declined: None,
             closed: VecDeque::new(),
@@ -567,6 +578,7 @@ impl Policy {
             deferred: None,
             left_ms: 0,
             queued: Vec::new(),
+            said: Vec::new(),
             results: VecDeque::new(),
             orchestrated: cfg.tasks.orchestrator.is_some() && !cfg.tasks.agents.is_empty(),
             last_update: None,
@@ -579,10 +591,20 @@ impl Policy {
         }
     }
 
-    /// What the floor holds still to be heard: how long it lasts and its items, as of now.
-    pub fn set_speech(&mut self, left_ms: Ms, queued: Vec<ItemId>) {
+    /// What the floor holds still to be heard: how long it lasts and its items, and the
+    /// agent's recent lines, as of now.
+    pub fn set_speech(&mut self, left_ms: Ms, queued: Vec<ItemId>, said: Vec<(Ms, String)>) {
         self.left_ms = left_ms;
         self.queued = queued;
+        self.said = said;
+    }
+
+    /// The agent said a line apart from the floor (a failure line the pump played, chapter
+    /// 10), from `at` on: the holding line counts its silence from there. Live (take 15) a
+    /// holding line due from the wait's silence played right after "Thanks for waiting, I'm
+    /// back.": "Still working on it, thanks for waiting." (20.2 s, 22.3 s).
+    pub fn spoke_apart(&mut self, at: Ms) {
+        self.last_speech = self.last_speech.max(at);
     }
 
     /// The registry's board as the floor and the turn rules see it: a question waiting for a
@@ -612,6 +634,12 @@ impl Policy {
     /// The session's agents that are one MCP tool each (`set_single_calls`).
     pub fn set_single_calls(&mut self, single_calls: Vec<String>) {
         self.single_calls = single_calls;
+    }
+
+    /// What the session's agents do (name, own description): a follow-up is read apart
+    /// against what the agent that did the task does.
+    pub fn set_agent_topics(&mut self, topics: Vec<(String, String)>) {
+        self.agent_topics = topics;
     }
 
     /// The session goes on as the plain path: every turn the background's.
@@ -840,6 +868,7 @@ impl Policy {
                 .and_then(|asking| asking.key_at)
                 .map(|at| at + Ms::from(self.cfg.hitl_key_gap_ms)),
             self.repeat.as_ref().and_then(|repeat| repeat.deadline),
+            self.offer,
             self.wait_line_due().map(|(due, _)| due),
             self.wait
                 .as_ref()
@@ -902,10 +931,31 @@ impl Policy {
 
     // ---- settling a turn
 
-    fn end_of_turn(&mut self, now: Ms, eot: EndOfTurn, board: &Board, out: &mut Vec<PolicyAction>) {
+    fn end_of_turn(
+        &mut self,
+        now: Ms,
+        mut eot: EndOfTurn,
+        board: &Board,
+        out: &mut Vec<PolicyAction>,
+    ) {
         self.user_speaking = false;
         self.last_speech = now;
         self.caller_at = now;
+        // The caller went on before their last turn was decided, within `GOING_ON_MS` of its
+        // end: the pause was not the end of the turn, and this turn carries its words. Live
+        // (launch demo take 22, 28 Oct): "Great. Can you also get" ended at a pause (Smart
+        // Turn was sure), "the download numbers in the terminal?" came 0.3 s later as a turn
+        // of its own, and its words alone were read as a follow-up of the finished browser
+        // task: the browser agent was asked for "the download numbers in the terminal" and
+        // asked back which project was meant.
+        let onset = eot.onset_at.unwrap_or(eot.at);
+        if let Some(last) = self.turn.as_ref().filter(|last| !last.settled)
+            && last.id != eot.turn
+            && onset <= last.e + GOING_ON_MS
+            && !last.text.trim().is_empty()
+        {
+            eot.text = format!("{} {}", last.text.trim(), eot.text.trim());
+        }
         self.turn = Some(Turn {
             id: eot.turn,
             e: eot.at,
@@ -1124,10 +1174,11 @@ impl Policy {
                 options.extend(labels(&NEW));
                 (ReadingKind::Same, lines.join("\n"), options)
             }
-            Asked::Follows(_, _, title) => {
+            Asked::Follows(_, _, title, topic) => {
                 let mut options = vec![("1".to_owned(), title.clone())];
                 options.extend(labels(&NEW));
-                let context = format!("Task done: {}", front_model::reading_context("1", title));
+                options.extend(labels(&[THANKS]));
+                let context = front_model::follows_context(title, topic.as_deref());
                 (ReadingKind::Follows, context, options)
             }
             Asked::Started(_, _, title) => {
@@ -1179,11 +1230,20 @@ impl Policy {
             if let Some(turn) = &mut self.turn {
                 turn.asked_twice = true;
             }
-            // A follow-up the front named: about something else, it is a new request; with no
-            // reading in time the front's word stands.
+            // A follow-up the front named: about something else, it is a new request, and words
+            // that ask for nothing are thanks (the persona's line, not an answer from the
+            // result: live rehearsal 1, "Thanks, Eva." was answered with the release check);
+            // with no reading in time the front's word stands.
             if let Asked::Follows(decision, ..) = asked {
                 let decision = match label {
                     OTHER | "1" => decision,
+                    label if label == THANKS.0 => ActDecision {
+                        act: Act::Social,
+                        task: None,
+                        say: None,
+                        intent: Some("thanks"),
+                        ..decision
+                    },
                     _ => ActDecision {
                         act: Act::Delegate,
                         task: None,
@@ -1697,23 +1757,43 @@ impl Policy {
             let agent = view.and_then(|view| view.lineage.agent.as_ref());
             agent.is_some_and(|agent| self.single_calls.contains(agent))
         };
+        // Words that name another agent of the session are a request for that agent's work,
+        // not more of the finished task's: the orchestrator places them (live take 23).
+        let elsewhere = |task: &TaskRef| {
+            let view = done.iter().find(|view| view.task_ref == *task);
+            let named = view.and_then(|view| {
+                let agent = view.lineage.agent.as_deref()?;
+                rules::other_agent_named(&text, agent, &view.title, &self.agent_topics)
+            });
+            if let Some(other) = named {
+                tracing::debug!(task = %task.0, other, "interaction follow-up names another agent");
+            }
+            named.is_some()
+        };
         let follow = match act {
             Act::FollowUp => named
                 .filter(|task| done.iter().any(|view| view.task_ref == *task))
                 .or_else(|| last.clone())
-                .filter(|task| !single(task)),
+                .filter(|task| !single(task))
+                .filter(|task| !elsewhere(task)),
             _ => None,
         };
         if let Some(task) = follow {
             // Read apart whether the words are about that task (live MA7).
-            let title = done.iter().find(|view| view.task_ref == task);
-            let title = title.map(|view| view.title.clone()).unwrap_or_default();
+            let view = done.iter().find(|view| view.task_ref == task);
+            let title = view.map(|view| view.title.clone()).unwrap_or_default();
+            let agent = view.and_then(|view| view.lineage.agent.as_ref());
+            let topic = agent.and_then(|agent| {
+                let topics = self.agent_topics.iter();
+                topics.into_iter().find(|(name, _)| name == agent)
+            });
+            let topic = topic.map(|(_, what)| what.clone());
             if ask_which && decision.source == ActSource::Model {
                 let pending = Pending {
                     turn: id,
                     eot: None,
                     stage: Stage::Front,
-                    asked: Asked::Follows(decision, task, title),
+                    asked: Asked::Follows(decision, task, title, topic),
                 };
                 return self.read(e, pending, board, out);
             }
@@ -1985,6 +2065,7 @@ impl Policy {
                     title: title.clone(),
                     summary: summary.clone(),
                     question: Some(text.clone()),
+                    retry: None,
                 }));
                 self.answering.push(Answering {
                     item,
@@ -2540,7 +2621,6 @@ impl Policy {
             LaneEvent::Started { item, at, .. } => {
                 self.last_speech = at;
                 self.agent_at = at;
-                self.tts_failed = false;
                 if let Some(turn) = &mut self.turn {
                     turn.audible_by = None;
                 }
@@ -2554,6 +2634,9 @@ impl Policy {
                 }
             }
             LaneEvent::Heard { item, heard_at } => {
+                // A line heard to its end ends a run of synthesis failures (one that only
+                // started may still fail: live take 22, each line played and then failed).
+                self.tts_failed = false;
                 self.last_speech = now;
                 self.agent_at = now;
                 if let Some(repeat) = self.repeat.as_mut().filter(|repeat| repeat.item == item) {
@@ -2580,31 +2663,43 @@ impl Policy {
                 }
             }
             LaneEvent::Dropped {
+                item,
                 cause: CutCause::Failure,
                 ..
             } => {
-                // Once the caller is told; a second failure in a row only reaches the client.
-                if std::mem::replace(&mut self.tts_failed, true) {
+                // A line the voice could not give: the client is told, once in a run of
+                // failures; the caller hears the health watcher's line for the voice (chapter
+                // 10: a stall line when the next line does not succeed either), never "Sorry,
+                // I couldn't get that done just now.", which says a task failed. Live (launch
+                // demo take 22, 28 Oct): with the voice's completions lost after a refused
+                // flush, every line played and then failed on the floor's watchdog; each
+                // failure said that notice, the notice's own start ended the run of failures,
+                // and the notice failed in turn: it was said every 13 s for six minutes, and a
+                // confirmation's question was never heard.
+                if !std::mem::replace(&mut self.tts_failed, true) {
                     out.push(error("interaction_tts_failed", "speech synthesis failed"));
-                } else {
-                    let notice =
-                        self.utterance(Kind::Notice, RANK_RELAY, template("failure.retryable"));
-                    out.push(PolicyAction::Speak(notice));
                 }
+                self.unheard(now, item);
             }
             LaneEvent::Dropped { item, .. } | LaneEvent::Returned { item } => {
-                self.asked.retain(|asked| *asked != item);
-                if let Some(repeat) = self.repeat.as_mut().filter(|repeat| repeat.item == item) {
-                    // Cut by the caller, whose words are then the answer; else it waits as long.
-                    repeat.deadline = Some(now + Ms::from(self.cfg.hitl_answer_timeout_ms));
-                }
-                if let Some(asking) = &mut self.asking
-                    && asking.items.contains(&item)
-                {
-                    asking.reoffer = true;
-                }
+                self.unheard(now, item);
             }
             LaneEvent::Idle { .. } => {}
+        }
+    }
+
+    /// `item` never reached the caller in full: a question it asked is asked again, and an
+    /// open repeat question waits for its answer from now on.
+    fn unheard(&mut self, now: Ms, item: ItemId) {
+        self.asked.retain(|asked| *asked != item);
+        if let Some(repeat) = self.repeat.as_mut().filter(|repeat| repeat.item == item) {
+            // Cut by the caller, whose words are then the answer; else it waits as long.
+            repeat.deadline = Some(now + Ms::from(self.cfg.hitl_answer_timeout_ms));
+        }
+        if let Some(asking) = &mut self.asking
+            && asking.items.contains(&item)
+        {
+            asking.reoffer = true;
         }
     }
 
@@ -2703,6 +2798,7 @@ impl Policy {
                     at: now,
                     offered: false,
                     tries: 0,
+                    refused: None,
                 });
             }
             TaskEventKind::Progress { text } => {
@@ -2807,6 +2903,7 @@ impl Policy {
                             at: now,
                             offered: false,
                             tries: 0,
+                            refused: None,
                         });
                     }
                     (true, None) => out.push(PolicyAction::Speak(
@@ -2879,6 +2976,7 @@ impl Policy {
                         at: now,
                         offered: false,
                         tries: 0,
+                        refused: None,
                     });
                     return;
                 }
@@ -3163,6 +3261,7 @@ impl Policy {
                     title: update.title.clone(),
                     summary: update.summary.clone(),
                     question: None,
+                    retry: update.refused,
                 }));
                 self.narrating.push((item, update, reply_to));
             }
@@ -3191,7 +3290,7 @@ impl Policy {
         if let Some(at) = self.answering.iter().position(|asked| asked.item == item) {
             let asked = self.answering.swap_remove(at);
             let source = format!("{} {} {}", asked.title, asked.summary, asked.text);
-            let checked = line.filter(|line| {
+            let checked = line.map(|line| guard::fit_narration(&line)).filter(|line| {
                 guard::narration(line, &source) == GuardOutcome::Pass
                     && carries_result(line, &asked.summary, &asked.text)
             });
@@ -3225,17 +3324,27 @@ impl Policy {
             caller,
             line,
             self.screen,
+            &self.said,
         );
-        let Some(say) = checked else {
-            // No fallback (chapter 9): with no line the front worded and the check passed,
-            // the update waits for the next slot, at most three times; the client has the
-            // result (`task_result`, `task_output`) whatever is said of it.
-            let tries = update.tries + 1;
-            tracing::debug!(task = %update.task.0, tries, "interaction update not worded");
-            if tries < NARRATION_TRIES {
-                self.inbox.push(Update { tries, ..update });
+        let say = match checked {
+            Ok(say) => say,
+            Err(rule) => {
+                // No fallback (chapter 9): with no line the front worded and the check
+                // passed, the update waits for the next slot, at most three times, and the
+                // narrator is told why its line was not used; the client has the result
+                // (`task_result`, `task_output`) whatever is said of it.
+                let tries = update.tries + 1;
+                tracing::debug!(task = %update.task.0, tries, rule, "interaction update not worded");
+                if tries < NARRATION_TRIES {
+                    let refused = Some(rule).filter(|rule| *rule != NO_LINE);
+                    self.inbox.push(Update {
+                        tries,
+                        refused,
+                        ..update
+                    });
+                }
+                return;
             }
-            return;
         };
         let line = Utterance {
             item,
@@ -3334,6 +3443,12 @@ impl Policy {
             }
         }
 
+        // A choice offer nobody answered in its time: its answer no longer counts
+        // (`Stage::Choice`), and it no longer holds the updates back ("asked"). Live (launch
+        // demo take 24, 28 Oct): the caller's "Keep going." to it was taken for the agent's
+        // echo, the offer stayed open until the caller's next turn 3.5 minutes later, and the
+        // results of the release check and the download numbers waited all that time.
+        self.offer.take_if(|until| *until <= now);
         let unanswered = |repeat: &mut Repeat| repeat.deadline.is_some_and(|at| at <= now);
         if self.repeat.take_if(unanswered).is_some() {
             // Nothing was started, and the caller is told so.
@@ -3492,9 +3607,20 @@ impl Policy {
     }
 }
 
-/// What is said of a task's result: the narrator's `line` when it passes the check against
-/// the title, the result and the caller's latest words; `None` otherwise (there is no template
-/// to fall back to, chapter 9). With a screen the line points at it.
+/// The rule [`spoken_update`] names when the narrator gave no line at all.
+const NO_LINE: &str = "no_line";
+
+/// What is said of a task's result: the narrator's `line`, cut to the narration's length at a
+/// clause boundary when it is longer (`guard::fit_narration`), when it passes the check
+/// against the title, the result and the caller's latest words, says something of its own
+/// result ([`carries_result`]) and does not say again one of the agent's recent lines
+/// (`said`, the floor's heard timeline); otherwise the rule it broke (there is no template to
+/// fall back to, chapter 9). With a screen the line points at it.
+///
+/// Live (launch demo take 15, 27 Oct): the narrator is shown the call's last two lines, and
+/// for the browser task's update the 2B model copied the line just said of the writer task.
+/// Only the fact check applied, the copy passed it, and the writer's result was said a second
+/// time, as the browser task's update.
 pub fn spoken_update(
     persona: &Persona,
     title: &str,
@@ -3502,14 +3628,26 @@ pub fn spoken_update(
     caller: &str,
     line: Option<String>,
     screen: bool,
-) -> Option<Say> {
+    said: &[(Ms, String)],
+) -> Result<Say, &'static str> {
+    let line = guard::fit_narration(&line.ok_or(NO_LINE)?);
     let source = format!("{title} {summary} {caller}");
-    let line = line.filter(|line| guard::narration(line, &source) == GuardOutcome::Pass)?;
+    if let GuardOutcome::Blocked(rule) = guard::narration(&line, &source) {
+        return Err(rule);
+    }
+    // The title is the request: a line made of its words ("I checked the GitHub release")
+    // says nothing of the result.
+    if !carries_result(&line, summary, title) {
+        return Err("no_result");
+    }
+    if said.iter().any(|(_, said)| guard::repeats(&line, said)) {
+        return Err("repeated");
+    }
     if !screen {
-        return Some(Say::Front(line));
+        return Ok(Say::Front(line));
     }
     let more = persona.resolve(&template("update.screen"), 0);
-    Some(Say::Front(
+    Ok(Say::Front(
         format!("{line} {}", more.unwrap_or_default())
             .trim()
             .to_owned(),
@@ -4220,6 +4358,23 @@ mod tests {
         assert!(policy.step(30_000, PolicyInput::Tick, &board).is_empty());
     }
 
+    /// Live (launch demo take 15): "Thanks for waiting, I'm back." (a failure line the pump
+    /// plays, apart from the floor) at 20.2 s, then the holding line due from the wait's
+    /// silence at 22.3 s. A line said apart counts as speech: the hold waits 8 s from its end.
+    #[test]
+    fn a_line_said_apart_from_the_floor_puts_the_holding_line_off() {
+        let mut policy = policy();
+        let board = working();
+        policy.step(1_000, PolicyInput::Tick, &board);
+        assert_eq!(policy.next_wakeup(), Some(9_000));
+        policy.spoke_apart(8_200);
+        policy.spoke_apart(10_300);
+        assert!(policy.step(9_000, PolicyInput::Tick, &board).is_empty());
+        assert!(policy.step(18_299, PolicyInput::Tick, &board).is_empty());
+        let actions = policy.step(18_300, PolicyInput::Tick, &board);
+        assert_eq!(spoken(&actions)[0].kind, Kind::Hold, "{actions:?}");
+    }
+
     #[test]
     fn a_kept_progress_phrase_is_dropped_when_it_no_longer_holds() {
         let board = working();
@@ -4278,6 +4433,10 @@ mod tests {
         );
         assert_eq!(spoken(&actions)[0].kind, Kind::ChoiceOffer);
 
+        // Its answer counts for 10 s; then it is closed, unanswered (an agreed wait).
+        assert_eq!(policy.next_wakeup(), Some(27_000));
+        assert!(policy.step(27_000, PolicyInput::Tick, &board).is_empty());
+        assert_eq!(policy.offer, None);
         assert_eq!(policy.next_wakeup(), Some(47_000));
         let actions = policy.step(47_000, PolicyInput::Tick, &board);
         assert_eq!(spoken(&actions)[0].kind, Kind::Checkin);
@@ -5719,8 +5878,58 @@ mod tests {
         ));
     }
 
+    /// Live (launch demo take 22, 28 Oct): "Great. Can you also get" ended at a pause and
+    /// "the download numbers in the terminal?" came 0.3 s later as a turn of its own, read
+    /// alone as a follow-up of the finished browser task. A turn the caller goes on with
+    /// before it is decided carries into the next.
     #[test]
-    fn a_tts_failure_is_said_once_and_a_second_in_a_row_only_reported() {
+    fn a_turn_the_caller_goes_on_with_before_it_is_decided_carries_into_the_next() {
+        let asked = |actions: &[PolicyAction]| {
+            actions.iter().find_map(|action| match action {
+                PolicyAction::RequestFront { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+        };
+        let board = Board::default();
+        let mut policy = policy();
+        let first = policy.step(10_000, says(3, 10_000, "Great. Can you also get"), &board);
+        assert_eq!(asked(&first).as_deref(), Some("Great. Can you also get"));
+        let mut next = turn(4, 10_300, "the download numbers in the terminal?");
+        next.onset_at = Some(10_050);
+        let actions = policy.step(10_300, PolicyInput::EndOfTurn(next), &board);
+        assert_eq!(
+            asked(&actions).as_deref(),
+            Some("Great. Can you also get the download numbers in the terminal?")
+        );
+        assert_eq!(
+            policy.turn.as_ref().map(|turn| turn.text.as_str()),
+            Some("Great. Can you also get the download numbers in the terminal?")
+        );
+
+        // A turn already decided, or one begun well after the last ended, stands alone.
+        let mut policy = self::policy();
+        policy.step(10_000, says(3, 10_000, "What time is it?"), &board);
+        policy.step(10_100, done(3, Act::Delegate), &board);
+        let mut next = turn(4, 10_600, "And in Tokyo?");
+        next.onset_at = Some(10_200);
+        let actions = policy.step(10_600, PolicyInput::EndOfTurn(next), &board);
+        assert_eq!(asked(&actions).as_deref(), Some("And in Tokyo?"));
+        let mut policy = self::policy();
+        policy.step(10_000, says(3, 10_000, "Great. Can you also get"), &board);
+        let mut late = turn(4, 14_000, "What's the weather?");
+        late.onset_at = Some(12_000);
+        let actions = policy.step(14_000, PolicyInput::EndOfTurn(late), &board);
+        assert_eq!(asked(&actions).as_deref(), Some("What's the weather?"));
+    }
+
+    /// Live (launch demo take 22, 28 Oct): with the voice's completions lost, every line
+    /// played and then failed on the floor's watchdog, each failure said "Sorry, I couldn't
+    /// get that done just now.", and that notice, which started and then failed too, said it
+    /// again: every 13 s for six minutes. A line the voice could not give is reported to the
+    /// client once in a run of failures and never said as a failed task (the health watcher
+    /// speaks for the voice); only a line heard to its end ends the run.
+    #[test]
+    fn a_tts_failure_is_reported_once_and_never_said_as_a_failed_task() {
         let mut policy = policy();
         let board = Board::default();
         let failed = |item| {
@@ -5730,25 +5939,35 @@ mod tests {
                 cause: CutCause::Failure,
             })
         };
-        let actions = policy.step(1_000, failed(1), &board);
-        assert_eq!(
-            words(&actions),
-            ["Sorry, I couldn't get that done just now."]
-        );
-        let notice = spoken(&actions)[0].item;
-        let actions = policy.step(1_500, failed(notice.0), &board);
-        assert!(matches!(
-            &actions[..],
-            [PolicyAction::Emit(WireEvent::Error { code, .. })] if code == "interaction_tts_failed"
-        ));
-        // Speech that plays ends the run of failures.
-        let started = LaneEvent::Started {
-            item: ItemId(9),
-            utt: UttId(3),
-            at: 2_000,
+        let reported = |actions: &[PolicyAction]| {
+            matches!(
+                actions,
+                [PolicyAction::Emit(WireEvent::Error { code, .. })] if code == "interaction_tts_failed"
+            )
         };
-        policy.step(2_000, PolicyInput::Lane(started), &board);
-        assert_eq!(spoken(&policy.step(3_000, failed(10), &board)).len(), 1);
+        let actions = policy.step(1_000, failed(1), &board);
+        assert!(reported(&actions), "{actions:?}");
+        assert!(spoken(&actions).is_empty(), "{actions:?}");
+        // A line that starts and fails again is the same run: nothing more.
+        let started = |item, at| {
+            PolicyInput::Lane(LaneEvent::Started {
+                item: ItemId(item),
+                utt: UttId(item),
+                at,
+            })
+        };
+        policy.step(2_000, started(2, 2_000), &board);
+        assert!(policy.step(12_000, failed(2), &board).is_empty());
+        // A line heard to its end ends the run.
+        policy.step(13_000, started(3, 13_000), &board);
+        let heard = LaneEvent::Heard {
+            item: ItemId(3),
+            heard_at: 14_000,
+        };
+        policy.step(14_000, PolicyInput::Lane(heard), &board);
+        let actions = policy.step(15_000, failed(4), &board);
+        assert!(reported(&actions), "{actions:?}");
+        assert!(spoken(&actions).is_empty());
     }
 
     #[test]
@@ -6963,6 +7182,123 @@ mod tests {
         );
     }
 
+    /// Live (launch demo take 15, 27 Oct): the terminal task's 22-word line was refused for
+    /// its length on all three tries, the same line each time, and the update was never said.
+    #[test]
+    fn a_long_update_is_cut_at_a_clause_and_a_refused_one_is_retried_with_its_reason() {
+        let counts = "I got the counts with no errors: the x86 Linux build has zero downloads, \
+                      the ARM Linux build twelve, and the checksums file fourteen, so the builds \
+                      total twelve.";
+        let title = "Pull the download numbers: Run curl -s";
+        let board = tree(&[("t2", title)]);
+        let mut policy = policy();
+        let done = event_of("t2", true, 10_000, TaskState::Completed, completed(counts));
+        let first = policy.step(10_000, done, &board);
+        let [narration] = narrations(&first)[..] else {
+            panic!("narrated at once");
+        };
+        assert_eq!(narration.retry, None);
+        let item = narration.item;
+        let line = Some(
+            "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the \
+             checksums file fourteen, so the builds total twelve."
+                .to_owned(),
+        );
+        let said = policy.step(10_300, PolicyInput::Narrated { item, line }, &board);
+        assert_eq!(
+            words(&said),
+            [
+                "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the \
+              checksums file fourteen."
+            ]
+        );
+
+        // A line that cannot be cut is refused; at the next slot the narrator is told why.
+        let mut policy = self::policy();
+        let done = event_of("t2", true, 10_000, TaskState::Completed, completed(counts));
+        let item = narrations(&policy.step(10_000, done, &board))[0].item;
+        let line = Some(
+            "The x86 Linux build and the ARM Linux build and the checksums file were all \
+             downloaded twelve or fourteen or zero times in total today."
+                .to_owned(),
+        );
+        let again = policy.step(10_300, PolicyInput::Narrated { item, line }, &board);
+        assert!(spoken(&again).is_empty(), "{again:?}");
+        // The conversation is idle: this is the next slot.
+        let [retry] = narrations(&again)[..] else {
+            panic!("asked again at the next slot, got {again:?}");
+        };
+        assert_eq!(retry.retry, Some("narration_length"));
+        // No line at all is no reason to tell.
+        let item = retry.item;
+        let third = policy.step(10_600, PolicyInput::Narrated { item, line: None }, &board);
+        assert_eq!(narrations(&third)[0].retry, None);
+    }
+
+    /// Live (launch demo take 15): for the browser task's update the narrator copied the
+    /// writer task's update, the call's last line, and it was said again as the browser
+    /// task's (64.4 s). An update must say its own result, and nothing the agent just said.
+    #[test]
+    fn an_update_that_repeats_a_recent_line_or_lacks_its_result_is_not_said() {
+        let release = "Version one point one point oh is published as Latest; highlights include \
+                       interaction mode, eleven more voice vendors, and SDK fixes.";
+        let writer = "The launch announcement has been saved with highlights from the release \
+                      notes instead of a placeholder.";
+        let board = tree(&[("t2", "Check the GitHub release: Open")]);
+        let mut policy = policy();
+        policy.set_speech(
+            0,
+            Vec::new(),
+            vec![(9_000, format!("{writer} The details are on your screen."))],
+        );
+        let done = event_of("t2", true, 10_000, TaskState::Completed, completed(release));
+        let item = narrations(&policy.step(10_000, done, &board))[0].item;
+        // The copy passes the fact check ("highlights" is in both results) but repeats.
+        let copy = Some(writer.to_owned());
+        let again = policy.step(10_300, PolicyInput::Narrated { item, line: copy }, &board);
+        assert!(spoken(&again).is_empty(), "{again:?}");
+        let [retry] = narrations(&again)[..] else {
+            panic!("asked again");
+        };
+        assert_eq!(retry.retry, Some("repeated"));
+        // A line about the task instead of its result says nothing of it either.
+        let item = retry.item;
+        let about = Some("I checked the GitHub release for you.".to_owned());
+        let third = policy.step(10_600, PolicyInput::Narrated { item, line: about }, &board);
+        assert!(spoken(&third).is_empty(), "{third:?}");
+        let [retry] = narrations(&third)[..] else {
+            panic!("asked a third time");
+        };
+        assert_eq!(retry.retry, Some("no_result"));
+        // Its own result is said.
+        let item = retry.item;
+        let own = "Version one point one point oh is published as Latest, with SDK fixes.";
+        let line = Some(own.to_owned());
+        let said = policy.step(10_900, PolicyInput::Narrated { item, line }, &board);
+        assert_eq!(words(&said), [own]);
+        assert!(!super::carries_result(
+            "I checked the GitHub release for you.",
+            release,
+            "Check the GitHub release: Open"
+        ));
+    }
+
+    /// Live take 24 (28 Oct): "Keep going." to the choice offer was taken for the agent's echo,
+    /// the offer stayed open for 3.5 minutes and held two finished results back all that time.
+    /// An offer nobody answered in its time no longer holds an update.
+    #[test]
+    fn an_unanswered_choice_offer_does_not_hold_updates_back() {
+        let board = tree(&[("t2", FLIGHT)]);
+        let mut policy = policy();
+        policy.offer = Some(10_000);
+        let done = event_of("t2", true, 5_000, TaskState::Completed, completed(BOOKED));
+        assert!(narrations(&policy.step(5_000, done, &board)).is_empty());
+        assert_eq!(policy.next_wakeup(), Some(10_000));
+        let actions = policy.step(10_000, PolicyInput::Tick, &board);
+        assert_eq!(policy.offer, None);
+        assert_eq!(narrations(&actions).len(), 1, "{actions:?}");
+    }
+
     #[test]
     fn tell_screen_and_the_callers_own_word_decide_how_an_update_is_said() {
         let board = tree(&[("t2", FLIGHT)]);
@@ -7102,7 +7438,7 @@ mod tests {
         // Six seconds of the answer are still to be heard: an 8 s deadline cannot wait for
         // the slot after it. The question breaks in, at the urgent rank, with its lead-in.
         policy.set_floor(false, false);
-        policy.set_speech(6_000, vec![lima]);
+        policy.set_speech(6_000, vec![lima], Vec::new());
         let actions = policy.step(2_000, question_event(2_000, &request), &board);
         let lines = spoken(&actions);
         assert_eq!(lines.len(), 2, "{actions:?}");
@@ -7146,7 +7482,7 @@ mod tests {
         let board = seat_asked(&request);
         let lima = answering(&mut policy, 1_000, &board);
         policy.set_floor(false, false);
-        policy.set_speech(3_000, vec![lima]);
+        policy.set_speech(3_000, vec![lima], Vec::new());
         let actions = policy.step(2_000, question_event(2_000, &request), &board);
         let lines = spoken(&actions);
         assert_eq!(lines.len(), 1, "{actions:?}");
@@ -7192,7 +7528,7 @@ mod tests {
         let board = seat_asked(&request);
         let lima = answering(&mut policy, 1_000, &board);
         policy.set_floor(false, false);
-        policy.set_speech(1_000, vec![lima]);
+        policy.set_speech(1_000, vec![lima], Vec::new());
         let actions = policy.step(2_000, question_event(2_000, &request), &board);
         assert!(spoken(&actions).is_empty(), "{actions:?}");
         // The floor and the turn rules do not see it yet; a quiet floor brings a look.
@@ -7212,7 +7548,7 @@ mod tests {
         };
         policy.step(2_600, PolicyInput::Lane(heard), &board);
         policy.set_floor(true, false);
-        policy.set_speech(0, Vec::new());
+        policy.set_speech(0, Vec::new(), Vec::new());
         let actions = policy.step(2_600, PolicyInput::Tick, &board);
         let lines = spoken(&actions);
         assert_eq!(lines.len(), 1, "no lead-in at a slot: {actions:?}");
@@ -7231,7 +7567,7 @@ mod tests {
         let lima = answering(&mut policy, 1_000, &board);
         // The caller speaks the whole time: it never breaks in over them, and expires.
         policy.set_floor(false, false);
-        policy.set_speech(0, vec![lima]);
+        policy.set_speech(0, vec![lima], Vec::new());
         policy.step(1_900, PolicyInput::UserSpeaking { on: true }, &board);
         let actions = policy.step(2_000, question_event(2_000, &request), &board);
         let lines = spoken(&actions);
@@ -7437,6 +7773,138 @@ mod tests {
         let board = parcel(2_000);
         let actions = decided(&mut policy, 1, 12_000, words, &board, delegate);
         assert_eq!(settled(&actions).0, Act::Delegate, "{actions:?}");
+    }
+
+    /// Live take 23 of the launch demo (28 Oct): "Great. Can you also get the download numbers
+    /// in the terminal?" after the browser's release check was a follow-up of it (the reading
+    /// apart had no label in time). Words that name another agent of the session are a new
+    /// request, not read apart.
+    #[test]
+    fn a_follow_up_that_names_another_agent_is_a_new_request() {
+        let modelled = |turn: u64| {
+            PolicyInput::Front(FrontEvent::Done {
+                turn: TurnId(turn),
+                decision: ActDecision {
+                    task: Some(TaskRef("t2".to_owned())),
+                    say: Some("Okay, let me check.".to_owned()),
+                    source: ActSource::Model,
+                    ..decision(Act::FollowUp)
+                },
+            })
+        };
+        let topics = vec![
+            (
+                "browser".to_owned(),
+                "Operates airline websites and books flights.".to_owned(),
+            ),
+            (
+                "terminal".to_owned(),
+                "Runs shell commands: downloads and verifies files.".to_owned(),
+            ),
+        ];
+        let mut policy = policy();
+        let board = booked(&mut policy);
+        policy.reader = None;
+        policy.set_agent_topics(topics.clone());
+        let words = "Great. Can you also get the download numbers in the terminal?";
+        policy.step(10_000, says(3, 10_000, words), &board);
+        let actions = policy.step(10_000, modelled(3), &board);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, PolicyAction::Read(_))),
+            "{actions:?}"
+        );
+        assert_eq!(settled(&actions).0, Act::Delegate, "{actions:?}");
+        assert!(
+            commands(&actions)
+                .iter()
+                .any(|cmd| matches!(cmd, TaskCmd::Delegate { .. })),
+            "{actions:?}"
+        );
+        // A question about the finished task itself is still read apart.
+        let mut policy = self::policy();
+        let board = booked(&mut policy);
+        policy.reader = None;
+        policy.set_agent_topics(topics);
+        policy.step(20_000, says(4, 20_000, "Which seat did I get?"), &board);
+        let actions = policy.step(20_000, modelled(4), &board);
+        assert!(
+            matches!(actions[..], [PolicyAction::Read(_)]),
+            "{actions:?}"
+        );
+    }
+
+    /// Live rehearsal 1 of the launch demo (28 Oct): after the browser's release check every
+    /// turn was a follow-up of it, "Thanks, Eva." too, answered from its result. The reading
+    /// apart is shown what the agent that did the task does, and words that ask for nothing
+    /// are the persona's thanks line.
+    #[test]
+    fn a_follow_up_is_read_against_its_agent_and_thanks_are_thanks() {
+        let modelled = |turn: u64| {
+            PolicyInput::Front(FrontEvent::Done {
+                turn: TurnId(turn),
+                decision: ActDecision {
+                    task: Some(TaskRef("t2".to_owned())),
+                    say: Some("Okay, let me check.".to_owned()),
+                    source: ActSource::Model,
+                    ..decision(Act::FollowUp)
+                },
+            })
+        };
+        let mut policy = policy();
+        let board = booked(&mut policy);
+        policy.reader = None;
+        policy.set_agent_topics(vec![(
+            "browser".to_owned(),
+            "Operates airline websites and books flights.".to_owned(),
+        )]);
+        policy.step(10_000, says(3, 10_000, "Thanks, Eva."), &board);
+        let asked = policy.step(10_000, modelled(3), &board);
+        let [PolicyAction::Read(reading)] = &asked[..] else {
+            panic!("a reading, got {asked:?}");
+        };
+        assert_eq!(reading.kind, ReadingKind::Follows);
+        assert!(
+            reading.context.ends_with(
+                "by an agent that \u{ab}Operates airline websites and books flights.\u{bb}"
+            ),
+            "{}",
+            reading.context
+        );
+        let labels: Vec<&str> = reading.labels.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["1", "new", "thanks"]);
+        let thanks = PolicyInput::Read {
+            turn: TurnId(3),
+            label: Some("thanks".to_owned()),
+        };
+        let actions = policy.step(10_100, thanks, &board);
+        assert_eq!(settled(&actions).0, Act::Social, "{actions:?}");
+        assert_eq!(words(&actions), ["You're welcome."]);
+        assert!(
+            narrations(&actions).is_empty(),
+            "nothing is answered from the result"
+        );
+        assert!(
+            commands(&actions)
+                .iter()
+                .all(|cmd| !matches!(cmd, TaskCmd::FollowUp { .. } | TaskCmd::Delegate { .. })),
+            "{actions:?}"
+        );
+        // Without a description of the agent the title alone is shown, as before.
+        let mut policy = self::policy();
+        let board = booked(&mut policy);
+        policy.reader = None;
+        policy.step(20_000, says(4, 20_000, "When does it leave?"), &board);
+        let asked = policy.step(20_000, modelled(4), &board);
+        let [PolicyAction::Read(reading)] = &asked[..] else {
+            panic!("a reading, got {asked:?}");
+        };
+        assert!(
+            !reading.context.contains("by an agent"),
+            "{}",
+            reading.context
+        );
     }
 
     /// Live MA7: a follow-up the front named is read apart against the finished task's title;

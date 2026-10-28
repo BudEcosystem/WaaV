@@ -214,25 +214,81 @@ pub fn outbound(sentence: &str, caller: &str) -> GuardOutcome {
     GuardOutcome::Blocked(rule)
 }
 
-/// The most words a spoken task update may have (chapter 8's narrator).
+/// The most words a spoken task update may have (chapter 8's narrator). The one limit of the
+/// narrator's line: its prompt asks for it (`front_model::narrator_system`), [`fit_narration`]
+/// cuts a longer line to it and [`narration`] refuses what is still longer; its grammar bounds
+/// the sentence, not its length (`front_model::sentence_grammar`). Live (launch demo take 15,
+/// 27 Oct) the three disagreed: the prompt asked for 20 words, the grammar allowed 160
+/// characters and this check refused 21, and a 22-word line with every count of a terminal
+/// task ("The x86 Linux build has zero downloads, the ARM Linux build twelve, and the
+/// checksums file fourteen, so the builds total twelve.") was refused on all three tries: the
+/// update was never said.
 pub const NARRATION_MAX_WORDS: usize = 20;
+/// The fewest words a line cut to fit [`NARRATION_MAX_WORDS`] keeps: a shorter head ("Good
+/// news.") says nothing of the result, and the line is refused instead.
+const NARRATION_MIN_CUT_WORDS: usize = 4;
+
+/// A task update the front worded, fitted to [`NARRATION_MAX_WORDS`]: a longer line, or one
+/// the token budget cut before its full stop, ends at its last clause boundary (a comma,
+/// semicolon or colon after a word) within the limit, with a full stop. A line with no such
+/// boundary is left as it is, for [`narration`] to refuse. The 22-word line above becomes
+/// "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the checksums file
+/// fourteen." (17 words): the result, without the clause past the limit.
+pub fn fit_narration(line: &str) -> String {
+    let line = line.trim();
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let finished = line.ends_with(['.', '!']);
+    if finished && words.len() <= NARRATION_MAX_WORDS {
+        return line.to_owned();
+    }
+    let most = words.len().min(NARRATION_MAX_WORDS);
+    let clause = (NARRATION_MIN_CUT_WORDS..=most)
+        .rev()
+        .find(|&n| words[n - 1].ends_with([',', ';', ':']));
+    match clause {
+        Some(n) => {
+            let head = words[..n].join(" ");
+            format!("{}.", head.trim_end_matches([',', ';', ':']))
+        }
+        None => line.to_owned(),
+    }
+}
+
+/// Whether a sentence ends inside `body`: a `!`, a `?`, a line break, or a full stop that is
+/// not a decimal or version point between two digits ("1.1.0", "2.5"). Live (take 15) the
+/// narrator's grammar ended its line at the first full stop: "The GitHub release for version
+/// 1." was all of it, refused for the "1" its result does not have.
+fn ends_sentence_inside(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let digit = |at: Option<&char>| at.is_some_and(char::is_ascii_digit);
+    chars.iter().enumerate().any(|(at, c)| match c {
+        '!' | '?' | '\n' => true,
+        '.' => !(at > 0 && digit(chars.get(at - 1)) && digit(chars.get(at + 1))),
+        _ => false,
+    })
+}
 
 /// The check of a task update the front worded (chapter 8): the outbound policy, with the
-/// task's result among what was given, then one sentence of at most
-/// [`NARRATION_MAX_WORDS`] words whose every number and every name (a capitalised word that
-/// does not start the sentence) is in `source`: the task's title and result and the caller's
-/// latest words.
+/// task's result among what was given, then one finished sentence (it ends with its full
+/// stop: a line the token budget cut is no sentence) of at most [`NARRATION_MAX_WORDS`]
+/// words whose every number and every name (a capitalised word that does not start the
+/// sentence) is in `source`: the task's title and result and the caller's latest words. A
+/// point between two digits ("version 1.1.0") ends no sentence.
 pub fn narration(line: &str, source: &str) -> GuardOutcome {
     if let GuardOutcome::Blocked(rule) = outbound(line, source) {
         return GuardOutcome::Blocked(rule);
     }
     let words: Vec<&str> = line.split_whitespace().collect();
-    let body = line.trim_end().trim_end_matches(['.', '!']);
+    let line = line.trim_end();
+    let body = line.trim_end_matches(['.', '!']);
+    let given = given_numbers(source);
     let rule = if words.is_empty() || words.len() > NARRATION_MAX_WORDS {
         "narration_length"
-    } else if body.contains(['.', '!', '?', '\n']) {
+    } else if !line.ends_with(['.', '!']) {
+        "narration_unfinished"
+    } else if ends_sentence_inside(body) {
         "narration_sentences"
-    } else if numbers(line).iter().any(|n| !numbers(source).contains(n)) {
+    } else if numbers(line).iter().any(|n| !given.iter().any(|g| g == n)) {
         "number_not_given"
     } else {
         let given = norm_phrase(source);
@@ -248,6 +304,83 @@ pub fn narration(line: &str, source: &str) -> GuardOutcome {
         }
     };
     GuardOutcome::Blocked(rule)
+}
+
+/// The numbers a source gives, by value: in digits ([`numbers`]) and in words
+/// ([`spelled_numbers`]). Live (take 15) the browser agent wrote its result for speech,
+/// "Version one point one point oh is published as Latest", and the narrator wrote "version
+/// 1.1.0": the same number, not one the result lacks.
+fn given_numbers(source: &str) -> Vec<String> {
+    let mut given: Vec<String> = numbers(source).into_iter().map(str::to_owned).collect();
+    given.extend(spelled_numbers(source).into_iter().map(|n| n.to_string()));
+    given
+}
+
+/// The numbers a text says in words, by value: "twelve" 12, "twenty-seventh" 27 (and 20 and
+/// 7), "twenty six" 26, and the "oh" of "point oh" 0. Up to ninety-nine: a larger number a
+/// result says in words is not read.
+fn spelled_numbers(text: &str) -> Vec<u32> {
+    const UNITS: [(&str, &str, u32); 20] = [
+        ("zero", "zeroth", 0),
+        ("one", "first", 1),
+        ("two", "second", 2),
+        ("three", "third", 3),
+        ("four", "fourth", 4),
+        ("five", "fifth", 5),
+        ("six", "sixth", 6),
+        ("seven", "seventh", 7),
+        ("eight", "eighth", 8),
+        ("nine", "ninth", 9),
+        ("ten", "tenth", 10),
+        ("eleven", "eleventh", 11),
+        ("twelve", "twelfth", 12),
+        ("thirteen", "thirteenth", 13),
+        ("fourteen", "fourteenth", 14),
+        ("fifteen", "fifteenth", 15),
+        ("sixteen", "sixteenth", 16),
+        ("seventeen", "seventeenth", 17),
+        ("eighteen", "eighteenth", 18),
+        ("nineteen", "nineteenth", 19),
+    ];
+    const TENS: [(&str, &str, u32); 8] = [
+        ("twenty", "twentieth", 20),
+        ("thirty", "thirtieth", 30),
+        ("forty", "fortieth", 40),
+        ("fifty", "fiftieth", 50),
+        ("sixty", "sixtieth", 60),
+        ("seventy", "seventieth", 70),
+        ("eighty", "eightieth", 80),
+        ("ninety", "ninetieth", 90),
+    ];
+    let value = |table: &[(&str, &str, u32)], word: &str| {
+        let found = table
+            .iter()
+            .find(|(name, nth, _)| *name == word || *nth == word);
+        found.map(|(.., value)| *value)
+    };
+    let text = text.to_lowercase();
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut values = Vec::new();
+    for (at, word) in words.iter().enumerate() {
+        if *word == "oh" && at > 0 && words[at - 1] == "point" {
+            values.push(0);
+        } else if let Some(unit) = value(&UNITS, word) {
+            values.push(unit);
+        } else if let Some(tens) = value(&TENS, word) {
+            values.push(tens);
+            // "twenty-seven" and "twenty seven" are split alike.
+            if let Some(unit) = words
+                .get(at + 1)
+                .and_then(|next| value(&UNITS[1..10], next))
+            {
+                values.push(tens + unit);
+            }
+        }
+    }
+    values
 }
 
 /// The numbers of a text, by value: "09:40" holds 9 and 40, as "9:40" does.
@@ -326,30 +459,51 @@ pub fn role_lines(parts: &[&str]) -> String {
 
 /// Whether a sentence of a background answer says again who its prompt tells it it is (live
 /// P1, r15-verify: qwen2.5-3b relayed "You are the help desk for customer accounts.", the first
-/// line of its prompt). `roles` is [`role_lines`] of the prompt the gateway sent it. The
-/// sentence repeats one when a run of its words, in order, is also in that line, and the run
-/// has at least the transcript echo filter's least words and its share of both the sentence
-/// and the line.
+/// line of its prompt). `roles` is [`role_lines`] of the prompt the gateway sent it; the
+/// sentence repeats one of them as [`repeats`] measures it.
 pub fn repeats_prompt(sentence: &str, roles: &str) -> bool {
+    roles.lines().any(|line| repeats(sentence, line))
+}
+
+/// Whether `sentence` says `line` again: a run of its words, in order, is also in the line,
+/// and the run has at least the transcript echo filter's least words and its share of both
+/// the sentence and the line. The measure of [`repeats_prompt`], and of a task update that
+/// repeats one of the agent's recent lines (live, take 15: for the browser task the 2B
+/// narrator copied the writer task's update it had just been shown as the call's last line,
+/// "The launch announcement has been saved with highlights from the release notes instead of
+/// a placeholder.", and it was said again under the browser task).
+pub fn repeats(sentence: &str, line: &str) -> bool {
     use super::duplex::{ECHO_MIN_WORDS, ECHO_SHARE_PERCENT};
     let words = persona::word_list(sentence);
     if words.len() < ECHO_MIN_WORDS {
         return false;
     }
     let share = |run: usize, of: usize| run * 100 >= of * ECHO_SHARE_PERCENT;
-    roles.lines().any(|line| {
-        let known = persona::word_list(line);
-        // The longest run of the sentence's words that the line holds in the same order.
-        let mut run = vec![0usize; known.len() + 1];
-        let mut longest = 0;
-        for word in &words {
-            for at in (0..known.len()).rev() {
-                run[at + 1] = if known[at] == *word { run[at] + 1 } else { 0 };
-                longest = longest.max(run[at + 1]);
-            }
+    let known = persona::word_list(line);
+    let longest = longest_run(&words, &known);
+    longest >= ECHO_MIN_WORDS && share(longest, words.len()) && share(longest, known.len())
+}
+
+/// Whether two lines share a phrase: a run of at least the echo filter's least words, in the
+/// same order ("thanks for waiting" in "Thanks for waiting, I'm back." and "Still working on
+/// it, thanks for waiting.").
+pub fn shares_phrase(one: &str, other: &str) -> bool {
+    use super::duplex::ECHO_MIN_WORDS;
+    let (one, other) = (persona::word_list(one), persona::word_list(other));
+    longest_run(&one, &other) >= ECHO_MIN_WORDS
+}
+
+/// The longest run of `words` that `known` holds in the same order.
+fn longest_run(words: &[String], known: &[String]) -> usize {
+    let mut run = vec![0usize; known.len() + 1];
+    let mut longest = 0;
+    for word in words {
+        for at in (0..known.len()).rev() {
+            run[at + 1] = if known[at] == *word { run[at] + 1 } else { 0 };
+            longest = longest.max(run[at + 1]);
         }
-        longest >= ECHO_MIN_WORDS && share(longest, words.len()) && share(longest, known.len())
-    })
+    }
+    longest
 }
 
 /// A web address: a scheme, `www.`, or a name under a common top-level domain.
@@ -992,5 +1146,113 @@ mod tests {
             );
         }
         assert_eq!(numbers("09:40 and 0 and 007"), ["9", "40", "0", "7"]);
+    }
+
+    /// Live (launch demo take 15, 27 Oct): the terminal task's 22-word line was refused on
+    /// all three tries and never said; the browser task's line ended at the point of "1.1.0".
+    #[test]
+    fn a_long_update_is_cut_at_a_clause_and_a_version_point_ends_no_sentence() {
+        let source = "Pull the download numbers I got the counts with no errors: the x86 Linux \
+                      build has zero downloads, the ARM Linux build twelve, and the checksums \
+                      file fourteen, so the builds total twelve.";
+        let long = "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the \
+                    checksums file fourteen, so the builds total twelve.";
+        assert_eq!(long.split_whitespace().count(), 22);
+        assert_eq!(
+            narration(long, source),
+            GuardOutcome::Blocked("narration_length")
+        );
+        let fitted = fit_narration(long);
+        assert_eq!(
+            fitted,
+            "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the \
+             checksums file fourteen."
+        );
+        assert_eq!(narration(&fitted, source), GuardOutcome::Pass);
+        // A line within the limit is left as it is; one with no clause boundary within it
+        // too, for the check to refuse; a head too short to say anything is no cut.
+        let short = "The ARM Linux build has twelve downloads.";
+        assert_eq!(fit_narration(short), short);
+        let unbroken = "The x86 Linux build and the ARM Linux build and the checksums file \
+                        were all downloaded twelve or fourteen or zero times in total today.";
+        assert_eq!(fit_narration(unbroken), unbroken);
+        assert_eq!(
+            narration(unbroken, source),
+            GuardOutcome::Blocked("narration_length")
+        );
+        let early = "Okay, the x86 Linux build and the ARM Linux build and the checksums file \
+                     were all downloaded twelve or fourteen or zero times in total today.";
+        assert_eq!(fit_narration(early), early);
+        // A line the token budget cut before its full stop: cut at its last clause, else
+        // refused as unfinished.
+        assert_eq!(
+            fit_narration("The x86 Linux build has zero downloads, the ARM Linux build tw"),
+            "The x86 Linux build has zero downloads."
+        );
+        assert_eq!(
+            narration("The x86 Linux build has zero downloads", source),
+            GuardOutcome::Blocked("narration_unfinished")
+        );
+
+        // A version's points end no sentence; a full stop between words still does.
+        let release = "Version 1.1.0 is published as Latest, highlights include interaction mode.";
+        let result = "Version 1.1.0 is published as Latest; highlights include interaction mode.";
+        assert_eq!(narration(release, result), GuardOutcome::Pass);
+        assert_eq!(
+            narration("Version 1.1.0 is out. It is Latest.", result),
+            GuardOutcome::Blocked("narration_sentences")
+        );
+        assert_eq!(
+            narration("The GitHub release for version 1.", "a new release"),
+            GuardOutcome::Blocked("number_not_given")
+        );
+        // A number the result says in words is given, in digits too.
+        let spoken = "Version one point one point oh is published as Latest, around October \
+                      twenty-seventh, twenty twenty-six; the ARM build has twelve downloads.";
+        for line in [
+            "Version 1.1.0 is published as Latest.",
+            "It was published on October 27.",
+            "The ARM build has 12 downloads.",
+        ] {
+            assert_eq!(narration(line, spoken), GuardOutcome::Pass, "{line}");
+        }
+        assert_eq!(
+            narration("The ARM build has 13 downloads.", spoken),
+            GuardOutcome::Blocked("number_not_given")
+        );
+        assert_eq!(spelled_numbers("Point oh, Oh well."), [0]);
+        assert!(ends_sentence_inside("Version 1. 1"));
+        assert!(!ends_sentence_inside("Version 1.1.0 and 2.5"));
+    }
+
+    #[test]
+    fn an_update_that_says_a_recent_line_again_repeats_it() {
+        let said = "The launch announcement has been saved with highlights from the release \
+                    notes instead of a placeholder. The details are on your screen.";
+        let copy = "The launch announcement has been saved with highlights from the release \
+                    notes instead of a placeholder.";
+        assert!(repeats(copy, said));
+        assert!(repeats(
+            "The launch announcement has been saved with highlights from the release notes.",
+            copy
+        ));
+        // A line of its own that shares a few words is no repeat.
+        assert!(!repeats(
+            "Version 1.1.0 is published as Latest, with highlights from the release notes.",
+            said
+        ));
+        assert!(!repeats(
+            "Your Delhi flight is booked.",
+            "Sure, I'll book your Delhi flight."
+        ));
+        // A phrase in common is enough to pass a bank line over.
+        assert!(shares_phrase(
+            "Still working on it, thanks for waiting.",
+            "Thanks for waiting, I'm back."
+        ));
+        assert!(!shares_phrase(
+            "I'm still on it.",
+            "Thanks for waiting, I'm back."
+        ));
     }
 }

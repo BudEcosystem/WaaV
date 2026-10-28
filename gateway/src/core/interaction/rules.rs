@@ -5,7 +5,6 @@
 //! model's to decide in context (chapter 9): the lexicon's phrase lists are prompt examples
 //! and test data only.
 
-#[cfg(test)]
 use std::collections::BTreeSet;
 
 #[cfg(test)]
@@ -266,6 +265,66 @@ pub fn near_duplicate(text: &str, title: &str, lexicon: &Lexicon) -> bool {
     let (new, old) = (words(text), words(title));
     let shared = new.intersection(&old).count();
     shared >= 2 && shared * 4 >= new.len().min(old.len()) * 3
+}
+
+/// The shortest description word that can name an agent ("downloads", "announcements"):
+/// shorter ones ("check", "notes", "pages") are said of any agent's work.
+const AGENT_WORD_MIN_CHARS: usize = 6;
+
+/// The other agent of the session the caller's words name, when a finished task of `agent`
+/// (its title `title`) is the one the front named a follow-up of: by its registered name
+/// ("terminal"), or by a word of its description no other agent's description has and the
+/// finished task's agent and title do not ("download" for an agent that "downloads,
+/// verifies checksums"), plurals read as their singular. `None` when they name no other agent, or
+/// only the finished task's own. `topics`: the session's agents and their descriptions.
+///
+/// Live (launch demo take 23, 28 Oct): with the browser's release check finished, "Great.
+/// Can you also get the download numbers in the terminal?" was named a follow-up of it; the
+/// reading apart had no label in its 1.5 s on the loaded GPU, so the front's word stood, and
+/// the browser agent was asked for the download numbers (it asked which project was meant).
+/// No terminal task started until the caller asked again 110 s later.
+pub fn other_agent_named<'a>(
+    text: &str,
+    agent: &str,
+    title: &str,
+    topics: &'a [(String, String)],
+) -> Option<&'a str> {
+    let stem = |word: &str| -> String {
+        let plural = word.len() > 4 && word.ends_with('s') && !word.ends_with("ss");
+        if plural {
+            word[..word.len() - 1].to_owned()
+        } else {
+            word.to_owned()
+        }
+    };
+    let words =
+        |text: &str| -> BTreeSet<String> { word_list(text).iter().map(|w| stem(w)).collect() };
+    let said = words(text);
+    let norm = norm_phrase(text);
+    let own: BTreeSet<String> = topics
+        .iter()
+        .filter(|(name, _)| name == agent)
+        .flat_map(|(_, what)| words(what))
+        .chain(words(title))
+        .chain(words(agent))
+        .collect();
+    topics
+        .iter()
+        .filter(|(name, _)| name != agent)
+        .find(|(name, what)| {
+            if has_phrase(&norm, name) {
+                return true;
+            }
+            let others = topics.iter().filter(|(other, _)| other != name);
+            let elsewhere: BTreeSet<String> = others.flat_map(|(_, what)| words(what)).collect();
+            words(what).into_iter().any(|word| {
+                word.chars().count() >= AGENT_WORD_MIN_CHARS
+                    && !own.contains(&word)
+                    && !elsewhere.contains(&word)
+                    && said.contains(&word)
+            })
+        })
+        .map(|(name, _)| name.as_str())
 }
 
 /// What a caller says before the request itself, longest first.
@@ -601,5 +660,87 @@ mod tests {
         ] {
             assert_eq!(spoken_title(title), spoken, "{title:?}");
         }
+    }
+
+    /// What the launch demo's desk agents say they do.
+    fn desk() -> Vec<(String, String)> {
+        [
+            (
+                "browser",
+                "Operates a real web browser: opens pages, reads them, follows links, and \
+                 reports what it found.",
+            ),
+            (
+                "terminal",
+                "Runs shell commands on a sandboxed Linux machine with internet access: \
+                 downloads, verifies checksums, unpacks, starts and health-checks programs.",
+            ),
+            (
+                "writer",
+                "Drafts documents such as announcements, emails and notes, and saves them in \
+                 the word processor on the caller's screen after the caller approves.",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, what)| (name.to_owned(), what.to_owned()))
+        .collect()
+    }
+
+    /// Live take 23: "... the download numbers in the terminal?" after the browser's release
+    /// check was handed to the browser agent.
+    #[test]
+    fn words_that_name_another_agent_are_not_a_follow_up_of_this_one() {
+        let desk = desk();
+        let title = "Check the GitHub release: Open";
+        let named = |text: &str, agent: &str| other_agent_named(text, agent, title, &desk);
+        // By its name, or by a word only its description has.
+        for (text, other) in [
+            (
+                "Great. Can you also get the download numbers in the terminal?",
+                "terminal",
+            ),
+            ("Oh, and grab the downloads too.", "terminal"),
+            (
+                "Let's draft the launch announcement and mention those numbers.",
+                "writer",
+            ),
+            ("Can the writer put that in an email?", "writer"),
+        ] {
+            assert_eq!(named(text, "browser"), Some(other), "{text}");
+        }
+        // About the release check itself, thanks, a status question: no other agent.
+        for text in [
+            "Does the release mention interaction mode?",
+            "Which files does it list?",
+            "Can you open the release notes and read me the highlights?",
+            "Can you check it again?",
+            "How's it looking?",
+            "Thanks, Eva.",
+            "Can the browser open the release page?",
+        ] {
+            assert_eq!(named(text, "browser"), None, "{text}");
+        }
+        // The finished task's own agent, and words of its own description or title, are not
+        // another agent's.
+        assert_eq!(
+            other_agent_named(
+                "Can the terminal run it again?",
+                "terminal",
+                "Pull the numbers",
+                &desk
+            ),
+            None
+        );
+        let mut overlap = desk.clone();
+        overlap[0].1.push_str(" It downloads pages too.");
+        assert_eq!(
+            other_agent_named("Grab the downloads.", "browser", title, &overlap),
+            None,
+            "a word the finished task's agent also does"
+        );
+        assert_eq!(
+            other_agent_named("Grab the terminal output.", "browser", title, &[]),
+            None
+        );
     }
 }

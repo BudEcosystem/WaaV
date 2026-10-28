@@ -60,6 +60,10 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const OUTBOUND_CHANNEL_BUFFER: usize = 64;
 /// Grace period for the send/recv tasks to exit on disconnect before abort.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// A refused flush is sent again after this long, doubled for each refusal in a row (at
+/// most [`FLUSH_RETRY_MAX`]).
+const FLUSH_RETRY: Duration = Duration::from_secs(1);
+const FLUSH_RETRY_MAX: Duration = Duration::from_secs(8);
 
 /// Client-side classification of a provider text (JSON) frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +76,10 @@ pub enum WsTtsEvent {
     Metadata,
     /// Provider warning surfaced in logs only.
     Warning(String),
+    /// The provider refused the last `Flush` (Deepgram's `EXCESSIVE_FLUSH` warning, a rate
+    /// limit): the text sent before it stays in the provider's buffer, unsynthesised, and no
+    /// `Flushed` comes for it. The client sends the flush again ([`FLUSH_RETRY`]).
+    FlushRefused(String),
     /// Provider error surfaced via [`AudioCallback::on_error`].
     Error(String),
     /// Frame is not relevant to the client.
@@ -132,10 +140,22 @@ pub struct PendingUtterance {
 /// Utterance bookkeeping: map keyed by context id + FIFO order of submission.
 /// Providers stream responses in submission order, so the queue front is the
 /// utterance currently being synthesized.
+///
+/// Each `Flush` sent completes the utterances submitted since the previous one (`flushes`:
+/// how many, per flush still awaiting its `Flushed`). A refused flush leaves its utterances
+/// to the next flush (`unflushed`). Live (launch demo take 22, 28 Oct): Deepgram refused one
+/// flush ("Rate limit exceeded for flushes"), its `Flushed` never came, and from then on each
+/// `Flushed` completed the utterance before the one it was for: no utterance had its
+/// completion again, the interaction floor failed each line after its 10 s watchdog, and the
+/// call heard "Sorry, I couldn't get that done just now." every 13 s for six minutes.
 #[derive(Default)]
 struct PendingMap {
     by_context: HashMap<String, PendingUtterance>,
     order: VecDeque<String>,
+    flushes: VecDeque<usize>,
+    unflushed: usize,
+    /// Flushes refused in a row (the retry's back-off).
+    refused: u32,
 }
 
 impl PendingMap {
@@ -148,6 +168,35 @@ impl PendingMap {
     fn purge(&mut self) {
         self.by_context.clear();
         self.order.clear();
+        self.flushes.clear();
+        self.unflushed = 0;
+    }
+
+    /// A flush is sent: it completes the utterances not yet flushed.
+    fn flush_sent(&mut self) {
+        self.flushes.push_back(std::mem::take(&mut self.unflushed));
+    }
+
+    /// A `Flushed` came: the utterances its flush completes, oldest first (one when no flush
+    /// was counted, as before).
+    fn flushed(&mut self) -> Vec<PendingUtterance> {
+        self.refused = 0;
+        let count = self.flushes.pop_front().unwrap_or(1);
+        (0..count)
+            .filter_map(|_| self.order.pop_front())
+            .filter_map(|id| self.by_context.remove(&id))
+            .collect()
+    }
+
+    /// The provider refused a flush (the latest sent: its refusal comes at once, before the
+    /// `Flushed` of any flush in synthesis). Its utterances wait for the next flush; when no
+    /// flush is on its way, how long until it is sent again.
+    fn flush_refused(&mut self) -> Option<Duration> {
+        let count = self.flushes.pop_back().unwrap_or(0);
+        self.unflushed += count;
+        self.refused = self.refused.saturating_add(1);
+        let backoff = FLUSH_RETRY.saturating_mul(1 << (self.refused - 1).min(3));
+        (self.unflushed > 0).then_some(backoff.min(FLUSH_RETRY_MAX))
     }
 }
 
@@ -352,6 +401,7 @@ impl WebSocketTtsClient {
         // --- Recv task: owns the socket read half; holds NO outer lock (§P1.1). ---
         let recv_shared = Arc::clone(&self.shared);
         let recv_protocol = Arc::clone(&self.protocol);
+        let recv_outbound = outbound_tx.clone();
         let recv_task = tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
@@ -360,7 +410,13 @@ impl WebSocketTtsClient {
                             .await;
                     }
                     Ok(Message::Text(text)) => {
-                        Self::handle_text_frame(&recv_shared, &recv_protocol, &text).await;
+                        Self::handle_text_frame(
+                            &recv_shared,
+                            &recv_protocol,
+                            &recv_outbound,
+                            &text,
+                        )
+                        .await;
                     }
                     Ok(Message::Close(frame)) => {
                         debug!(
@@ -466,23 +522,21 @@ impl WebSocketTtsClient {
     async fn handle_text_frame(
         shared: &Arc<WsShared>,
         protocol: &Arc<dyn WsTtsProtocol>,
+        outbound: &mpsc::Sender<Outbound>,
         raw: &str,
     ) {
         match protocol.classify_text_frame(raw) {
             WsTtsEvent::Flushed => {
-                // Pop the finished utterance; fire on_complete only when it was not
-                // cancelled and nothing else is in flight (mirrors the HTTP
+                // Pop the utterances its flush finished; fire on_complete only when the
+                // last was not cancelled and nothing else is in flight (mirrors the HTTP
                 // dispatcher's "one completion after all queued audio" behavior).
                 let (finished, queue_empty) = {
                     let mut pending = shared.pending.lock();
-                    let finished = pending
-                        .order
-                        .pop_front()
-                        .and_then(|id| pending.by_context.remove(&id));
+                    let finished = pending.flushed();
                     (finished, pending.order.is_empty())
                 };
                 let was_cancelled = finished
-                    .as_ref()
+                    .last()
                     .map(|p| p.cancel_token.is_cancelled())
                     .unwrap_or(false);
                 if shared.clearing.load(Ordering::Acquire) || was_cancelled {
@@ -519,6 +573,18 @@ impl WebSocketTtsClient {
                     "streaming TTS warning: {message}"
                 );
             }
+            WsTtsEvent::FlushRefused(message) => {
+                let retry = shared.pending.lock().flush_refused();
+                warn!(
+                    provider = protocol.provider_name(),
+                    retry_ms = retry.map(|retry| retry.as_millis() as u64),
+                    "streaming TTS flush refused: {message}"
+                );
+                if let (Some(retry), Some(frame)) = (retry, protocol.flush_frame()) {
+                    let (shared, outbound) = (Arc::clone(shared), outbound.clone());
+                    tokio::spawn(Self::flush_again(shared, outbound, frame, retry));
+                }
+            }
             WsTtsEvent::Error(message) => {
                 warn!(
                     provider = protocol.provider_name(),
@@ -533,6 +599,25 @@ impl WebSocketTtsClient {
                 debug!(provider = protocol.provider_name(), "ignored frame: {raw}");
             }
         }
+    }
+
+    /// The refused flush, sent again after `retry` unless a flush sent since covers its
+    /// utterances (or they were cleared).
+    async fn flush_again(
+        shared: Arc<WsShared>,
+        outbound: mpsc::Sender<Outbound>,
+        frame: String,
+        retry: Duration,
+    ) {
+        tokio::time::sleep(retry).await;
+        {
+            let mut pending = shared.pending.lock();
+            if pending.unflushed == 0 || shared.clearing.load(Ordering::Acquire) {
+                return;
+            }
+            pending.flush_sent();
+        }
+        let _ = outbound.send(Outbound::Frame(frame)).await;
     }
 
     /// `speak(flush=false)` buffers; `flush=true` emits ONE `Speak` (buffer + text)
@@ -588,6 +673,7 @@ impl WebSocketTtsClient {
         let context_id = context_id
             .map(str::to_string)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let flush = self.protocol.flush_frame();
         {
             let mut pending = self.shared.pending.lock();
             pending.by_context.insert(
@@ -599,18 +685,27 @@ impl WebSocketTtsClient {
                 },
             );
             pending.order.push_back(context_id.clone());
+            pending.unflushed += 1;
+            if flush.is_some() {
+                pending.flush_sent();
+            }
         }
 
         let mut frames = vec![self.protocol.speak_frame(text)];
-        if let Some(flush_frame) = self.protocol.flush_frame() {
-            frames.push(flush_frame);
-        }
+        frames.extend(flush);
         for frame in frames {
             if let Err(e) = self.send_frame(frame).await {
                 // Roll the registration back — no audio will ever arrive for it.
                 let mut pending = self.shared.pending.lock();
                 pending.by_context.remove(&context_id);
                 pending.order.retain(|id| id != &context_id);
+                match self.protocol.flush_frame() {
+                    Some(_) => {
+                        let covered = pending.flushes.pop_back().unwrap_or(0);
+                        pending.unflushed += covered.saturating_sub(1);
+                    }
+                    None => pending.unflushed = pending.unflushed.saturating_sub(1),
+                }
                 return Err(e);
             }
         }
@@ -904,6 +999,139 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             Box::pin(async {})
         }
+    }
+
+    /// Classifies the test's own frames: `flushed`, `refused`.
+    struct FlushProtocol;
+    impl WsTtsProtocol for FlushProtocol {
+        fn provider_name(&self) -> &'static str {
+            "flush"
+        }
+        fn speak_frame(&self, text: &str) -> String {
+            text.to_string()
+        }
+        fn flush_frame(&self) -> Option<String> {
+            Some("Flush".to_string())
+        }
+        fn clear_frame(&self) -> Option<String> {
+            None
+        }
+        fn close_frame(&self) -> Option<String> {
+            None
+        }
+        fn classify_text_frame(&self, raw: &str) -> WsTtsEvent {
+            match raw {
+                "flushed" => WsTtsEvent::Flushed,
+                "refused" => WsTtsEvent::FlushRefused("rate limit".to_string()),
+                _ => WsTtsEvent::Ignored,
+            }
+        }
+        fn sample_rate(&self) -> u32 {
+            24000
+        }
+        fn audio_format(&self) -> String {
+            "linear16".to_string()
+        }
+    }
+
+    #[derive(Default)]
+    struct CompleteCount(std::sync::atomic::AtomicUsize);
+    impl AudioCallback for CompleteCount {
+        fn on_audio(
+            &self,
+            _audio_data: AudioData,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+        fn on_error(
+            &self,
+            _error: TTSError,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+        fn on_complete(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+    }
+
+    /// An utterance submitted with its flush, as `submit_utterance` registers it.
+    fn submitted(shared: &WsShared, id: &str) {
+        let mut pending = shared.pending.lock();
+        pending.by_context.insert(
+            id.to_string(),
+            PendingUtterance {
+                cancel_token: CancellationToken::new(),
+                request_ts_ns: 0,
+                first_frame_seen: false,
+            },
+        );
+        pending.order.push_back(id.to_string());
+        pending.unflushed += 1;
+        pending.flush_sent();
+    }
+
+    /// Live (launch demo take 22, 28 Oct): Deepgram refused a flush ("Rate limit exceeded for
+    /// flushes"), and from then on each `Flushed` completed the utterance before the one it
+    /// was for, so no utterance was ever complete again. A refused flush is sent again, and
+    /// each `Flushed` completes the utterances its flush covered.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_flush_is_sent_again_and_completions_stay_in_step() {
+        let shared = Arc::new(WsShared::new());
+        let count = Arc::new(CompleteCount::default());
+        *shared.callback.lock() = Some(count.clone() as Arc<dyn AudioCallback>);
+        let protocol: Arc<dyn WsTtsProtocol> = Arc::new(FlushProtocol);
+        let (tx, mut rx) = mpsc::channel(8);
+        let frame = |raw: &'static str| {
+            let (shared, protocol, tx) = (shared.clone(), protocol.clone(), tx.clone());
+            async move { WebSocketTtsClient::handle_text_frame(&shared, &protocol, &tx, raw).await }
+        };
+
+        // a in synthesis, b's flush refused.
+        submitted(&shared, "a");
+        submitted(&shared, "b");
+        frame("refused").await;
+        assert_eq!(shared.pending.lock().unflushed, 1);
+        // a completes; b is still owed.
+        frame("flushed").await;
+        assert_eq!(count.0.load(Ordering::SeqCst), 0, "b is in flight");
+        // The flush is sent again after a second.
+        tokio::time::sleep(FLUSH_RETRY + Duration::from_millis(10)).await;
+        assert!(matches!(rx.try_recv(), Ok(Outbound::Frame(flush)) if flush == "Flush"));
+        frame("flushed").await;
+        assert_eq!(count.0.load(Ordering::SeqCst), 1, "b completed");
+        assert!(shared.pending.lock().order.is_empty());
+
+        // A refused flush that the next utterance's flush covers: one `Flushed` completes
+        // both, and no flush is sent again.
+        submitted(&shared, "c");
+        frame("refused").await;
+        submitted(&shared, "d");
+        assert_eq!(shared.pending.lock().flushes, [2]);
+        frame("flushed").await;
+        assert_eq!(count.0.load(Ordering::SeqCst), 2, "c and d completed");
+        tokio::time::sleep(FLUSH_RETRY_MAX).await;
+        assert!(rx.try_recv().is_err(), "nothing was owed any more");
+
+        // Refused again, the retry backs off.
+        let mut pending = PendingMap::default();
+        pending.unflushed = 1;
+        pending.flush_sent();
+        let waits: Vec<Option<Duration>> = (0..5)
+            .map(|_| {
+                let wait = pending.flush_refused();
+                pending.flush_sent();
+                wait
+            })
+            .collect();
+        let seconds = |s| Some(Duration::from_secs(s));
+        assert_eq!(
+            waits,
+            [seconds(1), seconds(2), seconds(4), seconds(8), seconds(8)]
+        );
     }
 
     #[tokio::test]
