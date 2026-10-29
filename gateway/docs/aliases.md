@@ -46,11 +46,50 @@ aliases:
 | `tts.base_url`, `tts.credential_ref` | The leg's own server and the credential sent to it. |
 | `tts.request_timeout_secs` | Synthesis timeout when the client names none. The default is 60 s; values are clamped to 1–300 s. |
 | `llm.base_url`, `llm.model`, `llm.system_prompt`, `llm.reasoning_effort`, `llm.reasoning_model`, `llm.provider_kind`, `llm.credential_ref` | LLM defaults. |
+| `llm.max_history` | How many messages a session keeps, the system prompt included, when the client names none. The default is 20. See [Conversation history](#conversation-history). |
+| `llm.summarize_target_tokens` | Summarize older turns once the session's context passes this many tokens (estimated), when the client names none. Off (0) by default. |
 | `dag_template` | Route the session through a server DAG template instead. |
 | `realtime.provider`, `realtime.model` | A vendor's own realtime API, relayed by standalone `/v1/realtime` (see [below](#relaying-to-a-vendors-realtime-api)). Both required. |
 | `realtime.base_url`, `realtime.credential_ref` | The vendor's address instead of its own host, and the credential sent to it. |
 | `realtime.voice`, `realtime.instructions` | The session's defaults; the client may change them. |
 | `openai_compatible` | Lets `/v1/audio/speech`, `/v1/audio/transcriptions` and `/v1/realtime` resolve the alias as `model`. |
+
+## Conversation history
+
+A session keeps its conversation for the LLM: the system prompt and up to `max_history` messages
+in all (20 unless the client or the alias sets it). When a new message takes it over that number,
+the oldest messages are removed **in one block**, down to about half of the room, and the window
+always starts at one of the caller's turns. The start of the prompt then stays the same for the
+next several turns, so an LLM server's prefix cache (llama.cpp's slot cache, vLLM's prefix caching,
+OpenAI's prompt caching) reuses everything but the newest turn. Releases up to 1.1.0 removed one
+message on every add, which changed the prompt's start on every turn and made the server re-read the
+whole conversation each time.
+
+Some rules always hold:
+
+- System messages are never removed.
+- The caller's last message is never removed. When the current turn alone is more than
+  `max_history` (a long tool loop, or many replies to a quiet caller), its oldest replies and
+  tool rounds go first.
+- A tool result is never kept without the call it answers.
+
+Size `max_history` to the model: the window holds from about half of it (a little less when a
+trim lands inside a turn with tool calls) up to all of it. To keep about 20 messages or more, set
+40. For example:
+
+```yaml
+aliases:
+  support:
+    llm:
+      base_url: "http://127.0.0.1:8080/v1"
+      model: local-chat
+      max_history: 40        # 20 to 40 messages, prefix reused between trims
+```
+
+A client's own `conversation_config.max_history` or `summarize_target_tokens` wins over the alias's,
+including a client that sends the default value. `summarize_target_tokens` asks the session's own
+LLM for the summary after a turn; on a server with one slot that request takes the slot, and the
+cached prefix with it, so prefer a larger `max_history` on a single-slot server.
 
 ## A leg's own server
 

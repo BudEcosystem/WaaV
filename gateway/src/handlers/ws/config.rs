@@ -176,9 +176,13 @@ pub struct ConversationWebSocketConfig {
     #[serde(default = "default_conversation_streaming")]
     pub streaming: bool,
 
-    /// Max retained history messages (default 20).
-    #[serde(default = "default_conversation_max_history")]
-    pub max_history: usize,
+    /// Max retained history messages, the system prompt included. Omitted: the alias's
+    /// `llm.max_history`, else 20. Once over it, the oldest messages go in a block, down to about
+    /// half, so the prompt's start (and an LLM server's prefix cache) holds between trims; the
+    /// current turn is never removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = 20))]
+    pub max_history: Option<usize>,
 
     /// Whether the bot's speech is interruptible / barge-in (default true).
     #[serde(default = "default_conversation_allow_interruption")]
@@ -205,11 +209,11 @@ pub struct ConversationWebSocketConfig {
 
     /// Token-aware context compaction (B-G6): when the session context's
     /// estimated tokens cross this value, older messages are summarized
-    /// after the turn (system + recent turns kept verbatim). Omitted/0 =
-    /// off.
-    #[serde(default)]
+    /// after the turn (system + recent turns kept verbatim). Omitted: the
+    /// alias's `llm.summarize_target_tokens`, else off; 0 = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(example = 6000))]
-    pub summarize_target_tokens: usize,
+    pub summarize_target_tokens: Option<usize>,
 
     /// User-mute strategy (A-G5): while active, USER INPUT is suppressed
     /// (bot/lifecycle signals always flow).
@@ -334,10 +338,6 @@ fn default_conversation_streaming() -> bool {
     true
 }
 
-fn default_conversation_max_history() -> usize {
-    20
-}
-
 fn default_conversation_allow_interruption() -> bool {
     true
 }
@@ -366,12 +366,14 @@ impl ConversationWebSocketConfig {
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             streaming: self.streaming,
-            max_history: self.max_history,
+            max_history: self
+                .max_history
+                .unwrap_or(crate::core::llm::DEFAULT_MAX_HISTORY),
             allow_interruption: self.allow_interruption,
             eager_eot: self.eager_eot,
             provider_kind: self.provider_kind,
             barge_in_min_words: self.barge_in_min_words,
-            summarize_target_tokens: self.summarize_target_tokens,
+            summarize_target_tokens: self.summarize_target_tokens.unwrap_or(0),
             mute_strategy: self.mute_strategy.clone(),
             strip_markdown: self.strip_markdown,
             user_idle_timeout_ms: self.user_idle_timeout_ms,

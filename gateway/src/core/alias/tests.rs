@@ -224,7 +224,7 @@ fn default_alias_conversation_uses_wire_defaults_without_static_expect() {
     assert_eq!(cfg.base_url, "");
     assert_eq!(cfg.model, "");
     assert!(cfg.streaming);
-    assert_eq!(cfg.max_history, 20);
+    assert_eq!(cfg.max_history, None);
     assert!(cfg.allow_interruption);
     assert!(cfg.strip_markdown);
 }
@@ -239,7 +239,7 @@ fn invalid_alias_conversation_wire_defaults_fall_back_without_panic() {
     assert_eq!(cfg.base_url, "");
     assert_eq!(cfg.model, "");
     assert!(cfg.streaming);
-    assert_eq!(cfg.max_history, 20);
+    assert_eq!(cfg.max_history, None);
     assert!(cfg.allow_interruption);
     assert!(cfg.strip_markdown);
 }
@@ -658,4 +658,84 @@ realtime: { provider: openai, model: m, base_url: "https://api.openai.com/v1", c
     // resource endpoint.
     let e = refused("openai_compatible: true\nrealtime: { provider: azure_openai, model: rt }\n");
     assert!(e.contains("api_base"), "{e}");
+}
+
+/// Gaia's report: an operator sizes the history of the sessions its alias serves. The alias
+/// fills `max_history` and `summarize_target_tokens` when the client names none, and the
+/// `ready` echo shows the window the session keeps.
+#[test]
+fn an_alias_sets_the_history_its_sessions_keep() {
+    let def = parse_def(
+        r#"
+kind: agent
+llm: { base_url: "http://127.0.0.1:8080/v1", model: chat, max_history: 40, summarize_target_tokens: 6000 }
+"#,
+    );
+    let (mut stt, mut tts, mut conv, mut dag) = (None, None, None, None);
+    let echo = splice_alias("voice", &def, &mut stt, &mut tts, &mut conv, &mut dag);
+
+    let conv = conv.unwrap();
+    assert_eq!(conv.max_history, Some(40));
+    assert_eq!(conv.summarize_target_tokens, Some(6000));
+    let core = conv.to_conversation_config();
+    assert_eq!(core.max_history, 40);
+    assert_eq!(core.summarize_target_tokens, 6000);
+    let echoed = echo.llm.unwrap();
+    assert_eq!(echoed.max_history, Some(40));
+    assert_eq!(echoed.summarize_target_tokens, Some(6000));
+}
+
+/// Client-wins is exact: a client that sends the default value (20 messages, summaries off)
+/// keeps it, and one that sends nothing gets the alias's, else the defaults.
+#[test]
+fn a_clients_own_history_settings_win_even_at_their_defaults() {
+    let def = parse_def(
+        r#"
+llm: { base_url: "http://127.0.0.1:8080/v1", model: chat, max_history: 40, summarize_target_tokens: 6000 }
+"#,
+    );
+    let client: ConversationWebSocketConfig = serde_json::from_value(serde_json::json!({
+        "base_url": "", "model": "", "max_history": 20, "summarize_target_tokens": 0
+    }))
+    .unwrap();
+    let (mut stt, mut tts, mut conv, mut dag) = (None, None, Some(client), None);
+    splice_alias("voice", &def, &mut stt, &mut tts, &mut conv, &mut dag);
+    let core = conv.unwrap().to_conversation_config();
+    assert_eq!(core.max_history, 20, "the client's 20 wins");
+    assert_eq!(core.summarize_target_tokens, 0, "the client's 0 (off) wins");
+
+    // Neither the client nor the alias: the defaults, as before.
+    let bare = parse_def(r#"llm: { model: chat }"#);
+    let omitted: ConversationWebSocketConfig =
+        serde_json::from_value(serde_json::json!({ "base_url": "", "model": "" })).unwrap();
+    let (mut stt, mut tts, mut conv, mut dag) = (None, None, Some(omitted), None);
+    let echo = splice_alias("bare", &bare, &mut stt, &mut tts, &mut conv, &mut dag);
+    let core = conv.unwrap().to_conversation_config();
+    assert_eq!(core.max_history, crate::core::llm::DEFAULT_MAX_HISTORY);
+    assert_eq!(core.summarize_target_tokens, 0);
+    assert_eq!(
+        echo.llm.unwrap().max_history,
+        Some(crate::core::llm::DEFAULT_MAX_HISTORY)
+    );
+}
+
+/// The wire accepts the fields omitted, as numbers, or as `null` (omitted), and leaves an
+/// omitted one out of what it writes back.
+#[test]
+fn the_wire_history_fields_are_optional() {
+    let null: ConversationWebSocketConfig = serde_json::from_value(serde_json::json!({
+        "base_url": "", "model": "", "max_history": null, "summarize_target_tokens": null
+    }))
+    .unwrap();
+    assert_eq!(null.max_history, None);
+    assert_eq!(null.summarize_target_tokens, None);
+    let written = serde_json::to_value(&null).unwrap();
+    assert!(written.get("max_history").is_none());
+    assert!(written.get("summarize_target_tokens").is_none());
+    assert!(
+        serde_json::from_value::<ConversationWebSocketConfig>(serde_json::json!({
+            "base_url": "", "model": "", "max_history": -1
+        }))
+        .is_err()
+    );
 }

@@ -214,7 +214,7 @@ impl Default for ConversationConfig {
             temperature: None,
             max_tokens: None,
             streaming: true,
-            max_history: 20,
+            max_history: crate::core::llm::DEFAULT_MAX_HISTORY,
             allow_interruption: true,
             eager_eot: false,
             provider_kind: None,

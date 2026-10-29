@@ -129,8 +129,97 @@ fn stream_idle_timeout() -> Option<Duration> {
     *IDLE.get_or_init(|| env_ms("WAAV_LLM_STREAM_IDLE_TIMEOUT_MS").map(Duration::from_millis))
 }
 
+/// The conversation history a session keeps when neither the client nor its alias sets
+/// `max_history`: 20 messages, the system prompt included.
+pub const DEFAULT_MAX_HISTORY: usize = 20;
+
 fn default_max_history() -> usize {
-    20
+    DEFAULT_MAX_HISTORY
+}
+
+/// Trim `messages` to `max_messages` in blocks, so the start of the conversation an LLM is sent
+/// stays the same for many turns and a server's prefix cache (llama.cpp's slot cache, vLLM's
+/// prefix caching, OpenAI's prompt caching) reuses all of it but the newest turn.
+///
+/// Nothing is removed until more than `max_messages` are held. Then, at once, the oldest
+/// non-system messages go until half of the non-system room is left (`ceil((max - systems) / 2)`),
+/// and on until the oldest one kept opens a turn (a user message), so the window never starts on
+/// an assistant reply or an orphaned tool result. System messages are never removed, and neither
+/// is the current turn's start: the last user message. When the current turn alone is over
+/// `max_messages` (a caller quiet through many replies, a long tool loop), its oldest replies and
+/// tool rounds go, a call with its results, but never the user message or the newest message.
+/// With no user message at all, the newest message (with the call its results answer) is kept
+/// and the window starts on a message that is not a tool result.
+///
+/// A history rebuilt by adding a growing list one message at a time (`set_context`) is cut at the
+/// same places each time, so a rebuild keeps its prefix too.
+pub fn trim_history(messages: &mut Vec<ChatMessage>, max_messages: usize) {
+    if messages.len() <= max_messages {
+        return;
+    }
+    let (current, has_user) = match messages.iter().rposition(|m| m.role == MessageRole::User) {
+        Some(at) => (at, true),
+        // The newest message, with the call its tool results answer.
+        None => {
+            let mut at = messages.len() - 1;
+            while at > 0 && messages[at].role == MessageRole::Tool {
+                at -= 1;
+            }
+            (at, false)
+        }
+    };
+    let systems = messages
+        .iter()
+        .filter(|m| m.role == MessageRole::System)
+        .count();
+    let floor = max_messages.saturating_sub(systems).div_ceil(2);
+    let opens_turn = |m: &ChatMessage| {
+        if has_user {
+            m.role == MessageRole::User
+        } else {
+            m.role != MessageRole::Tool
+        }
+    };
+    let mut others = messages.len() - systems;
+    let mut drop = vec![false; messages.len()];
+    for (at, m) in messages[..current].iter().enumerate() {
+        if m.role == MessageRole::System {
+            continue;
+        }
+        if others <= floor && opens_turn(m) {
+            break;
+        }
+        drop[at] = true;
+        others -= 1;
+    }
+    let mut at = 0;
+    messages.retain(|_| {
+        at += 1;
+        !drop[at - 1]
+    });
+    if !has_user {
+        return;
+    }
+    // The current turn alone over the cap: its oldest replies and rounds go.
+    let mut at = current + 1 - drop[..current].iter().filter(|d| **d).count();
+    while messages.len() > max_messages {
+        while at < messages.len() && messages[at].role == MessageRole::System {
+            at += 1;
+        }
+        let mut end = at + 1;
+        if messages
+            .get(at)
+            .is_some_and(|m| m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()))
+        {
+            while end < messages.len() && messages[end].role == MessageRole::Tool {
+                end += 1;
+            }
+        }
+        if end >= messages.len() {
+            break;
+        }
+        messages.drain(at..end);
+    }
 }
 
 /// Error type for the LLM client. Self-contained (no DAG dependency).
@@ -531,7 +620,7 @@ pub struct LlmClientConfig {
     /// Request timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    /// Maximum conversation history to maintain.
+    /// Maximum conversation history to maintain, trimmed in blocks ([`trim_history`]).
     #[serde(default = "default_max_history")]
     pub max_history: usize,
     /// Extra headers.
@@ -735,26 +824,9 @@ impl ConversationHistory {
     pub fn add(&mut self, message: ChatMessage) {
         self.version = self.version.wrapping_add(1);
         self.messages.push(message);
-        // Trim history to max_messages (keep system message if present).
-        while self.messages.len() > self.max_messages {
-            if let Some(idx) = self
-                .messages
-                .iter()
-                .position(|m| m.role != MessageRole::System)
-            {
-                self.messages.remove(idx);
-                // Pair-aware eviction (review wf_6783a4b3): the oldest
-                // non-system slot must never be left on a tool RESULT whose
-                // call was just (or previously) evicted — strict providers
-                // 400 on orphan tool messages. Any tool message now at the
-                // front is by definition an orphan: drop it with its call.
-                while idx < self.messages.len() && self.messages[idx].role == MessageRole::Tool {
-                    self.messages.remove(idx);
-                }
-            } else {
-                break;
-            }
-        }
+        // In blocks, from a turn's start: never an orphaned tool result (review wf_6783a4b3,
+        // strict providers 400 on one) and a prefix that holds between trims.
+        trim_history(&mut self.messages, self.max_messages);
     }
 
     /// Insert a context message WITHOUT breaking an open `tool_use` pairing.
@@ -1990,6 +2062,212 @@ mod tests {
             AdapterKind::Anthropic,
             "explicit kind wins"
         );
+    }
+
+    fn call(id: &str) -> ChatMessage {
+        let mut m = ChatMessage::assistant("");
+        m.tool_calls = Some(vec![ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "look_up".into(),
+                arguments: "{}".into(),
+            },
+        }]);
+        m
+    }
+
+    /// Every tool result follows the call it answers, and no message after the system prompt
+    /// is a tool result or an assistant reply opening the window.
+    fn assert_well_formed(messages: &[ChatMessage]) {
+        let mut open: Vec<String> = Vec::new();
+        for m in messages {
+            if let Some(calls) = &m.tool_calls {
+                open.extend(calls.iter().map(|c| c.id.clone()));
+            }
+            if m.role == MessageRole::Tool {
+                let id = m.tool_call_id.clone().unwrap_or_default();
+                assert!(
+                    open.contains(&id),
+                    "orphaned tool result {id}: {messages:?}"
+                );
+            }
+        }
+    }
+
+    /// Gaia's report: with one message removed per add, the message after the system prompt
+    /// changed every turn once 20 were held, so an LLM server's prefix cache reused only the
+    /// system prompt. Trimmed in blocks, the start holds for about five exchanges at a time.
+    #[test]
+    fn a_full_history_keeps_its_start_between_trims() {
+        let mut h = ConversationHistory::new(DEFAULT_MAX_HISTORY);
+        h.add(ChatMessage::system("You are a support agent."));
+        let mut starts = Vec::new();
+        for n in 0..40 {
+            h.add(ChatMessage::user(format!("question {n}")));
+            let sent = h.messages().to_vec();
+            assert!(sent.len() <= DEFAULT_MAX_HISTORY);
+            assert_eq!(sent[0].role, MessageRole::System);
+            assert_eq!(
+                sent[1].role,
+                MessageRole::User,
+                "the window opens on a turn"
+            );
+            assert_eq!(
+                sent.last().unwrap().content.as_deref(),
+                Some(&*format!("question {n}"))
+            );
+            starts.push(sent[1].content.clone());
+            h.add(ChatMessage::assistant(format!("answer {n}")));
+        }
+        let changes = starts.windows(2).filter(|w| w[0] != w[1]).count();
+        // Today's trim changed it on 30 of these 39 turns; in blocks, once per ~5 exchanges.
+        assert!(changes <= 8, "{changes} start changes: {starts:?}");
+        // Never below half the room: 10 of 19 non-system messages.
+        assert!(h.messages().len() > DEFAULT_MAX_HISTORY / 2);
+    }
+
+    /// A window smaller than a turn keeps the current turn: the request always carries the
+    /// user's message (before, `max_history` 0 or 1 sent the system prompt alone).
+    #[test]
+    fn a_tiny_window_keeps_the_current_turn() {
+        for max in 0..4 {
+            let mut h = ConversationHistory::new(max);
+            h.add(ChatMessage::system("sys"));
+            for n in 0..6 {
+                h.add(ChatMessage::user(format!("u{n}")));
+                let sent = h.messages();
+                assert_eq!(sent[0].role, MessageRole::System, "max {max}");
+                assert_eq!(
+                    sent.last().unwrap().content.as_deref(),
+                    Some(&*format!("u{n}"))
+                );
+                h.add(ChatMessage::assistant(format!("a{n}")));
+                assert!(
+                    h.messages()
+                        .iter()
+                        .any(|m| m.content.as_deref() == Some(&*format!("u{n}")))
+                );
+            }
+        }
+    }
+
+    /// A tool round longer than the window stays whole, and older rounds go with their calls.
+    #[test]
+    fn tool_rounds_are_never_split() {
+        let mut h = ConversationHistory::new(6);
+        h.add(ChatMessage::system("sys"));
+        for n in 0..12 {
+            h.add(ChatMessage::user(format!("u{n}")));
+            for k in 0..(n % 4) {
+                h.add(call(&format!("c{n}-{k}")));
+                assert_well_formed(h.messages());
+                h.add(ChatMessage::tool(format!("c{n}-{k}"), "result"));
+                assert_well_formed(h.messages());
+            }
+            h.add(ChatMessage::assistant(format!("a{n}")));
+            assert_well_formed(h.messages());
+            assert_eq!(h.messages()[1].role, MessageRole::User);
+        }
+    }
+
+    /// System messages added mid-history (async-tool notes, flow task messages) are kept, and
+    /// do not starve the conversation: the current turn still goes out.
+    #[test]
+    fn pinned_system_notes_never_push_out_the_current_turn() {
+        let mut h = ConversationHistory::new(4);
+        h.add(ChatMessage::system("sys"));
+        for n in 0..6 {
+            h.add(ChatMessage::user(format!("u{n}")));
+            h.add(ChatMessage::system(format!("note {n}")));
+            h.add(ChatMessage::assistant(format!("a{n}")));
+        }
+        h.add(ChatMessage::user("now"));
+        let sent = h.messages();
+        assert_eq!(sent.last().unwrap().content.as_deref(), Some("now"));
+        let systems = sent
+            .iter()
+            .filter(|m| m.role == MessageRole::System)
+            .count();
+        assert_eq!(systems, 7, "no system message is removed");
+    }
+
+    /// No user message at all (a context rebuilt from assistant and tool rounds): the newest
+    /// message and its call are kept, and the window never opens on a tool result.
+    #[test]
+    fn a_history_without_a_user_message_keeps_its_newest_round() {
+        let mut h = ConversationHistory::new(3);
+        h.add(ChatMessage::system("sys"));
+        for n in 0..5 {
+            h.add(ChatMessage::assistant(format!("a{n}")));
+            h.add(call(&format!("c{n}")));
+            h.add(ChatMessage::tool(format!("c{n}"), "result"));
+            assert_well_formed(h.messages());
+            assert_ne!(h.messages()[1].role, MessageRole::Tool);
+        }
+        assert_eq!(h.messages().last().unwrap().role, MessageRole::Tool);
+    }
+
+    /// A caller quiet through many replies (idle check-ins, an interaction provider's lines)
+    /// and a tool loop longer than the window: the turn is held to the cap, its user message and
+    /// newest message kept, no tool result without its call.
+    #[test]
+    fn a_long_current_turn_is_still_held_to_the_cap() {
+        let mut h = ConversationHistory::new(6);
+        h.add(ChatMessage::system("sys"));
+        h.add(ChatMessage::user("hello?"));
+        for n in 0..30 {
+            h.add(ChatMessage::assistant(format!("still there? {n}")));
+            assert!(h.messages().len() <= 6, "{:?}", h.messages());
+            assert_eq!(h.messages()[1].content.as_deref(), Some("hello?"));
+            assert_eq!(
+                h.messages().last().unwrap().content.as_deref(),
+                Some(&*format!("still there? {n}"))
+            );
+        }
+        let mut h = ConversationHistory::new(6);
+        h.add(ChatMessage::system("sys"));
+        h.add(ChatMessage::user("book it all"));
+        for n in 0..10 {
+            h.add(call(&format!("c{n}")));
+            assert_well_formed(h.messages());
+            h.add(ChatMessage::tool(format!("c{n}"), "done"));
+            assert_well_formed(h.messages());
+            assert!(h.messages().len() <= 6, "{:?}", h.messages());
+            assert_eq!(h.messages()[1].role, MessageRole::User);
+            assert_eq!(h.messages().last().unwrap().role, MessageRole::Tool);
+        }
+    }
+
+    /// A context rebuilt by adding a growing conversation one message at a time (interaction
+    /// runs, flows) is cut at the same places as a history that grew: each rebuild starts where
+    /// the last one did, except at a trim.
+    #[test]
+    fn a_rebuilt_context_starts_where_the_last_rebuild_did() {
+        let mut said = vec![ChatMessage::system("sys")];
+        let mut grown = ConversationHistory::new(10);
+        grown.add(said[0].clone());
+        let mut starts = Vec::new();
+        for n in 0..30 {
+            for m in [
+                ChatMessage::user(format!("u{n}")),
+                ChatMessage::assistant(format!("a{n}")),
+            ] {
+                said.push(m.clone());
+                grown.add(m);
+            }
+            let mut rebuilt = ConversationHistory::new(10);
+            for m in &said {
+                rebuilt.add(m.clone());
+            }
+            let contents = |h: &ConversationHistory| -> Vec<Option<String>> {
+                h.messages().iter().map(|m| m.content.clone()).collect()
+            };
+            assert_eq!(contents(&rebuilt), contents(&grown));
+            starts.push(rebuilt.messages()[1].content.clone());
+        }
+        let changes = starts.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(changes <= 13, "{changes}: {starts:?}");
     }
 
     #[test]

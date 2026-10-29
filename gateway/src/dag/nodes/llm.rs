@@ -49,7 +49,7 @@ fn default_timeout_ms() -> u64 {
 }
 
 fn default_max_history() -> usize {
-    20
+    crate::core::llm::DEFAULT_MAX_HISTORY
 }
 
 /// LLM endpoint configuration (DAG-node-facing).
