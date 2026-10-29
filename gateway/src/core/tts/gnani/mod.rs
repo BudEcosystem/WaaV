@@ -1,69 +1,40 @@
 //! Gnani.ai Text-to-Speech Provider
 //!
-//! This module provides integration with Gnani.ai's TTS service,
-//! supporting 12 Indian language variants with multi-speaker voices
-//! and SSML gender selection.
+//! Gnani's REST text-to-speech API (docs.gnani.ai, "Text-to-Speech (REST)"):
+//! `POST https://api.vachana.ai/api/v1/tts/inference` with the `X-API-Key-ID` header. The former
+//! `asr.gnani.ai/synthesize` (token + access key) is not in Gnani's docs, and the host sends no HTTP
+//! response.
 //!
-//! ## Features
+//! ## Models and voices
 //!
-//! - 12 language support (Hindi, Kannada, Tamil, Telugu, etc.)
-//! - Multi-speaker voices (10+ voices per language)
-//! - Single-speaker voices with SSML gender selection
-//! - PCM16 audio output at 8000 Hz
+//! - `timbre-v3.0` (default): 13 voices, each speaks all ten languages. A session that names no
+//!   voice gets Shivani (female) or Avinash (male).
+//! - `timbre-v2.5`: 42 voices, one preferred language each; the default is the language's preferred
+//!   voice of the gender.
+//!
+//! A voice belongs to one model (Gnani answers 400 otherwise), so naming a voice selects its model.
+//! `voice_id` may instead be a language code (`Hi-IN`, the former convention); `model` may name the
+//! model or, as before, `MALE`/`FEMALE`.
+//!
+//! ## Languages
+//!
+//! Hindi, English, Tamil, Telugu, Kannada, Malayalam, Marathi, Punjabi, Bengali and Gujarati
+//! (`hi-IN`, `en-IN`, ...). The former `Hi-IN-al` is Hindi; Nepali has no voice and is refused.
 //!
 //! ## Authentication
 //!
-//! Gnani requires two credentials (provided via email after registration):
-//! - Token (`GNANI_TOKEN`)
-//! - Access Key (`GNANI_ACCESS_KEY`)
+//! One API key from Gnani's console, sent as `X-API-Key-ID`: the server's `GNANI_TOKEN` (or the
+//! session's `api_key`). `GNANI_ACCESS_KEY` is not used for text-to-speech.
 //!
-//! SSL certificate is optional for TTS (unlike STT which requires it).
+//! ## Audio
 //!
-//! ## Usage
-//!
-//! ```ignore
-//! use waav_gateway::core::tts::{create_tts_provider, TTSConfig};
-//!
-//! let config = TTSConfig {
-//!     provider: "gnani".to_string(),
-//!     voice_id: Some("Hi-IN".to_string()),
-//!     ..Default::default()
-//! };
-//!
-//! let mut tts = create_tts_provider("gnani", config)?;
-//! tts.connect().await?;
-//! tts.speak("नमस्ते दुनिया", false).await?;
-//! ```
-//!
-//! ## Supported Languages
-//!
-//! ### Single-Speaker Mode (ssmlGender: MALE/FEMALE)
-//!
-//! | Language | Code | Gender Support |
-//! |----------|------|----------------|
-//! | English (India) | En-IN | Male, Female |
-//! | Hindi | Hi-IN | Male, Female |
-//! | Hindi (Alternate) | Hi-IN-al | Male, Female |
-//! | Kannada | Kn-IN | Male, Female |
-//! | Tamil | Ta-IN | Male, Female |
-//! | Telugu | Te-IN | Male, Female |
-//! | Marathi | Mr-IN | Female only |
-//!
-//! ### Multi-Speaker Mode (voice name selection)
-//!
-//! All languages support multi-speaker mode with 10+ voices each:
-//! - En-IN, Hi-IN, Hi-IN-al, Kn-IN, Ta-IN, Te-IN, Mr-IN
-//! - Ml-IN (Malayalam), Gu-IN (Gujarati), Bn-IN (Bengali)
-//! - Pa-IN (Punjabi), Ne-NP (Nepali)
-//!
-//! ## Rate Limits
-//!
-//! - Contact hello@gnani.ai for commercial access
+//! Raw 16-bit mono PCM (`container: raw`, `encoding: linear_pcm`) at the session's sample rate
+//! (8000 by default; 8000, 16000, 22050, 24000, 44100 or 48000).
 
 mod config;
 mod provider;
 
-pub use config::{GnaniGender, GnaniTTSConfig, GnaniTTSLanguage};
+pub use config::{GnaniGender, GnaniModel, GnaniTTSConfig, GnaniTTSLanguage};
 pub use provider::GnaniTTS;
 
 #[cfg(test)]
