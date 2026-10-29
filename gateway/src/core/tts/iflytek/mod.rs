@@ -49,15 +49,20 @@
 //!
 //! | Voice Code | Language | Description |
 //! |------------|----------|-------------|
-//! | xiaoyan | Chinese | Standard female |
-//! | aisjiuxu | Chinese | Young male |
-//! | aisxping | Chinese | Female broadcaster |
-//! | aisjinger | Chinese | Sweet female |
-//! | aisbabyxu | Chinese | Child voice |
-//! | john_ce | English | American male |
-//! | catherine | English | American female |
-//! | luna | Japanese | Japanese female |
-//! | anjali | Hindi | Hindi female |
+//! Each is sent as the SG host's voice table lists it (global.xfyun.cn, "Available Voices"); the
+//! former names (in brackets) still parse. Any other name is sent as given.
+//!
+//! | Voice Code | Language | Description |
+//! |------------|----------|-------------|
+//! | x_xiaoyan (`xiaoyan`) | Chinese | Female (default) |
+//! | x_yifeng (`aisjiuxu`) | Chinese | Male |
+//! | x_xiaolin (`aisxping`) | Chinese | Female |
+//! | x_xiaomei (`aisjinger`) | Chinese | Female |
+//! | x_xiaoyang_story (`aisbabyxu`) | Chinese | Female, story |
+//! | x_john_ce (`john_ce`) | English | Male |
+//! | x_catherine_ce (`catherine`) | English | Female |
+//! | qianhui (`luna`) | Japanese | Female |
+//! | abha (`anjali`) | Hindi | Female |
 //!
 //! # Audio Formats
 //!
@@ -179,9 +184,9 @@ mod tests {
     fn test_available_voices() {
         let voices = IFlytekTtsConfig::available_voices();
         assert!(voices.len() >= 9);
-        assert!(voices.contains(&"xiaoyan"));
-        assert!(voices.contains(&"john_ce"));
-        assert!(voices.contains(&"luna"));
+        assert!(voices.contains(&"x_xiaoyan"));
+        assert!(voices.contains(&"x_john_ce"));
+        assert!(voices.contains(&"qianhui"));
     }
 
     #[tokio::test]

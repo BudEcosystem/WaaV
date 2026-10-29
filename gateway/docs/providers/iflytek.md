@@ -135,7 +135,7 @@ iFlytek uses HMAC-SHA256 signature-based authentication.
   "business": {
     "aue": "raw",
     "auf": "audio/L16;rate=16000",
-    "vcn": "xiaoyan",
+    "vcn": "x_xiaoyan",
     "speed": 50,
     "volume": 50,
     "pitch": 50,
@@ -199,7 +199,7 @@ iFlytek uses HMAC-SHA256 signature-based authentication.
 
 | Parameter | Description | Values | Default |
 |-----------|-------------|--------|---------|
-| vcn | Voice/speaker name | xiaoyan, john_ce, etc. | xiaoyan |
+| vcn | Voice/speaker name | x_xiaoyan, x_john_ce, etc. | x_xiaoyan |
 | speed | Speech rate | 0-100 | 50 |
 | volume | Volume level | 0-100 | 50 |
 | pitch | Pitch level | 0-100 | 50 |
@@ -213,15 +213,20 @@ iFlytek uses HMAC-SHA256 signature-based authentication.
 
 | Voice Code (vcn) | Language | Gender | Description |
 |------------------|----------|--------|-------------|
-| xiaoyan | Chinese | Female | Standard Mandarin (default) |
-| aisjiuxu | Chinese | Male | Young male voice |
-| aisxping | Chinese | Female | Female broadcaster |
-| aisjinger | Chinese | Female | Sweet female voice |
-| aisbabyxu | Chinese | Child | Child voice |
-| john_ce | English | Male | American English male |
-| catherine | English | Female | American English female |
-| luna | Japanese | Female | Japanese female |
-| anjali | Hindi | Female | Hindi female |
+| x_xiaoyan | Chinese | Female | Standard Mandarin (default) |
+| x_yifeng | Chinese | Male | |
+| x_xiaolin, x_xiaomei, x_xiaoyuan, x_xiaoxi, x_xiaoxue, x_xiaofeng, x_laoma, x_xiaoyang_story | Chinese | Female | |
+| x3_xiaoyue | Cantonese | Female | |
+| x_john_ce | English | Male | |
+| x_catherine_ce | English | Female | |
+| qianhui | Japanese | Female | |
+| abha, mohita | Hindi | Female | |
+
+These are the SG host's voice table (global.xfyun.cn, "Available Voices"; the gateway calls
+`tts-api-sg.xf-yun.com`). The gateway's former built-in names are sent as one of these:
+`xiaoyan` → `x_xiaoyan`, `aisjiuxu` → `x_yifeng`, `aisxping` → `x_xiaolin`, `aisjinger` →
+`x_xiaomei`, `aisbabyxu` → `x_xiaoyang_story`, `john_ce` → `x_john_ce`, `catherine` →
+`x_catherine_ce`, `luna` → `qianhui`, `anjali` → `abha`. Any other name is sent as given.
 
 > **Note:** Additional voices must be enabled in the iFlytek console before use. Attempting to use a non-enabled voice returns error 11200.
 

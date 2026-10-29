@@ -294,18 +294,16 @@ impl BhashiniTtsConfig {
 }
 
 impl BhashiniLanguage {
-    /// Get the TTS service ID for this language.
+    /// Get the TTS service ID for this language: AI4Bharat's three Coqui models, routed as
+    /// AI4Bharat routes them (`models.ai4bharat.org` backend: `hi` and `as` are `indo_aryan`; there
+    /// is no Hindi-only TTS service). Used only when the pipeline config names none.
     pub fn tts_service_id(&self) -> &'static str {
-        // Bhashini TTS uses AI4Bharat models for most languages
+        if matches!(self, Self::Assamese) {
+            return "ai4bharat/indic-tts-coqui-indo_aryan-gpu--t4";
+        }
         match self.family() {
             LanguageFamily::Dravidian => "ai4bharat/indic-tts-coqui-dravidian-gpu--t4",
-            LanguageFamily::IndoAryan => {
-                if matches!(self, Self::Hindi) {
-                    "ai4bharat/indic-tts-coqui-hi-gpu--t4"
-                } else {
-                    "ai4bharat/indic-tts-coqui-indo_aryan-gpu--t4"
-                }
-            }
+            LanguageFamily::IndoAryan => "ai4bharat/indic-tts-coqui-indo_aryan-gpu--t4",
             // The Misc family uses a single coqui model regardless of English vs other languages
             // (both branches were identical — collapsed; clippy if_same_then_else).
             LanguageFamily::Misc => "ai4bharat/indic-tts-coqui-misc-gpu--t4",
@@ -430,16 +428,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tts_service_id() {
-        assert!(BhashiniLanguage::Hindi.tts_service_id().contains("hi"));
-        assert!(
-            BhashiniLanguage::Tamil
-                .tts_service_id()
-                .contains("dravidian")
-        );
-    }
-
-    #[test]
     fn test_config_validation() {
         let mut config = BhashiniTtsConfig::default();
         assert!(config.validate().is_err());
@@ -472,5 +460,30 @@ mod tests {
             .validate()
             .expect_err("non-HTTP endpoint_override must be rejected");
         assert!(err.to_string().contains("SSRF protection"), "{err}");
+    }
+
+    /// The fallback TTS service ids are AI4Bharat's own routing (no `-hi-` service exists).
+    #[test]
+    fn tts_service_ids_follow_ai4bharats_routing() {
+        let id = |l: BhashiniLanguage| l.tts_service_id();
+        for l in [
+            BhashiniLanguage::Hindi,
+            BhashiniLanguage::Assamese,
+            BhashiniLanguage::Bengali,
+        ] {
+            assert_eq!(
+                id(l),
+                "ai4bharat/indic-tts-coqui-indo_aryan-gpu--t4",
+                "{l:?}"
+            );
+        }
+        assert_eq!(
+            id(BhashiniLanguage::Tamil),
+            "ai4bharat/indic-tts-coqui-dravidian-gpu--t4"
+        );
+        assert_eq!(
+            id(BhashiniLanguage::English),
+            "ai4bharat/indic-tts-coqui-misc-gpu--t4"
+        );
     }
 }
