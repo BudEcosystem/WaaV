@@ -2,15 +2,26 @@
 
 All notable changes to WaaV Gateway will be documented in this file.
 
-## [Unreleased]
+## [1.2.0] - 2026-10-29
+
+Everything merged to `main` after 1.1.0 (#45, #47-#54). Upgrade note: an alias whose `stt`, `tts`, `llm` or `realtime` leg names a `credential_ref` that is undeclared, bound to another host, or (on `stt`/`tts`/`realtime`) set without a `base_url` used to start and fail every session on that leg; it is now refused at startup, naming the alias and leg (#51).
 
 ### Bug Fixes
 
-- **A long voice session keeps its prompt's start, so the LLM server's prefix cache works.** Once a session held `max_history` messages (20 by default), every new message removed the oldest one, so the message after the system prompt changed on every turn and llama.cpp, vLLM or OpenAI could reuse only the system prompt: each turn re-read the whole conversation before the first word. History is now trimmed in blocks, down to about half the window, starting at one of the caller's turns, so the start holds for the next several turns. The caller's current message is never removed (a window of 0 or 1 used to send the system prompt without it), a turn longer than the window keeps its newest messages, system messages are kept, and a tool result is never kept without its call. The same rule trims the conversation interaction mode gives a background run. Reported by the Gaia team.
+- **A long voice session keeps its prompt's start, so the LLM server's prefix cache works.** Once a session held `max_history` messages (20 by default), every new message removed the oldest one, so the message after the system prompt changed on every turn and llama.cpp, vLLM or OpenAI could reuse only the system prompt: each turn re-read the whole conversation before the first word. History is now trimmed in blocks, down to about half the window, starting at one of the caller's turns, so the start holds for the next several turns. The caller's current message is never removed (a window of 0 or 1 used to send the system prompt without it), a turn longer than the window keeps its newest messages, system messages are kept, and a tool result is never kept without its call. The same rule trims the conversation interaction mode gives a background run. Reported by the Gaia team (#54).
+- **Startup checks every alias leg's `credential_ref`** (#51), not only the realtime block's: the credential must be declared and allowed to reach the leg's server, and `waav-gateway check` reports the same problems.
+- **Unreal Speech sends V8 voice ids to the V8 API** (#52). The provider called V8 with V7 ids and lowercased unknown ids. It now knows V8's 38 voices (default `Sierra`), maps the five V7 ids to a V8 voice of the same gender with a warning, sends other ids as given, accepts the `48k` bitrate, and lists its voices on `GET /voices`.
+- **Alibaba CosyVoice and Tencent default voices are ones the vendors list** (#53). CosyVoice picks the model's documented default for the region (`longxiaochun_v3`, `longwan_v3`, `longanhuan`, `longxiaochun_v2`; `Cherry` on Qwen) and maps v1 names to their successor with a warning; Tencent defaults to `1001` instead of the unlisted `0`, and an unknown name gets that default with a warning.
+- **Interaction mode stops repeating lines, losing task updates and misreading follow-ups** (#49): one narration length limit shared by the prompt, grammar and guard (long lines are cut at a clause instead of refused); version numbers no longer end a sentence; an update must carry its own task's result and not repeat a recent line; a relay sentence mostly heard before an urgent cut is not replayed; template lines skip a wording just said; and a turn after a finished task is no longer always read as a follow-up (thanks get the persona's thanks line, other work goes to the orchestrator).
 
 ### Features
 
-- **Aliases set the history of the sessions they serve:** `llm.max_history` and `llm.summarize_target_tokens` (see `docs/aliases.md`, Conversation history). A client's own value still wins, including one that sends the default; `conversation_config.max_history` and `summarize_target_tokens` may now be omitted or `null` on the wire. The `ready` message's `resolved_alias.llm` shows the window the session keeps.
+- **Aliases set the history of the sessions they serve:** `llm.max_history` and `llm.summarize_target_tokens` (see `docs/aliases.md`, Conversation history). A client's own value still wins, including one that sends the default; `conversation_config.max_history` and `summarize_target_tokens` may now be omitted or `null` on the wire. The `ready` message's `resolved_alias.llm` shows the window the session keeps (#54).
+- **A standalone alias can relay `/v1/realtime` to a vendor's realtime API** (#45): an alias `realtime:` block (`provider`, `model`, `base_url`, `credential_ref`, `voice`, `instructions`) for OpenAI Realtime, Azure OpenAI, Grok, and the translated Gemini, Deepgram Voice Agent, ElevenLabs ConvAI and Hume EVI, on a gateway without the Bud control plane. Before, such an alias was refused `alias_not_realtime`. See `docs/aliases.md`.
+
+### Documentation
+
+- The repository root is organised into `docs/`, the README is rewritten with a regional coverage map and the audio models WaaV runs, and the interaction mode paper, launch video and demo are in `docs/launch` (#47, #48, #50).
 
 ## [1.1.0] - 2026-10-27
 

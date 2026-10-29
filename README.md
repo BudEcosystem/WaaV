@@ -117,8 +117,8 @@ which lets file-only recognisers such as Whisper serve live calls.
 
 ```bash
 ARCH=x86_64   # or aarch64
-curl -fsSLO https://github.com/BudEcosystem/WaaV/releases/download/1.1.0/waav-gateway-1.1.0-linux-$ARCH.tar.gz
-tar xzf waav-gateway-1.1.0-linux-$ARCH.tar.gz && cd waav-gateway-1.1.0-linux-$ARCH
+curl -fsSLO https://github.com/BudEcosystem/WaaV/releases/download/1.2.0/waav-gateway-1.2.0-linux-$ARCH.tar.gz
+tar xzf waav-gateway-1.2.0-linux-$ARCH.tar.gz && cd waav-gateway-1.2.0-linux-$ARCH
 
 export DEEPGRAM_API_KEY=your-deepgram-key   # the examples below use Deepgram
 ./waav-gateway                              # listens on http://localhost:3001
