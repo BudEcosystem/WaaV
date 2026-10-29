@@ -3,7 +3,6 @@
 //! Implements the BaseTTS trait for Gnani's Text-to-Speech REST API.
 
 use async_trait::async_trait;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
@@ -78,18 +77,9 @@ impl GnaniTTS {
 
     /// Build HTTP client
     fn build_client(config: &GnaniTTSConfig) -> TTSResult<reqwest::Client> {
-        let mut builder =
+        let builder =
             crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
                 .timeout(std::time::Duration::from_secs(config.request_timeout_secs));
-
-        // Add certificate if provided (optional for TTS)
-        if let Some(ref path) = config.certificate_path
-            && path.exists()
-            && let Ok(cert_pem) = std::fs::read(path)
-            && let Ok(cert) = reqwest::Certificate::from_pem(&cert_pem)
-        {
-            builder = builder.add_root_certificate(cert);
-        }
 
         builder.build().map_err(|e| {
             TTSError::InvalidConfiguration(format!("Failed to build HTTP client: {}", e))
@@ -108,29 +98,13 @@ impl GnaniTTS {
             .as_ref()
             .ok_or_else(|| TTSError::ProviderNotReady("Not connected".to_string()))?;
 
-        // Build request body
-        let request_body = GnaniTTSRequest {
-            input: GnaniInput {
-                text: text.to_string(),
-            },
-            voice: GnaniVoice {
-                language_code: config.language_code.as_str().to_string(),
-                name: config
-                    .voice_name
-                    .clone()
-                    .unwrap_or_else(|| "gnani".to_string()),
-                ssml_gender: config.ssml_gender.as_str().to_string(),
-            },
-            audio_config: GnaniAudioConfig {
-                audio_encoding: "pcm16".to_string(),
-                sample_rate: config.output_sample_rate,
-            },
-        };
+        let request_body = GnaniTTSRequest::from_config(config, text);
 
         debug!(
             text_len = text.len(),
-            language = %config.language_code.as_str(),
-            gender = %config.ssml_gender.as_str(),
+            model = config.model.as_str(),
+            voice = %request_body.voice,
+            language = request_body.language,
             "Gnani TTS synthesis request"
         );
 
@@ -139,10 +113,7 @@ impl GnaniTTS {
                 config.endpoint(),
                 config.endpoint_override.as_deref(),
             ))
-            .header("token", &config.token)
-            .header("accesskey", &config.access_key)
-            .header("lang", config.language_code.as_str())
-            .header("product", "tts")
+            .header("X-API-Key-ID", &config.api_key)
             .header("Content-Type", "application/json")
             .json(&request_body)
             .send()
@@ -158,15 +129,12 @@ impl GnaniTTS {
             )));
         }
 
-        let result: GnaniTTSResponse = response
-            .json()
+        // `container: raw` with `linear_pcm`: the body is 16-bit PCM, no header.
+        let audio_bytes = response
+            .bytes()
             .await
-            .map_err(|e| TTSError::ProviderError(format!("Failed to parse response: {}", e)))?;
-
-        // Decode base64 audio
-        let audio_bytes = BASE64
-            .decode(&result.audio_content)
-            .map_err(|e| TTSError::AudioGenerationFailed(format!("Base64 decode error: {}", e)))?;
+            .map_err(|e| TTSError::ProviderError(format!("Failed to read audio: {}", e)))?
+            .to_vec();
 
         debug!(
             audio_bytes = audio_bytes.len(),
@@ -297,57 +265,58 @@ impl BaseTTS for GnaniTTS {
         serde_json::json!({
             "provider": "gnani",
             "name": "Gnani.ai TTS",
-            "description": "Multi-speaker Indic TTS with 12 language support",
+            "description": "Indic TTS (Timbre v3.0 and v2.5) in ten languages",
             "api_type": "HTTP REST",
-            "endpoint": "https://asr.gnani.ai/synthesize",
-            "features": ["multi-speaker", "ssml-gender", "indic-languages"],
+            "endpoint": super::config::GNANI_TTS_ENDPOINT,
+            "features": ["indic-languages"],
+            "models": ["timbre-v3.0", "timbre-v2.5"],
             "supported_languages": [
-                "En-IN", "Hi-IN", "Kn-IN", "Ta-IN", "Te-IN", "Mr-IN",
-                "Ml-IN", "Gu-IN", "Bn-IN", "Pa-IN", "Ne-NP"
+                "hi-IN", "en-IN", "ta-IN", "te-IN", "kn-IN",
+                "ml-IN", "mr-IN", "pa-IN", "bn-IN", "gu-IN"
             ]
         })
     }
 }
 
-/// Gnani TTS request structure
+/// The `/api/v1/tts/inference` body (docs.gnani.ai, "Text-to-Speech (REST)").
 #[derive(Debug, Clone, serde::Serialize)]
 struct GnaniTTSRequest {
-    input: GnaniInput,
-    voice: GnaniVoice,
-    #[serde(rename = "audioConfig")]
+    text: String,
+    voice: String,
+    model: &'static str,
+    language: &'static str,
+    speed: f32,
     audio_config: GnaniAudioConfig,
 }
 
-/// Input text for TTS
-#[derive(Debug, Clone, serde::Serialize)]
-struct GnaniInput {
-    text: String,
+impl GnaniTTSRequest {
+    fn from_config(config: &GnaniTTSConfig, text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            voice: config.resolved_voice(),
+            model: config.model.as_str(),
+            // `validate` refuses a language without an API code; `auto` is never reached.
+            language: config.language_code.api_code().unwrap_or("auto"),
+            speed: config.speed.clamp(0.85, 1.15),
+            audio_config: GnaniAudioConfig {
+                sample_rate: config.output_sample_rate,
+                num_channels: 1,
+                sample_width: 2,
+                encoding: "linear_pcm",
+                container: "raw",
+            },
+        }
+    }
 }
 
-/// Voice configuration
-#[derive(Debug, Clone, serde::Serialize)]
-struct GnaniVoice {
-    #[serde(rename = "languageCode")]
-    language_code: String,
-    name: String,
-    #[serde(rename = "ssmlGender")]
-    ssml_gender: String,
-}
-
-/// Audio output configuration
+/// Audio output configuration: raw 16-bit mono PCM at the session's rate.
 #[derive(Debug, Clone, serde::Serialize)]
 struct GnaniAudioConfig {
-    #[serde(rename = "audioEncoding")]
-    audio_encoding: String,
-    #[serde(rename = "sampleRate")]
     sample_rate: u32,
-}
-
-/// Gnani TTS response structure
-#[derive(Debug, Clone, serde::Deserialize)]
-struct GnaniTTSResponse {
-    #[serde(rename = "audioContent")]
-    audio_content: String, // Base64 encoded PCM16 audio
+    num_channels: u8,
+    sample_width: u8,
+    encoding: &'static str,
+    container: &'static str,
 }
 
 #[cfg(test)]
@@ -408,8 +377,7 @@ mod tests {
         });
 
         let mut config = GnaniTTSConfig::default();
-        config.token = "test-token".to_string();
-        config.access_key = "test-access-key".to_string();
+        config.api_key = "test-api-key".to_string();
         let client = GnaniTTS::build_client(&config).expect("construct Gnani TTS client");
         let err = client
             .get(format!("http://{addr}/start"))
@@ -473,28 +441,126 @@ mod tests {
         assert!(!info["features"].as_array().unwrap().is_empty());
     }
 
+    /// The body is the documented `/api/v1/tts/inference` shape: an old language-code voice
+    /// becomes `language`, the default voice is Timbre v3.0's for the gender, audio is raw PCM.
     #[test]
     fn test_gnani_tts_request_serialization() {
-        let request = GnaniTTSRequest {
-            input: GnaniInput {
-                text: "नमस्ते".to_string(),
-            },
-            voice: GnaniVoice {
-                language_code: "Hi-IN".to_string(),
-                name: "gnani".to_string(),
-                ssml_gender: "FEMALE".to_string(),
-            },
-            audio_config: GnaniAudioConfig {
-                audio_encoding: "pcm16".to_string(),
-                sample_rate: 8000,
-            },
-        };
+        let mut config = GnaniTTSConfig::from_base(create_test_config()).unwrap();
+        config.api_key = "test-api-key".to_string();
+        let body = serde_json::to_value(GnaniTTSRequest::from_config(&config, "नमस्ते")).unwrap();
+        assert_eq!(body["text"], "नमस्ते");
+        assert_eq!(body["model"], "timbre-v3.0");
+        assert_eq!(body["voice"], "Shivani");
+        assert_eq!(body["language"], "hi-IN");
+        assert_eq!(body["speed"], 1.0);
+        assert_eq!(body["audio_config"]["sample_rate"], 8000);
+        assert_eq!(body["audio_config"]["encoding"], "linear_pcm");
+        assert_eq!(body["audio_config"]["container"], "raw");
 
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("नमस्ते"));
-        assert!(json.contains("Hi-IN"));
-        assert!(json.contains("FEMALE"));
-        assert!(json.contains("8000"));
+        // A Timbre v2.5 voice selects its model (a v2.5 voice sent with v3.0 is a 400).
+        let mut base = create_test_config();
+        base.voice_id = Some("nalini".to_string());
+        let config = GnaniTTSConfig::from_base(base).unwrap();
+        let body = serde_json::to_value(GnaniTTSRequest::from_config(&config, "x")).unwrap();
+        assert_eq!(
+            (body["model"].as_str(), body["voice"].as_str()),
+            (Some("timbre-v2.5"), Some("Nalini"))
+        );
+    }
+
+    /// End to end against a local server: the request reaches the documented endpoint path with
+    /// `X-API-Key-ID` and the JSON body, and the raw PCM response is the audio.
+    #[tokio::test(flavor = "current_thread")]
+    async fn synthesis_sends_the_documented_request_and_returns_the_pcm() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct RestoreLoopbackFlag(Option<String>);
+        impl Drop for RestoreLoopbackFlag {
+            fn drop(&mut self) {
+                // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+                unsafe {
+                    if let Some(previous) = self.0.take() {
+                        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+                    } else {
+                        std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+                    }
+                }
+            }
+        }
+        let _restore_loopback =
+            RestoreLoopbackFlag(std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS").ok());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Gnani mock");
+        let addr = listener.local_addr().expect("local addr");
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Headers, then the body (`Content-Length`).
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let length = text[..head_end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let _ = seen_tx.send(String::from_utf8_lossy(&request).into_owned());
+            let pcm = [1u8, 0, 2, 0];
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                pcm.len()
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, head.as_bytes()).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &pcm).await;
+        });
+
+        let mut base = create_test_config();
+        base.api_key = "test-api-key".to_string();
+        let mut tts = GnaniTTS::create(base).unwrap();
+        if let Some(config) = tts.config.as_mut() {
+            config.endpoint_override = Some(format!("http://{addr}"));
+        }
+        tts.connect().await.expect("connect");
+        let audio = tts.synthesize("नमस्ते").await.expect("synthesize");
+        assert_eq!(audio, vec![1u8, 0, 2, 0]);
+
+        let request = seen_rx.await.expect("the mock saw the request");
+        assert!(
+            request.starts_with("POST /api/v1/tts/inference "),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-api-key-id: test-api-key"),
+            "{request}"
+        );
+        assert!(request.contains(r#""model":"timbre-v3.0""#), "{request}");
+        assert!(request.contains(r#""language":"hi-IN""#), "{request}");
     }
 
     #[tokio::test]
