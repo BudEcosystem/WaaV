@@ -242,7 +242,7 @@ pub const STT_FEATURE_SUPPORT: &[FeatureSupport] = &[
         provider: "gnani",
         module: "gnani",
         batch_builder: None,
-        features: &["interim_results"],
+        features: &[],
     },
     FeatureSupport {
         provider: "google",

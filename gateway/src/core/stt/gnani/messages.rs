@@ -1,371 +1,149 @@
-//! Gnani.ai STT Message Types
+//! Gnani.ai realtime STT wire messages.
 //!
-//! Message types for Gnani's Speech-to-Text gRPC streaming API.
-//! These types match Gnani's proto definitions for the Listener service.
-//!
-//! ## gRPC Service Definition
-//!
-//! ```protobuf
-//! service Listener {
-//!     rpc DoSpeechToText(stream SpeechChunk) returns (stream TranscriptChunk);
-//! }
-//! ```
+//! Up: raw PCM s16le mono binary frames of exactly [`GNANI_STT_FRAME_BYTES`] bytes, and the
+//! [`COMMIT_MESSAGE`] text frame that closes the open utterance. Down: JSON text frames with a
+//! `type` discriminator (docs.gnani.ai, "Realtime streaming" → "Server messages").
 
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use bytes::{Bytes, BytesMut};
+use serde::Deserialize;
 
-/// Audio chunk sent to Gnani for streaming recognition.
-///
-/// This maps to the gRPC `SpeechChunk` message:
-/// ```protobuf
-/// message SpeechChunk {
-///     bytes content = 1;
-///     string token = 2;
-///     string lang = 3;
-///     string demo = 4;
-/// }
-/// ```
-#[derive(Debug, Clone)]
-pub struct SpeechChunk {
-    /// Raw audio content (PCM16, 16kHz, mono)
-    pub content: Bytes,
-    /// Authentication token (passed in first chunk only for gRPC)
-    pub token: String,
-    /// Language code (e.g., "hi-IN", "en-IN")
-    pub lang: String,
-    /// Demo mode flag (empty string for production)
-    pub demo: String,
+use crate::core::stt::base::STTResult;
+
+/// Every binary audio frame is exactly this long: 512 samples of 16-bit PCM.
+pub const GNANI_STT_FRAME_BYTES: usize = 1024;
+
+/// Closes the open utterance now instead of waiting for silence.
+pub const COMMIT_MESSAGE: &str = r#"{"type":"commit"}"#;
+
+/// A server message.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GnaniServerMessage {
+    /// The session is ready; echoes the active configuration.
+    Connected {
+        #[serde(default)]
+        message: Option<String>,
+        /// Prisma v3.0: the `x-api-request-id`, or one Gnani generated.
+        #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
+        config: Option<GnaniConnectedConfig>,
+    },
+    /// VAD closed a segment; its transcript follows.
+    Processing {
+        #[serde(default)]
+        timestamp: Option<String>,
+    },
+    /// Voice was detected.
+    SpeechStart {
+        #[serde(default)]
+        utterance_id: Option<String>,
+    },
+    /// The transcript of a closed segment (always final).
+    Transcript(GnaniTranscript),
+    /// The reply to an `update_settings` frame.
+    SettingsUpdated {
+        #[serde(default)]
+        config: serde_json::Value,
+    },
+    /// A recoverable or fatal error; a fatal one is followed by a close.
+    Error {
+        #[serde(default)]
+        message: String,
+    },
+    /// A message type this client does not know.
+    #[serde(other)]
+    Unknown,
 }
 
-impl SpeechChunk {
-    /// Create a new speech chunk with audio data
-    pub fn new(content: Bytes, token: &str, lang: &str) -> Self {
-        Self {
-            content,
-            token: token.to_string(),
-            lang: lang.to_string(),
-            demo: String::new(),
-        }
-    }
-
-    /// Create a speech chunk with only audio (for subsequent chunks)
-    pub fn audio_only(content: Bytes) -> Self {
-        Self {
-            content,
-            token: String::new(),
-            lang: String::new(),
-            demo: String::new(),
-        }
-    }
-
-    /// Encode to protobuf wire format
-    ///
-    /// Field numbers:
-    /// - content: 1 (bytes)
-    /// - token: 2 (string)
-    /// - lang: 3 (string)
-    /// - demo: 4 (string)
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.content.len() + 100);
-
-        // Field 1: content (bytes) - wire type 2 (length-delimited)
-        if !self.content.is_empty() {
-            buf.push(0x0a); // field 1, wire type 2
-            encode_varint(&mut buf, self.content.len() as u64);
-            buf.extend_from_slice(&self.content);
-        }
-
-        // Field 2: token (string) - wire type 2 (length-delimited)
-        if !self.token.is_empty() {
-            buf.push(0x12); // field 2, wire type 2
-            encode_varint(&mut buf, self.token.len() as u64);
-            buf.extend_from_slice(self.token.as_bytes());
-        }
-
-        // Field 3: lang (string) - wire type 2 (length-delimited)
-        if !self.lang.is_empty() {
-            buf.push(0x1a); // field 3, wire type 2
-            encode_varint(&mut buf, self.lang.len() as u64);
-            buf.extend_from_slice(self.lang.as_bytes());
-        }
-
-        // Field 4: demo (string) - wire type 2 (length-delimited)
-        if !self.demo.is_empty() {
-            buf.push(0x22); // field 4, wire type 2
-            encode_varint(&mut buf, self.demo.len() as u64);
-            buf.extend_from_slice(self.demo.as_bytes());
-        }
-
-        buf
+impl GnaniServerMessage {
+    /// Parse a text frame.
+    pub fn parse(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(text)
     }
 }
 
-/// Transcription result from Gnani's streaming recognition.
-///
-/// This maps to the gRPC `TranscriptChunk` message:
-/// ```protobuf
-/// message TranscriptChunk {
-///     string asr = 1;
-///     string transcript = 2;
-///     bool is_final = 3;
-///     float confidence = 4;
-///     string answer = 5;
-///     string image_url = 6;
-///     string image_yes_no = 7;
-/// }
-/// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TranscriptChunk {
-    /// Raw ASR output
+/// The `config` of a `connected` message.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct GnaniConnectedConfig {
+    /// The active sample rate (echo of `x-sample-rate`).
     #[serde(default)]
-    pub asr: String,
-
-    /// Processed transcript text
+    pub sample_rate: Option<u32>,
+    /// Samples per frame (always 512).
     #[serde(default)]
-    pub transcript: String,
-
-    /// Whether this is a final result
+    pub chunk_size: Option<u32>,
     #[serde(default)]
-    pub is_final: bool,
-
-    /// Confidence score (0.0 to 1.0)
+    pub language_code: Option<String>,
     #[serde(default)]
-    pub confidence: f32,
+    pub format: Option<String>,
+}
 
-    /// Answer field (used for Q&A applications)
+/// A `transcript` message.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct GnaniTranscript {
     #[serde(default)]
-    pub answer: String,
-
-    /// Image URL (if applicable)
+    pub text: String,
+    /// The segment's speech, in ms (an integer on v2.5, a float on v3.0).
     #[serde(default)]
-    pub image_url: String,
-
-    /// Yes/No classification result
+    pub audio_duration_ms: Option<f64>,
+    /// `<request_id>-seg-<N>`.
     #[serde(default)]
-    pub image_yes_no: String,
+    pub segment_id: Option<String>,
+    /// 1-based position of the segment within the session.
+    #[serde(default)]
+    pub segment_index: Option<u64>,
+    /// Time Gnani took to transcribe the segment, in ms.
+    #[serde(default)]
+    pub latency: Option<f64>,
+    /// Prisma v3.0: the language heard (`te-IN`).
+    #[serde(default)]
+    pub detected_language_code: Option<String>,
+    #[serde(default)]
+    pub utterance_id: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
-impl TranscriptChunk {
-    /// Decode from protobuf wire format
-    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
-        let mut chunk = TranscriptChunk::default();
-        let mut pos = 0;
-
-        while pos < buf.len() {
-            let (field_tag, new_pos) = decode_varint(&buf[pos..])?;
-            pos += new_pos;
-
-            let field_number = field_tag >> 3;
-            let wire_type = field_tag & 0x07;
-
-            match (field_number, wire_type) {
-                // Field 1: asr (string)
-                (1, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size;
-                    let end = pos + len as usize;
-                    if end > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    chunk.asr = String::from_utf8_lossy(&buf[pos..end]).to_string();
-                    pos = end;
-                }
-                // Field 2: transcript (string)
-                (2, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size;
-                    let end = pos + len as usize;
-                    if end > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    chunk.transcript = String::from_utf8_lossy(&buf[pos..end]).to_string();
-                    pos = end;
-                }
-                // Field 3: is_final (bool/varint)
-                (3, 0) => {
-                    let (value, size) = decode_varint(&buf[pos..])?;
-                    pos += size;
-                    chunk.is_final = value != 0;
-                }
-                // Field 4: confidence (float)
-                (4, 5) => {
-                    if pos + 4 > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    let mut bytes = [0u8; 4];
-                    bytes.copy_from_slice(&buf[pos..pos + 4]);
-                    chunk.confidence = f32::from_le_bytes(bytes);
-                    pos += 4;
-                }
-                // Field 5: answer (string)
-                (5, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size;
-                    let end = pos + len as usize;
-                    if end > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    chunk.answer = String::from_utf8_lossy(&buf[pos..end]).to_string();
-                    pos = end;
-                }
-                // Field 6: image_url (string)
-                (6, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size;
-                    let end = pos + len as usize;
-                    if end > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    chunk.image_url = String::from_utf8_lossy(&buf[pos..end]).to_string();
-                    pos = end;
-                }
-                // Field 7: image_yes_no (string)
-                (7, 2) => {
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size;
-                    let end = pos + len as usize;
-                    if end > buf.len() {
-                        return Err(DecodeError::BufferTooShort);
-                    }
-                    chunk.image_yes_no = String::from_utf8_lossy(&buf[pos..end]).to_string();
-                    pos = end;
-                }
-                // Skip unknown fields
-                (_, 0) => {
-                    // Varint
-                    let (_, size) = decode_varint(&buf[pos..])?;
-                    pos += size;
-                }
-                (_, 2) => {
-                    // Length-delimited
-                    let (len, len_size) = decode_varint(&buf[pos..])?;
-                    pos += len_size + len as usize;
-                }
-                (_, 5) => {
-                    // 32-bit
-                    pos += 4;
-                }
-                (_, 1) => {
-                    // 64-bit
-                    pos += 8;
-                }
-                _ => {
-                    return Err(DecodeError::UnknownWireType(wire_type as u8));
-                }
-            }
-        }
-
-        Ok(chunk)
-    }
-
-    /// Get the best available transcript
-    pub fn best_transcript(&self) -> &str {
-        if !self.transcript.is_empty() {
-            &self.transcript
-        } else {
-            &self.asr
-        }
-    }
-
-    /// Check if this result has meaningful content
-    pub fn has_content(&self) -> bool {
-        !self.transcript.is_empty() || !self.asr.is_empty()
+impl GnaniTranscript {
+    /// The gateway result: each transcript is a VAD-closed segment, so it is final and ends the
+    /// speech. Gnani sends no confidence (0.0 here stands for "not sent").
+    pub fn to_stt_result(&self) -> STTResult {
+        let mut result = STTResult::new(self.text.trim().to_string(), true, true, 0.0);
+        result.detected_language = self
+            .detected_language_code
+            .as_deref()
+            .map(|code| code.split('-').next().unwrap_or(code).to_ascii_lowercase());
+        result.audio_duration = self.audio_duration_ms.map(|ms| ms / 1000.0);
+        result.vendor_request_id = self.segment_id.clone();
+        result
     }
 }
 
-/// Protobuf decoding error
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum DecodeError {
-    #[error("Buffer too short")]
-    BufferTooShort,
-    #[error("Invalid varint")]
-    InvalidVarint,
-    #[error("Unknown wire type: {0}")]
-    UnknownWireType(u8),
+/// Cuts the gateway's arbitrary audio chunks into exact [`GNANI_STT_FRAME_BYTES`] frames. A
+/// remainder shorter than a frame waits for the next chunk; nothing is ever padded.
+#[derive(Debug, Default)]
+pub struct FrameChunker {
+    pending: BytesMut,
 }
 
-/// Encode a varint to the buffer
-fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let mut byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        buf.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
-}
-
-/// Decode a varint from the buffer, returning (value, bytes_consumed)
-fn decode_varint(buf: &[u8]) -> Result<(u64, usize), DecodeError> {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-
-    for (i, &byte) in buf.iter().enumerate() {
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok((value, i + 1));
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(DecodeError::InvalidVarint);
-        }
+impl FrameChunker {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    Err(DecodeError::BufferTooShort)
-}
-
-/// Streaming recognition response wrapper for compatibility
-#[derive(Debug, Clone, Default)]
-pub struct StreamingRecognitionResponse {
-    /// List of transcript chunks
-    pub results: Vec<TranscriptChunk>,
-    /// Error information if any
-    pub error: Option<StreamingError>,
-}
-
-/// Error from streaming recognition
-#[derive(Debug, Clone)]
-pub struct StreamingError {
-    /// gRPC status code
-    pub code: i32,
-    /// Error message
-    pub message: String,
-}
-
-impl StreamingRecognitionResponse {
-    /// Create from a single transcript chunk
-    pub fn from_chunk(chunk: TranscriptChunk) -> Self {
-        Self {
-            results: vec![chunk],
-            error: None,
+    /// Append `data` and take every whole frame now available.
+    pub fn push(&mut self, data: &[u8]) -> Vec<Bytes> {
+        self.pending.extend_from_slice(data);
+        let mut frames = Vec::with_capacity(self.pending.len() / GNANI_STT_FRAME_BYTES);
+        while self.pending.len() >= GNANI_STT_FRAME_BYTES {
+            frames.push(self.pending.split_to(GNANI_STT_FRAME_BYTES).freeze());
         }
+        frames
     }
 
-    /// Create an error response
-    pub fn error(code: i32, message: String) -> Self {
-        Self {
-            results: vec![],
-            error: Some(StreamingError { code, message }),
-        }
-    }
-
-    /// Get the best transcript from results
-    pub fn best_transcript(&self) -> Option<&str> {
-        self.results.first().map(|r| r.best_transcript())
-    }
-
-    /// Check if any result is final
-    pub fn has_final_result(&self) -> bool {
-        self.results.iter().any(|r| r.is_final)
-    }
-
-    /// Check if there's an error
-    pub fn has_error(&self) -> bool {
-        self.error.is_some()
+    /// Bytes held back for the next frame.
+    pub fn remainder(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -374,122 +152,117 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_speech_chunk_encode() {
-        let chunk = SpeechChunk::new(
-            Bytes::from_static(&[0x01, 0x02, 0x03]),
-            "test-token",
-            "hi-IN",
+    fn audio_is_cut_into_exact_frames_and_the_remainder_kept() {
+        let mut chunker = FrameChunker::new();
+        assert!(chunker.push(&[1u8; 1000]).is_empty());
+        assert_eq!(chunker.remainder(), 1000);
+
+        let frames = chunker.push(&[2u8; 100]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), GNANI_STT_FRAME_BYTES);
+        assert_eq!(&frames[0][..1000], &[1u8; 1000][..]);
+        assert_eq!(&frames[0][1000..], &[2u8; 24][..]);
+        assert_eq!(chunker.remainder(), 76);
+
+        let frames = chunker.push(&[3u8; 3000]);
+        assert_eq!(frames.len(), 3);
+        assert!(frames.iter().all(|f| f.len() == GNANI_STT_FRAME_BYTES));
+        assert_eq!(chunker.remainder(), 76 + 3000 - 3 * GNANI_STT_FRAME_BYTES);
+
+        let mut exact = FrameChunker::new();
+        assert_eq!(exact.push(&[0u8; 2048]).len(), 2);
+        assert_eq!(exact.remainder(), 0);
+    }
+
+    #[test]
+    fn connected_is_parsed() {
+        let msg = GnaniServerMessage::parse(
+            r#"{"type":"connected","message":"STT service ready","timestamp":"2024-01-15T10:30:00.000Z",
+                "config":{"sample_rate":16000,"chunk_size":512}}"#,
+        )
+        .unwrap();
+        match msg {
+            GnaniServerMessage::Connected { config, .. } => {
+                let config = config.unwrap();
+                assert_eq!(config.sample_rate, Some(16000));
+                assert_eq!(config.chunk_size, Some(512));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn processing_speech_start_and_settings_updated_are_parsed() {
+        assert!(matches!(
+            GnaniServerMessage::parse(r#"{"type":"processing","timestamp":"t"}"#).unwrap(),
+            GnaniServerMessage::Processing { .. }
+        ));
+        assert!(matches!(
+            GnaniServerMessage::parse(r#"{"type":"speech_start","utterance_id":"u1"}"#).unwrap(),
+            GnaniServerMessage::SpeechStart {
+                utterance_id: Some(_)
+            }
+        ));
+        assert!(matches!(
+            GnaniServerMessage::parse(
+                r#"{"type":"settings_updated","config":{"language_code":"en-IN"}}"#
+            )
+            .unwrap(),
+            GnaniServerMessage::SettingsUpdated { .. }
+        ));
+        assert_eq!(
+            GnaniServerMessage::parse(r#"{"type":"something_new","x":1}"#).unwrap(),
+            GnaniServerMessage::Unknown
         );
-
-        let encoded = chunk.encode();
-        assert!(!encoded.is_empty());
-
-        // Verify field tags are present
-        assert!(encoded.contains(&0x0a)); // content field
-        assert!(encoded.contains(&0x12)); // token field
-        assert!(encoded.contains(&0x1a)); // lang field
     }
 
     #[test]
-    fn test_speech_chunk_audio_only() {
-        let chunk = SpeechChunk::audio_only(Bytes::from_static(&[0x01, 0x02]));
-        let encoded = chunk.encode();
-
-        // Should only contain content field
-        assert!(encoded.contains(&0x0a));
-        assert!(!encoded.contains(&0x12)); // no token
-    }
-
-    #[test]
-    fn test_transcript_chunk_decode() {
-        // Manually encode a simple message: transcript = "hello", is_final = true
-        let mut buf = Vec::new();
-
-        // Field 2: transcript = "hello"
-        buf.push(0x12); // field 2, wire type 2
-        buf.push(0x05); // length 5
-        buf.extend_from_slice(b"hello");
-
-        // Field 3: is_final = true
-        buf.push(0x18); // field 3, wire type 0
-        buf.push(0x01); // value 1 (true)
-
-        let chunk = TranscriptChunk::decode(&buf).unwrap();
-        assert_eq!(chunk.transcript, "hello");
-        assert!(chunk.is_final);
-    }
-
-    #[test]
-    fn test_transcript_chunk_with_confidence() {
-        let mut buf = Vec::new();
-
-        // Field 2: transcript = "test"
-        buf.push(0x12);
-        buf.push(0x04);
-        buf.extend_from_slice(b"test");
-
-        // Field 4: confidence = 0.95 (as float32)
-        buf.push(0x25); // field 4, wire type 5 (32-bit)
-        buf.extend_from_slice(&0.95f32.to_le_bytes());
-
-        let chunk = TranscriptChunk::decode(&buf).unwrap();
-        assert_eq!(chunk.transcript, "test");
-        assert!((chunk.confidence - 0.95).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_transcript_chunk_best_transcript() {
-        let chunk = TranscriptChunk {
-            asr: "raw asr".to_string(),
-            transcript: "processed transcript".to_string(),
-            ..Default::default()
+    fn transcript_is_parsed_into_a_final_result() {
+        let msg = GnaniServerMessage::parse(
+            r#"{"type":"transcript","timestamp":"2024-01-15T10:30:05.987Z","text":"Hello, how are you today?",
+                "audio_duration_ms":2340,"segment_id":"req-seg-1","segment_index":1,"latency":320}"#,
+        )
+        .unwrap();
+        let GnaniServerMessage::Transcript(t) = msg else {
+            panic!("not a transcript");
         };
-        assert_eq!(chunk.best_transcript(), "processed transcript");
+        assert_eq!(t.segment_index, Some(1));
+        assert_eq!(t.latency, Some(320.0));
+        let result = t.to_stt_result();
+        assert_eq!(result.transcript, "Hello, how are you today?");
+        assert!(result.is_final && result.is_speech_final);
+        assert_eq!(result.audio_duration, Some(2.34));
+        assert_eq!(result.vendor_request_id.as_deref(), Some("req-seg-1"));
+        assert_eq!(result.detected_language, None);
 
-        let chunk2 = TranscriptChunk {
-            asr: "only asr".to_string(),
-            ..Default::default()
+        // Prisma v3.0: a float duration and the detected language.
+        let msg = GnaniServerMessage::parse(
+            r#"{"type":"transcript","text":"ఈ రోజు","detected_language_code":"te-IN",
+                "audio_duration_ms":2340.0,"segment_id":"s","segment_index":1,"latency":380}"#,
+        )
+        .unwrap();
+        let GnaniServerMessage::Transcript(t) = msg else {
+            panic!("not a transcript");
         };
-        assert_eq!(chunk2.best_transcript(), "only asr");
+        assert_eq!(t.to_stt_result().detected_language.as_deref(), Some("te"));
     }
 
     #[test]
-    fn test_varint_encoding() {
-        let mut buf = Vec::new();
-
-        // Test small value
-        encode_varint(&mut buf, 1);
-        assert_eq!(buf, vec![0x01]);
-
-        buf.clear();
-        encode_varint(&mut buf, 127);
-        assert_eq!(buf, vec![0x7f]);
-
-        buf.clear();
-        encode_varint(&mut buf, 128);
-        assert_eq!(buf, vec![0x80, 0x01]);
-
-        buf.clear();
-        encode_varint(&mut buf, 300);
-        assert_eq!(buf, vec![0xac, 0x02]);
+    fn error_is_parsed_with_its_message() {
+        assert_eq!(
+            GnaniServerMessage::parse(
+                r#"{"type":"error","timestamp":"t","message":"STT engine failed to initialize"}"#
+            )
+            .unwrap(),
+            GnaniServerMessage::Error {
+                message: "STT engine failed to initialize".into()
+            }
+        );
     }
 
     #[test]
-    fn test_varint_decoding() {
-        let (value, size) = decode_varint(&[0x01]).unwrap();
-        assert_eq!(value, 1);
-        assert_eq!(size, 1);
-
-        let (value, size) = decode_varint(&[0x7f]).unwrap();
-        assert_eq!(value, 127);
-        assert_eq!(size, 1);
-
-        let (value, size) = decode_varint(&[0x80, 0x01]).unwrap();
-        assert_eq!(value, 128);
-        assert_eq!(size, 2);
-
-        let (value, size) = decode_varint(&[0xac, 0x02]).unwrap();
-        assert_eq!(value, 300);
-        assert_eq!(size, 2);
+    fn the_commit_frame_is_gnanis() {
+        let v: serde_json::Value = serde_json::from_str(COMMIT_MESSAGE).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "commit"}));
     }
 }

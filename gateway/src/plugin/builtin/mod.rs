@@ -154,24 +154,23 @@ fn groq_stt_metadata() -> ProviderMetadata {
 
 fn gnani_stt_metadata() -> ProviderMetadata {
     ProviderMetadata::stt("gnani", "Gnani Vachana STT")
-        .with_description("Indic speech-to-text with 14 language support via REST API")
+        .with_description(
+            "Indic speech-to-text: Prisma realtime streaming over WebSocket, ten languages",
+        )
         .with_alias("vachana")
-        .with_features(["indic-languages", "interim-results", "word-timestamps"])
+        .with_features(["streaming", "indic-languages", "language-detection"])
         .with_languages([
-            "kn-IN",
             "hi-IN",
+            "en-IN",
             "ta-IN",
             "te-IN",
-            "gu-IN",
-            "mr-IN",
-            "bn-IN",
+            "kn-IN",
             "ml-IN",
-            "pa-guru-IN",
-            "ur-IN",
-            "en-IN",
-            "en-GB",
-            "en-US",
-            "en-SG",
+            "mr-IN",
+            "pa-IN",
+            "bn-IN",
+            "gu-IN",
+            "indic-auto",
         ])
 }
 

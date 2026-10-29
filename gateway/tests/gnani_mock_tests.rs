@@ -402,21 +402,21 @@ async fn test_gnani_tts_speak_fails_not_connected() {
 /// Test all supported Gnani STT languages.
 #[test]
 fn test_gnani_stt_all_languages() {
+    // Gnani's ten languages and `indic-auto`, plus former spellings that still map onto them.
     let languages = [
         "hi-IN",
-        "kn-IN",
+        "en-IN",
         "ta-IN",
         "te-IN",
-        "gu-IN",
-        "mr-IN",
-        "bn-IN",
+        "kn-IN",
         "ml-IN",
+        "mr-IN",
+        "pa-IN",
+        "bn-IN",
+        "gu-IN",
+        "indic-auto",
         "pa-guru-IN",
-        "ur-IN",
-        "en-IN",
-        "en-GB",
         "en-US",
-        "en-SG",
     ];
 
     for lang in languages {
@@ -505,7 +505,7 @@ fn test_gnani_stt_audio_encodings() {
 /// Test STT with different sample rates.
 #[test]
 fn test_gnani_stt_sample_rates() {
-    let sample_rates = [8000, 16000, 24000, 48000];
+    let sample_rates = [8000, 16000, 44100, 48000];
 
     for rate in sample_rates {
         let config = STTConfig {

@@ -309,8 +309,8 @@ const REQUEST_LINES_BACK: usize = 6;
 /// words. Every other provider fills the field with a constant or a number of another kind:
 /// 1.0 (OpenAI without log-probabilities, ElevenLabs, Alibaba, Baidu, Naver, Cartesia finals),
 /// 0.95 or 0.9 (Bhashini, Yandex, Sber, FPT, NECTEC, Sarvam and iFlytek when the vendor sent
-/// none), 0.5 (Groq without log-probabilities), 0.0 (Cartesia, ElevenLabs and Speechmatics
-/// interims), or a figure the gateway derives from log-probabilities (OpenAI, Groq).
+/// none), 0.5 (Groq without log-probabilities), 0.0 (Gnani, which sends none; Cartesia,
+/// ElevenLabs and Speechmatics interims), or a figure the gateway derives from log-probabilities (OpenAI, Groq).
 fn passes_vendor_confidence(provider: &str) -> bool {
     use BuiltinSTTProvider as P;
     matches!(
@@ -321,7 +321,6 @@ fn passes_vendor_confidence(provider: &str) -> bool {
                 | P::RevAI
                 | P::Phonexia
                 | P::Tinkoff
-                | P::Gnani
                 | P::AwsTranscribe
                 | P::IbmWatson
                 | P::Speechmatics

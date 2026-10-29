@@ -139,10 +139,8 @@ pub use groq::{
 
 // Re-export Gnani.ai implementation
 pub use gnani::{
-    DecodeError as GnaniDecodeError, GnaniAudioFormat, GnaniGrpcError, GnaniLanguage, GnaniSTT,
-    GnaniSTTConfig, SpeechChunk as GnaniSpeechChunk, StreamingError as GnaniStreamingError,
-    StreamingRecognitionResponse as GnaniStreamingResponse,
-    TranscriptChunk as GnaniTranscriptChunk,
+    GNANI_STT_URL, GnaniLanguage, GnaniSTT, GnaniSTTConfig, GnaniSTTFormat, GnaniSTTModel,
+    GnaniServerMessage, GnaniTranscript,
 };
 
 // Re-export Sarvam.ai implementation

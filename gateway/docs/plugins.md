@@ -682,9 +682,7 @@ AWS_SECRET_ACCESS_KEY=your-secret
 IBM_WATSON_API_KEY=your-key
 IBM_WATSON_INSTANCE_ID=your-instance
 GROQ_API_KEY=your-key
-GNANI_TOKEN=your-token
-GNANI_ACCESS_KEY=your-access-key
-GNANI_CERTIFICATE_PATH=/path/to/cert.pem
+GNANI_TOKEN=your-api-key
 
 # TTS Providers (additional)
 ELEVENLABS_API_KEY=your-key
