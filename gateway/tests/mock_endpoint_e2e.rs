@@ -1910,188 +1910,62 @@ async fn tinkoff_full_integration_via_mock_endpoint() {
 }
 
 // ============================================================================
-// STT gRPC: gnani (bidi DoSpeechToText) — reuses the bidi tonic-mock pattern.
+// STT WS: gnani (Prisma realtime streaming) — config on the upgrade headers, exact 1,024-byte
+// binary audio frames up, JSON `transcript` frames down.
 // ============================================================================
 
-/// Hand-encode a Gnani response chunk: a flat message with field 2 = `transcript` (string) and
-/// field 3 = `is_final` (varint true). best_transcript() reads `transcript`.
-fn encode_gnani_response(transcript: &str) -> Vec<u8> {
-    let mut buf = vec![0x12u8]; // field 2, wire type 2 (length-delimited string)
-    let mut n = transcript.len();
-    loop {
-        let mut b = (n & 0x7f) as u8;
-        n >>= 7;
-        if n != 0 {
-            b |= 0x80;
-        }
-        buf.push(b);
-        if n == 0 {
-            break;
-        }
-    }
-    buf.extend_from_slice(transcript.as_bytes());
-    buf.extend_from_slice(&[0x18, 0x01]); // field 3 (is_final) varint = true
-    buf
-}
-
-/// Plaintext tonic bidi-streaming gRPC mock for Gnani `/Listener/DoSpeechToText`.
-async fn spawn_gnani_stt_grpc_mock(response: Vec<u8>) -> MockEndpoint {
-    use bytes::{Buf, BufMut, Bytes};
-    use futures::Stream;
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-    use tonic::codegen::{Body, BoxFuture, Context, Poll, Service, StdError, http};
-    use tonic::server::StreamingService;
-    use tonic::{Request, Response, Status, Streaming};
-
-    #[derive(Clone, Default)]
-    struct ByteCodec;
-    impl Codec for ByteCodec {
-        type Encode = Vec<u8>;
-        type Decode = Bytes;
-        type Encoder = ByteEnc;
-        type Decoder = ByteDec;
-        fn encoder(&mut self) -> ByteEnc {
-            ByteEnc
-        }
-        fn decoder(&mut self) -> ByteDec {
-            ByteDec
-        }
-    }
-    struct ByteEnc;
-    impl Encoder for ByteEnc {
-        type Item = Vec<u8>;
-        type Error = Status;
-        fn encode(&mut self, item: Vec<u8>, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
-            dst.put_slice(&item);
-            Ok(())
-        }
-    }
-    struct ByteDec;
-    impl Decoder for ByteDec {
-        type Item = Bytes;
-        type Error = Status;
-        fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Bytes>, Status> {
-            let n = src.remaining();
-            if n == 0 {
-                Ok(None)
-            } else {
-                Ok(Some(src.copy_to_bytes(n)))
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct Mock {
-        resp: Arc<Vec<u8>>,
-        panicked: Arc<AtomicBool>,
-        children: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    }
-    impl tonic::server::NamedService for Mock {
-        const NAME: &'static str = "Listener";
-    }
-    impl<B> Service<http::Request<B>> for Mock
-    where
-        B: Body + Send + 'static,
-        B::Error: Into<StdError> + Send + 'static,
-    {
-        type Response = http::Response<tonic::body::BoxBody>;
-        type Error = std::convert::Infallible;
-        type Future = BoxFuture<Self::Response, Self::Error>;
-        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-        fn call(&mut self, req: http::Request<B>) -> Self::Future {
-            if req.uri().path().ends_with("/DoSpeechToText") {
-                let resp = self.resp.clone();
-                let panicked = Arc::clone(&self.panicked);
-                let children = Arc::clone(&self.children);
-                Box::pin(async move {
-                    struct Svc {
-                        resp: Arc<Vec<u8>>,
-                        panicked: Arc<AtomicBool>,
-                        children: Arc<Mutex<Vec<JoinHandle<()>>>>,
-                    }
-                    impl StreamingService<Bytes> for Svc {
-                        type Response = Vec<u8>;
-                        type ResponseStream =
-                            Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send>>;
-                        type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
-                        fn call(&mut self, req: Request<Streaming<Bytes>>) -> Self::Future {
-                            let chunk = (*self.resp).clone();
-                            let panicked = Arc::clone(&self.panicked);
-                            let children = Arc::clone(&self.children);
-                            Box::pin(async move {
-                                let mut inbound = req.into_inner();
-                                spawn_mock_child(
-                                    "gnani_stt_grpc_inbound_drain",
-                                    &panicked,
-                                    &children,
-                                    async move {
-                                        use futures::StreamExt;
-                                        while inbound.next().await.is_some() {}
-                                    },
-                                );
-                                let s = futures::stream::iter(vec![Ok(chunk)]);
-                                Ok(Response::new(Box::pin(s) as Self::ResponseStream))
-                            })
-                        }
-                    }
-                    let mut grpc = tonic::server::Grpc::new(ByteCodec);
-                    Ok(grpc
-                        .streaming(
-                            Svc {
-                                resp,
-                                panicked,
-                                children,
-                            },
-                            req,
-                        )
-                        .await)
-                })
-            } else {
-                Box::pin(async move {
-                    Ok(http::Response::builder()
-                        .status(200)
-                        .header("content-type", "application/grpc")
-                        .header("grpc-status", "12")
-                        .body(tonic::body::empty_body())
-                        .unwrap())
-                })
-            }
-        }
-    }
-
+/// Spawn a local mock Gnani: check the upgrade headers, send `connected`, and after the first
+/// binary audio frame (which must be exactly 1,024 bytes) send one `transcript` — Gnani's real
+/// wire shapes — then drain.
+async fn spawn_gnani_mock(transcript_value: &'static str) -> MockEndpoint {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let incoming = futures::stream::unfold(listener, |l| async move {
-        let res = l.accept().await.map(|(s, _)| s);
-        Some((res, l))
+    let server = spawn_mock_server("gnani_mock", async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let check = |req: &Request, resp: Response| {
+                let h = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+                assert_eq!(h("x-api-key-id"), Some("test-key"));
+                assert_eq!(h("language_code"), Some("en-IN"));
+                assert_eq!(h("model"), Some("prisma-v2.5"));
+                assert_eq!(h("x-sample-rate"), Some("16000"));
+                Ok(resp)
+            };
+            if let Ok(ws) = accept_hdr_async(stream, check).await {
+                let (mut write, mut read) = ws.split();
+                let _ = write
+                    .send(Message::Text(
+                        r#"{"type":"connected","message":"STT service ready","config":{"sample_rate":16000,"chunk_size":512}}"#.into(),
+                    ))
+                    .await;
+                let msg = format!(
+                    r#"{{"type":"transcript","text":"{transcript_value}","audio_duration_ms":1200,"segment_id":"mock-seg-1","segment_index":1,"latency":80}}"#
+                );
+                let mut sent = false;
+                while let Some(Ok(frame)) = read.next().await {
+                    if let Message::Binary(data) = &frame {
+                        assert_eq!(
+                            data.len(),
+                            1024,
+                            "Gnani audio frames are exactly 1,024 bytes"
+                        );
+                        if !sent {
+                            let _ = write.send(Message::Text(msg.clone().into())).await;
+                            sent = true;
+                        }
+                    }
+                }
+            }
+        }
     });
-    let panicked = Arc::new(AtomicBool::new(false));
-    let children = Arc::new(Mutex::new(Vec::new()));
-    let svc = Mock {
-        resp: Arc::new(response),
-        panicked: Arc::clone(&panicked),
-        children: Arc::clone(&children),
-    };
-    let server =
-        spawn_mock_server_with_state("gnani_stt_grpc_mock", panicked, children, async move {
-            tonic::transport::Server::builder()
-                .add_service(svc)
-                .serve_with_incoming(incoming)
-                .await
-                .expect("gnani STT mock gRPC server");
-        });
     MockEndpoint::new(port, server)
 }
 
 #[tokio::test]
 async fn gnani_full_integration_via_mock_endpoint() {
     ensure_crypto();
-    let port = spawn_gnani_stt_grpc_mock(encode_gnani_response("hello world")).await;
-    let mut std = StandardSTTConfig::from_base(STTConfig {
+    allow_loopback_endpoint_mocks();
+    let port = spawn_gnani_mock("hello world").await;
+    let std = StandardSTTConfig::from_base(STTConfig {
         provider: "gnani".into(),
         api_key: "test-key".into(),
         language: "en-IN".into(),
@@ -2101,16 +1975,7 @@ async fn gnani_full_integration_via_mock_endpoint() {
         encoding: "pcm16".into(),
         model: String::new(),
     })
-    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
-    // Gnani gRPC auth uses token + access_key (sent as metadata; the mock ignores them).
-    std.extras.0.insert(
-        "token".to_string(),
-        serde_json::Value::String("test-token".into()),
-    );
-    std.extras.0.insert(
-        "access_key".to_string(),
-        serde_json::Value::String("test-access".into()),
-    );
+    .with_endpoint_override(format!("ws://127.0.0.1:{port}"));
     let mut stt = create_stt_standard("gnani", std).expect("build gnani via keystone");
     let got = drive_and_capture(stt.as_mut()).await;
     println!("Gnani mock e2e surfaced transcript: {got:?}");

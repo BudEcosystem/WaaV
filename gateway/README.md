@@ -582,9 +582,9 @@ docker run -p 3001:3001 --env-file .env waav-gateway
 | `IBM_WATSON_INSTANCE_ID` | IBM Watson service instance ID | - | No* |
 | `GROQ_API_KEY` | Groq API key (for ultra-fast Whisper STT) | - | No* |
 | `HUME_API_KEY` | Hume AI API key (for EVI realtime and TTS) | - | No* |
-| `GNANI_TOKEN` | Gnani.ai authentication token (for Indic STT/TTS) | - | No* |
-| `GNANI_ACCESS_KEY` | Gnani.ai access key (for Indic STT/TTS) | - | No* |
-| `GNANI_CERTIFICATE_PATH` | Path to Gnani SSL certificate (for mTLS auth) | - | No* |
+| `GNANI_TOKEN` | Gnani.ai API key, sent as `x-api-key-id` (for Indic STT/TTS) | - | No* |
+| `GNANI_ACCESS_KEY` | Not used (Gnani's former API) | - | No |
+| `GNANI_CERTIFICATE_PATH` | Not used (Gnani's former API) | - | No |
 | `LIVEKIT_URL` | LiveKit server WebSocket URL | `ws://localhost:7880` | No |
 | `LIVEKIT_API_KEY` | LiveKit API key (for webhooks and token generation) | - | No*** |
 | `LIVEKIT_API_SECRET` | LiveKit API secret (for webhooks and token generation) | - | No*** |

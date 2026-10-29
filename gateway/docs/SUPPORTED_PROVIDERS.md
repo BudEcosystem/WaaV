@@ -61,7 +61,7 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 | Provider | Protocol | Languages | Key Features | Env Variable |
 |----------|----------|-----------|--------------|--------------|
 | **Sarvam AI** | WebSocket | 11+ | Saarika v2.5, 22 Indian languages | `SARVAM_API_KEY` |
-| **Gnani.ai** | gRPC/REST | 14+ | Voice biometrics, Indic languages | `GNANI_TOKEN` |
+| **Gnani.ai** | WebSocket | 10 | Prisma v2.5/v3.0, Indic languages | `GNANI_TOKEN` |
 | **Reverie** | WebSocket | 22+ | Code-mixed Hinglish, hot-word boosting | `REVERIE_API_KEY` |
 | **AI4Bharat/Bhashini** | REST | 22+ | Government ULCA API, free service | `BHASHINI_USER_ID` |
 
@@ -296,8 +296,7 @@ export SBERDEVICES_CLIENT_ID="client_id:client_secret"
 
 # India Regional
 export SARVAM_API_KEY="your-key"
-export GNANI_TOKEN="your-token"
-export GNANI_ACCESS_KEY="your-key"
+export GNANI_TOKEN="your-api-key"
 export REVERIE_API_KEY="your-key"
 export BHASHINI_USER_ID="user_id|ulca_api_key"
 
