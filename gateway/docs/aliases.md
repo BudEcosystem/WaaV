@@ -68,12 +68,14 @@ whole conversation each time.
 Some rules always hold:
 
 - System messages are never removed.
-- The current turn is never removed: the caller's last message and everything after it (tool
-  calls, their results and the reply), even when that alone is more than `max_history`.
+- The caller's last message is never removed. When the current turn alone is more than
+  `max_history` (a long tool loop, or many replies to a quiet caller), its oldest replies and
+  tool rounds go first.
 - A tool result is never kept without the call it answers.
 
-Size `max_history` to the model: the window holds between about half of it and all of it. To keep
-at least 20 messages at all times, set 40. For example:
+Size `max_history` to the model: the window holds from about half of it (a little less when a
+trim lands inside a turn with tool calls) up to all of it. To keep about 20 messages or more, set
+40. For example:
 
 ```yaml
 aliases:

@@ -145,10 +145,11 @@ fn default_max_history() -> usize {
 /// non-system messages go until half of the non-system room is left (`ceil((max - systems) / 2)`),
 /// and on until the oldest one kept opens a turn (a user message), so the window never starts on
 /// an assistant reply or an orphaned tool result. System messages are never removed, and neither
-/// is the current turn: the last user message and everything after it (its tool rounds and
-/// reply), even when that alone is over `max_messages` (a request must carry its user message).
-/// With no user message at all, the newest message is kept and the window starts on a message
-/// that is not a tool result.
+/// is the current turn's start: the last user message. When the current turn alone is over
+/// `max_messages` (a caller quiet through many replies, a long tool loop), its oldest replies and
+/// tool rounds go, a call with its results, but never the user message or the newest message.
+/// With no user message at all, the newest message (with the call its results answer) is kept
+/// and the window starts on a message that is not a tool result.
 ///
 /// A history rebuilt by adding a growing list one message at a time (`set_context`) is cut at the
 /// same places each time, so a rebuild keeps its prefix too.
@@ -196,6 +197,29 @@ pub fn trim_history(messages: &mut Vec<ChatMessage>, max_messages: usize) {
         at += 1;
         !drop[at - 1]
     });
+    if !has_user {
+        return;
+    }
+    // The current turn alone over the cap: its oldest replies and rounds go.
+    let mut at = current + 1 - drop[..current].iter().filter(|d| **d).count();
+    while messages.len() > max_messages {
+        while at < messages.len() && messages[at].role == MessageRole::System {
+            at += 1;
+        }
+        let mut end = at + 1;
+        if messages
+            .get(at)
+            .is_some_and(|m| m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()))
+        {
+            while end < messages.len() && messages[end].role == MessageRole::Tool {
+                end += 1;
+            }
+        }
+        if end >= messages.len() {
+            break;
+        }
+        messages.drain(at..end);
+    }
 }
 
 /// Error type for the LLM client. Self-contained (no DAG dependency).
@@ -2182,6 +2206,37 @@ mod tests {
             assert_ne!(h.messages()[1].role, MessageRole::Tool);
         }
         assert_eq!(h.messages().last().unwrap().role, MessageRole::Tool);
+    }
+
+    /// A caller quiet through many replies (idle check-ins, an interaction provider's lines)
+    /// and a tool loop longer than the window: the turn is held to the cap, its user message and
+    /// newest message kept, no tool result without its call.
+    #[test]
+    fn a_long_current_turn_is_still_held_to_the_cap() {
+        let mut h = ConversationHistory::new(6);
+        h.add(ChatMessage::system("sys"));
+        h.add(ChatMessage::user("hello?"));
+        for n in 0..30 {
+            h.add(ChatMessage::assistant(format!("still there? {n}")));
+            assert!(h.messages().len() <= 6, "{:?}", h.messages());
+            assert_eq!(h.messages()[1].content.as_deref(), Some("hello?"));
+            assert_eq!(
+                h.messages().last().unwrap().content.as_deref(),
+                Some(&*format!("still there? {n}"))
+            );
+        }
+        let mut h = ConversationHistory::new(6);
+        h.add(ChatMessage::system("sys"));
+        h.add(ChatMessage::user("book it all"));
+        for n in 0..10 {
+            h.add(call(&format!("c{n}")));
+            assert_well_formed(h.messages());
+            h.add(ChatMessage::tool(format!("c{n}"), "done"));
+            assert_well_formed(h.messages());
+            assert!(h.messages().len() <= 6, "{:?}", h.messages());
+            assert_eq!(h.messages()[1].role, MessageRole::User);
+            assert_eq!(h.messages().last().unwrap().role, MessageRole::Tool);
+        }
     }
 
     /// A context rebuilt by adding a growing conversation one message at a time (interaction

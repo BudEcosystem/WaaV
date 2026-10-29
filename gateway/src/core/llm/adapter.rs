@@ -659,9 +659,9 @@ impl AnthropicAdapter {
 
         for msg in messages {
             // Anthropic requires the FIRST message to be a user turn. History
-            // trimming (`ConversationHistory::add` drops the OLDEST non-system
-            // message one at a time) can leave an assistant message first once
-            // the window wraps — without this guard every subsequent call
+            // trimming (`trim_history`) starts a window on a user turn, but a
+            // context set wholesale (`set_context`, flows) may still open on an
+            // assistant message — without this guard every subsequent call
             // 400s (review wf_e1bdd231, self-verified).
             if out.is_empty() && msg.role == MessageRole::Assistant {
                 out.push((
@@ -2109,9 +2109,9 @@ mod tests {
 
     #[test]
     fn anthropic_leading_assistant_after_history_trim_gets_user_guard() {
-        // ConversationHistory::add trims the OLDEST non-system message, so a
-        // wrapped window can start with an assistant turn — Anthropic requires
-        // messages[0] to be user, else every call 400s.
+        // A context that opens on an assistant turn (one set wholesale; the
+        // trim itself starts on a user turn) — Anthropic requires messages[0]
+        // to be user, else every call 400s.
         let messages = vec![
             ChatMessage::assistant("…earlier reply…"),
             ChatMessage::user("next question"),
