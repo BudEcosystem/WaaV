@@ -61,7 +61,11 @@ pub const DEFAULT_PITCH: u32 = 50;
 // Voice Enum
 // =============================================================================
 
-/// Available voices for iFlytek TTS.
+/// Available voices for iFlytek TTS, each sent as the voice the SG host's own voice table lists
+/// (global.xfyun.cn, "Available Voices", for `tts-api-sg.xf-yun.com`): Chinese voices are `x_...`
+/// there (`x_xiaoyan`, not `xiaoyan`), and the mainland ids some variants were named after
+/// (`aisjiuxu`, `luna`, ...) are not on it, so those go out as a listed voice of the same language
+/// and gender. The former names still parse.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum IFlytekVoice {
     // Chinese voices
@@ -97,15 +101,15 @@ impl IFlytekVoice {
     /// Get the voice code for the API.
     pub fn as_code(&self) -> &str {
         match self {
-            Self::Xiaoyan => "xiaoyan",
-            Self::Aisjiuxu => "aisjiuxu",
-            Self::Aisxping => "aisxping",
-            Self::Aisjinger => "aisjinger",
-            Self::Aisbabyxu => "aisbabyxu",
-            Self::JohnCe => "john_ce",
-            Self::Catherine => "catherine",
-            Self::Luna => "luna",
-            Self::Anjali => "anjali",
+            Self::Xiaoyan => "x_xiaoyan",
+            Self::Aisjiuxu => "x_yifeng",
+            Self::Aisxping => "x_xiaolin",
+            Self::Aisjinger => "x_xiaomei",
+            Self::Aisbabyxu => "x_xiaoyang_story",
+            Self::JohnCe => "x_john_ce",
+            Self::Catherine => "x_catherine_ce",
+            Self::Luna => "qianhui",
+            Self::Anjali => "abha",
             Self::Custom(name) => name,
         }
     }
@@ -114,14 +118,14 @@ impl IFlytekVoice {
     pub fn display_name(&self) -> &str {
         match self {
             Self::Xiaoyan => "Xiaoyan (Chinese Female)",
-            Self::Aisjiuxu => "Aisjiuxu (Chinese Male)",
-            Self::Aisxping => "Aisxping (Chinese Female Broadcaster)",
-            Self::Aisjinger => "Aisjinger (Chinese Sweet Female)",
-            Self::Aisbabyxu => "Aisbabyxu (Chinese Child)",
+            Self::Aisjiuxu => "Yifeng (Chinese Male)",
+            Self::Aisxping => "Xiaolin (Chinese Female)",
+            Self::Aisjinger => "Xiaomei (Chinese Female)",
+            Self::Aisbabyxu => "Xiaoyang (Chinese Female, Story)",
             Self::JohnCe => "John (English Male)",
             Self::Catherine => "Catherine (English Female)",
-            Self::Luna => "Luna (Japanese Female)",
-            Self::Anjali => "Anjali (Hindi Female)",
+            Self::Luna => "Qianhui (Japanese Female)",
+            Self::Anjali => "Abha (Hindi Female)",
             Self::Custom(name) => name,
         }
     }
@@ -130,15 +134,15 @@ impl IFlytekVoice {
     pub fn from_str(s: &str) -> Self {
         let normalized = s.trim().to_lowercase();
         match normalized.as_str() {
-            "xiaoyan" => Self::Xiaoyan,
-            "aisjiuxu" => Self::Aisjiuxu,
-            "aisxping" => Self::Aisxping,
-            "aisjinger" => Self::Aisjinger,
-            "aisbabyxu" => Self::Aisbabyxu,
-            "john_ce" | "john" => Self::JohnCe,
-            "catherine" => Self::Catherine,
-            "luna" => Self::Luna,
-            "anjali" => Self::Anjali,
+            "xiaoyan" | "x_xiaoyan" => Self::Xiaoyan,
+            "aisjiuxu" | "x_yifeng" => Self::Aisjiuxu,
+            "aisxping" | "x_xiaolin" => Self::Aisxping,
+            "aisjinger" | "x_xiaomei" => Self::Aisjinger,
+            "aisbabyxu" | "x_xiaoyang_story" => Self::Aisbabyxu,
+            "john_ce" | "john" | "x_john_ce" => Self::JohnCe,
+            "catherine" | "x_catherine_ce" => Self::Catherine,
+            "luna" | "qianhui" => Self::Luna,
+            "anjali" | "abha" => Self::Anjali,
             _ => Self::Custom(s.to_string()),
         }
     }
@@ -551,9 +555,11 @@ mod tests {
     // Voice tests
     #[test]
     fn test_voice_codes() {
-        assert_eq!(IFlytekVoice::Xiaoyan.as_code(), "xiaoyan");
-        assert_eq!(IFlytekVoice::JohnCe.as_code(), "john_ce");
-        assert_eq!(IFlytekVoice::Luna.as_code(), "luna");
+        // The SG host's voice table: `x_xiaoyan`, `x_john_ce`; Japanese female `qianhui`.
+        assert_eq!(IFlytekVoice::Xiaoyan.as_code(), "x_xiaoyan");
+        assert_eq!(IFlytekVoice::JohnCe.as_code(), "x_john_ce");
+        assert_eq!(IFlytekVoice::Luna.as_code(), "qianhui");
+        assert_eq!(IFlytekVoice::from_str("x_xiaoyan"), IFlytekVoice::Xiaoyan);
     }
 
     #[test]

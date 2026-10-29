@@ -745,7 +745,7 @@ mod tests {
         let info = tts.get_provider_info();
         assert!(info["provider"].as_str().unwrap().contains("iFlytek"));
         assert!(info["provider"].as_str().unwrap().contains("科大讯飞"));
-        assert_eq!(info["voice_code"].as_str().unwrap(), "xiaoyan");
+        assert_eq!(info["voice_code"].as_str().unwrap(), "x_xiaoyan");
         assert_eq!(info["sample_rate"].as_u64().unwrap(), 16000);
     }
 
