@@ -88,11 +88,14 @@ Available only in cn-north-4 and cn-east-3 regions. 30+ voices including:
 
 | Region | Region Code | STT/TTS Endpoint |
 |--------|-------------|------------------|
-| CN North-Beijing4 | cn-north-4 | sis.cn-north-4.myhuaweicloud.com |
-| CN East-Shanghai2 | cn-east-3 | sis.cn-east-3.myhuaweicloud.com |
+| CN North-Beijing4 | cn-north-4 | sis-ext.cn-north-4.myhuaweicloud.com |
+| CN East-Shanghai2 | cn-east-3 | sis-ext.cn-east-3.myhuaweicloud.com |
 | AP-Singapore | ap-southeast-3 | sis-ext.ap-southeast-3.myhuaweicloud.com |
 | CN-Hong Kong | ap-southeast-1 | sis-ext.ap-southeast-1.myhuaweicloud.com |
-| AP-Bangkok | ap-southeast-2 | sis-ext.ap-southeast-2.myhuaweicloud.com |
+| AP-Bangkok | ap-southeast-2 | none: Huawei offers no SIS here; the gateway refuses the region |
+
+Every region's host is `sis-ext.<region>` (Huawei's SIS "Endpoints" pages, China and
+international). The China regions' `sis.<region>` hosts do not exist.
 
 ### API URLs
 

@@ -64,13 +64,21 @@ pub const AUDIO_CHANNELS: u8 = 1;
 /// Audio sample width in bytes (16-bit).
 pub const AUDIO_SAMPLE_WIDTH: u8 = 2;
 
-/// Default `encode_type` (audio encoding selector) sent to `/v1/tts/synthesize`.
+/// Default `encode_type` (audio encoding selector) sent to `/v1/tts/synthesize`: `0`, WAV.
 ///
-/// `encode_type=1` is the value used by the reference Home Assistant integration
-/// (`minhdanh/ha-zalo-tts`, `data_payload = {.., 'encode_type': '1', ..}`), which corresponds to
-/// the documented WAV/PCM output (16kHz, mono, 16-bit). The official ZaloTTS Python library omits
-/// the field and gets the same default server-side, so `1` is the safe, audio-stable default.
-pub const DEFAULT_ENCODE_TYPE: u8 = 1;
+/// Zalo's API docs (ai.zalo.solutions, "Text to speech"): "encode_type : Optional, standard
+/// encoding for audio files ... 0 WAV, 1 MP3, 2 AAC". The provider hands its audio on as WAV, so it
+/// asks for WAV; `1` (what a Home Assistant integration posts) is MP3.
+pub const DEFAULT_ENCODE_TYPE: u8 = 0;
+
+/// The audio format an `encode_type` asks Zalo for (its docs: 0 WAV, 1 MP3, 2 AAC).
+pub fn encode_type_format(encode_type: u8) -> &'static str {
+    match encode_type {
+        1 => "mp3",
+        2 => "aac",
+        _ => "wav",
+    }
+}
 
 // =============================================================================
 // Voice Types
@@ -208,7 +216,7 @@ pub struct ZaloTtsConfig {
     /// Audio encoding selector sent as the `encode_type` form param to `/v1/tts/synthesize`.
     ///
     /// This is the standardized `output_audio_format` feature mapped to Zalo's native integer
-    /// encoding code (confirmed wire param: `minhdanh/ha-zalo-tts` posts `encode_type=1`). It is an
+    /// encoding code (0 WAV, 1 MP3, 2 AAC; see [`DEFAULT_ENCODE_TYPE`]). It is an
     /// audio-changing field. NOTE: `ZaloTts` implements `BaseTTS` directly and does NOT maintain a
     /// `compute_*_tts_config_hash` (no cache participation, unlike e.g. reverie/smallest), so there
     /// is no provider cache key to fold this into.
@@ -282,8 +290,8 @@ impl ZaloTtsConfig {
     ///
     /// Wired extras passthrough (Zalo has no typed `TtsFeatures` field for these):
     /// - `output_audio_format` (extras) -> the `encode_type` form param on `/v1/tts/synthesize`.
-    ///   Zalo's native encoding selector is an integer code; the reference Home Assistant
-    ///   integration (`minhdanh/ha-zalo-tts`) posts `encode_type=1`. Accepted as a JSON number or a
+    ///   Zalo's native encoding selector is an integer code (0 WAV, 1 MP3, 2 AAC). Accepted as a
+    ///   JSON number or a
     ///   numeric string. This is an audio-changing field (see [`ZaloTtsConfig::encode_type`] for the
     ///   cache-hash note — `ZaloTts` keeps no provider cache key).
     /// - `request_timeout_secs` (extras, non-standard knob) -> HTTP client timeout.
@@ -458,7 +466,7 @@ mod tests {
     fn output_audio_format_reaches_request_body_as_encode_type() {
         use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
         let mut extras = serde_json::Map::new();
-        // Override the default encode_type (1) with 2 so the assertion proves the value flows
+        // Override the default encode_type (0) with 2 so the assertion proves the value flows
         // through rather than coinciding with the default.
         extras.insert("output_audio_format".into(), serde_json::json!(2));
         let std = StandardTTSConfig {
@@ -500,8 +508,8 @@ mod tests {
         );
     }
 
-    // The `encode_type` form param is emitted unconditionally with its documented default (1) even
-    // when no `output_audio_format` is supplied, matching the reference HA integration's payload.
+    // The `encode_type` form param is emitted unconditionally with its documented default (0) even
+    // when no `output_audio_format` is supplied (WAV, per Zalo's docs).
     #[test]
     fn build_request_body_emits_default_encode_type() {
         let mut config = ZaloTtsConfig::default();
@@ -689,7 +697,7 @@ mod tests {
         assert!(body.contains("input=Xin"));
         assert!(body.contains("speaker_id=4"));
         assert!(body.contains("speed=1.1"));
-        assert!(body.contains("encode_type=1")); // default encode_type on the wire
+        assert!(body.contains("encode_type=0")); // default encode_type (WAV) on the wire
     }
 
     #[test]
@@ -788,5 +796,20 @@ mod tests {
 
         let zalo_config = ZaloTtsConfig::from_base(config).unwrap();
         assert_eq!(zalo_config.speed, DEFAULT_SPEED);
+    }
+
+    /// The default asks Zalo for WAV (its docs: 0 WAV, 1 MP3, 2 AAC), the format the provider
+    /// labels its audio with; another `encode_type` is labelled as what it asks for.
+    #[test]
+    fn the_default_encode_type_is_wav() {
+        assert_eq!(DEFAULT_ENCODE_TYPE, 0);
+        assert_eq!(encode_type_format(DEFAULT_ENCODE_TYPE), "wav");
+        assert_eq!(encode_type_format(1), "mp3");
+        assert_eq!(encode_type_format(2), "aac");
+        assert!(
+            ZaloTtsConfig::default()
+                .build_request_body("xin chào")
+                .contains("encode_type=0")
+        );
     }
 }

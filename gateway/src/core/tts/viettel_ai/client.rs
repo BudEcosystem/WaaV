@@ -14,8 +14,8 @@
 //! Output is WAV format at 16kHz sample rate.
 
 use super::config::{
-    AUDIO_SAMPLE_RATE, MAX_SPEED, MIN_SPEED, VIETTEL_TTS_ENDPOINT, ViettelTtsConfig,
-    ViettelTtsRequest, ViettelTtsResponse, ViettelVoice,
+    AUDIO_SAMPLE_RATE, CURRENT_VOICES, MAX_SPEED, MIN_SPEED, VIETTEL_TTS_ENDPOINT,
+    ViettelTtsConfig, ViettelTtsResponse, ViettelVoice,
 };
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
@@ -86,14 +86,7 @@ impl ViettelTts {
         let request_id = self.request_counter.fetch_add(1, Ordering::SeqCst);
 
         // Build request body
-        let request_body = ViettelTtsRequest {
-            text: text.to_string(),
-            voice: self.config.voice.voice_id().to_string(),
-            id: request_id.to_string(),
-            without_filter: self.config.without_filter,
-            speed: self.config.speed,
-            tts_return_option: self.config.tts_return_option,
-        };
+        let request_body = self.config.request(text, request_id);
 
         // Send request
         let http_client = self.http_client.as_ref().ok_or_else(|| {
@@ -461,20 +454,12 @@ impl BaseTTS for ViettelTts {
                 "central_accent": true,
                 "human_like_quality": "95%"
             },
-            "voices": [
-                {"id": "doanngocle", "name": "Doan Ngoc Le", "region": "northern", "gender": "female"},
-                {"id": "hn_female_ngochuyen_news_48k-fhg", "name": "Ngoc Huyen", "region": "northern", "gender": "female"},
-                {"id": "hn_female_thuthao_news_48k-fhg", "name": "Thu Thao", "region": "northern", "gender": "female"},
-                {"id": "hn_female_phuongtrang_news_48k-fhg", "name": "Phuong Trang", "region": "northern", "gender": "female"},
-                {"id": "hn_male_xuankien_news_48k-fhg", "name": "Xuan Kien", "region": "northern", "gender": "male"},
-                {"id": "hn_male_quang_news_48k-fhg", "name": "Quang", "region": "northern", "gender": "male"},
-                {"id": "sg_female_thuphuong_news_48k-fhg", "name": "Thu Phuong", "region": "southern", "gender": "female"},
-                {"id": "sg_female_minhly_news_48k-fhg", "name": "Minh Ly", "region": "southern", "gender": "female"},
-                {"id": "sg_female_huonggiang_news_48k-fhg", "name": "Huong Giang", "region": "southern", "gender": "female"},
-                {"id": "sg_male_trongphuc_news_48k-fhg", "name": "Trong Phuc", "region": "southern", "gender": "male"},
-                {"id": "hn_female_maiphuong_news_48k-fhg", "name": "Mai Phuong", "region": "central", "gender": "female"},
-                {"id": "hn_male_thanhtung_news_48k-fhg", "name": "Thanh Tung", "region": "central", "gender": "male"}
-            ]
+            "voices": CURRENT_VOICES
+                .iter()
+                .map(|(id, name, region, gender)| {
+                    serde_json::json!({"id": id, "name": name, "region": region, "gender": gender})
+                })
+                .collect::<Vec<_>>()
         })
     }
 }
@@ -750,7 +735,10 @@ mod tests {
 
         assert_eq!(info["provider"], "viettel-ai");
         assert_eq!(info["name"], "Viettel AI TTS (Viettel Group)");
-        assert_eq!(info["voices"].as_array().unwrap().len(), 12);
+        assert_eq!(
+            info["voices"].as_array().unwrap().len(),
+            CURRENT_VOICES.len()
+        );
     }
 
     #[test]
@@ -890,7 +878,7 @@ mod tests {
             ("minhly", ViettelVoice::SouthernFemale2),
             ("trongphuc", ViettelVoice::SouthernMale),
             ("maiphuong", ViettelVoice::CentralFemale),
-            ("thanhtung", ViettelVoice::CentralMale),
+            ("baoquoc", ViettelVoice::CentralMale),
         ];
 
         for (voice_id, expected_voice) in test_cases {

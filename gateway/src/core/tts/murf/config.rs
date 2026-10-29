@@ -226,7 +226,9 @@ pub enum MurfRegion {
 }
 
 impl MurfRegion {
-    /// Get the streaming endpoint URL for this region
+    /// Get the streaming endpoint URL for this region: the hosts Murf documents
+    /// (murf.ai/api/docs, "Text to Speech: Latency", regional endpoints; EU is `eu-central`, UAE
+    /// `me`, South America `sa-east`).
     #[inline]
     pub const fn streaming_url(&self) -> &'static str {
         match self {
@@ -235,13 +237,13 @@ impl MurfRegion {
             Self::UsWest => "https://us-west.api.murf.ai/v1/speech/stream",
             Self::India => "https://in.api.murf.ai/v1/speech/stream",
             Self::Canada => "https://ca.api.murf.ai/v1/speech/stream",
-            Self::EuCentral => "https://eu.api.murf.ai/v1/speech/stream",
+            Self::EuCentral => "https://eu-central.api.murf.ai/v1/speech/stream",
             Self::Uk => "https://uk.api.murf.ai/v1/speech/stream",
             Self::Japan => "https://jp.api.murf.ai/v1/speech/stream",
             Self::Australia => "https://au.api.murf.ai/v1/speech/stream",
             Self::SouthKorea => "https://kr.api.murf.ai/v1/speech/stream",
-            Self::Uae => "https://ae.api.murf.ai/v1/speech/stream",
-            Self::Brazil => "https://br.api.murf.ai/v1/speech/stream",
+            Self::Uae => "https://me.api.murf.ai/v1/speech/stream",
+            Self::Brazil => "https://sa-east.api.murf.ai/v1/speech/stream",
         }
     }
 
@@ -254,13 +256,13 @@ impl MurfRegion {
             Self::UsWest => "us-west",
             Self::India => "in",
             Self::Canada => "ca",
-            Self::EuCentral => "eu",
+            Self::EuCentral => "eu-central",
             Self::Uk => "uk",
             Self::Japan => "jp",
             Self::Australia => "au",
             Self::SouthKorea => "kr",
-            Self::Uae => "ae",
-            Self::Brazil => "br",
+            Self::Uae => "me",
+            Self::Brazil => "sa-east",
         }
     }
 
@@ -286,8 +288,8 @@ impl MurfRegion {
             "japan" | "jp" | "tokyo" => Some(Self::Japan),
             "australia" | "au" | "sydney" => Some(Self::Australia),
             "south-korea" | "south_korea" | "korea" | "kr" | "seoul" => Some(Self::SouthKorea),
-            "uae" | "ae" | "dubai" => Some(Self::Uae),
-            "brazil" | "br" | "sao-paulo" => Some(Self::Brazil),
+            "uae" | "ae" | "me" | "dubai" => Some(Self::Uae),
+            "brazil" | "br" | "sa-east" | "sa_east" | "sao-paulo" => Some(Self::Brazil),
             _ => None,
         }
     }
@@ -1106,11 +1108,8 @@ mod tests {
 
     #[test]
     fn test_config_from_base() {
-        // Set env var for test (SAFETY: Test-only, no concurrent access)
-        unsafe {
-            std::env::set_var("MURF_API_KEY", "test-env-key");
-        }
-
+        // The explicit key is the config's (no process env change: `MURF_API_KEY` set here raced
+        // `provider::tests::test_murf_tts_requires_api_key`, which runs in parallel).
         let base = TTSConfig {
             api_key: "test-key".to_string(),
             voice_id: Some("en-US-natalie".to_string()),
@@ -1128,11 +1127,6 @@ mod tests {
         assert_eq!(config.model, MurfModel::Gen2);
         // Default region is Global (can be set via builder methods)
         assert_eq!(config.region, MurfRegion::Global);
-
-        // Clean up (SAFETY: Test-only, no concurrent access)
-        unsafe {
-            std::env::remove_var("MURF_API_KEY");
-        }
     }
 
     #[test]
@@ -1151,5 +1145,35 @@ mod tests {
         assert_eq!(config.rate, Some(10));
         assert_eq!(config.pitch, Some(-5));
         assert_eq!(config.style, Some("Conversational".to_string()));
+    }
+
+    /// Every region streams from the host Murf documents for it (murf.ai/api/docs, "Text to
+    /// Speech: Latency"): `eu`, `ae` and `br` hosts do not exist.
+    #[test]
+    fn every_region_streams_from_its_documented_host() {
+        for (region, host) in [
+            (MurfRegion::Global, "global"),
+            (MurfRegion::UsEast, "us-east"),
+            (MurfRegion::UsWest, "us-west"),
+            (MurfRegion::India, "in"),
+            (MurfRegion::Canada, "ca"),
+            (MurfRegion::EuCentral, "eu-central"),
+            (MurfRegion::Uk, "uk"),
+            (MurfRegion::Japan, "jp"),
+            (MurfRegion::Australia, "au"),
+            (MurfRegion::SouthKorea, "kr"),
+            (MurfRegion::Uae, "me"),
+            (MurfRegion::Brazil, "sa-east"),
+        ] {
+            assert_eq!(
+                region.streaming_url(),
+                format!("https://{host}.api.murf.ai/v1/speech/stream"),
+                "{region:?}"
+            );
+            assert_eq!(region.subdomain(), host, "{region:?}");
+        }
+        assert_eq!(MurfRegion::from_str("me"), Some(MurfRegion::Uae));
+        assert_eq!(MurfRegion::from_str("sa-east"), Some(MurfRegion::Brazil));
+        assert_eq!(MurfRegion::from_str("eu"), Some(MurfRegion::EuCentral));
     }
 }

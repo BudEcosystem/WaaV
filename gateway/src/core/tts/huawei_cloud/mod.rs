@@ -50,11 +50,11 @@
 //!
 //! | Region | Code | Endpoint |
 //! |--------|------|----------|
-//! | CN North-Beijing4 | cn-north-4 | sis.cn-north-4.myhuaweicloud.com |
-//! | CN East-Shanghai2 | cn-east-3 | sis.cn-east-3.myhuaweicloud.com |
+//! | CN North-Beijing4 | cn-north-4 | sis-ext.cn-north-4.myhuaweicloud.com |
+//! | CN East-Shanghai2 | cn-east-3 | sis-ext.cn-east-3.myhuaweicloud.com |
 //! | AP-Singapore | ap-southeast-3 | sis-ext.ap-southeast-3.myhuaweicloud.com |
 //! | CN-Hong Kong | ap-southeast-1 | sis-ext.ap-southeast-1.myhuaweicloud.com |
-//! | AP-Bangkok | ap-southeast-2 | sis-ext.ap-southeast-2.myhuaweicloud.com |
+//! | AP-Bangkok | ap-southeast-2 | none: Huawei offers no SIS here (refused at config) |
 //!
 //! # Limitations
 //!

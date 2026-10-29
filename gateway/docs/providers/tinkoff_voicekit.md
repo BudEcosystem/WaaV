@@ -210,8 +210,18 @@ service TextToSpeech {
 
 | Voice ID | Gender | Language | Description |
 |----------|--------|----------|-------------|
-| alyona | Female | ru-RU | Default Russian female voice |
-| dorofeev | Male | ru-RU | Russian male voice |
+| anna | Female | ru-RU | Default Russian female voice |
+| dima | Male | ru-RU | Russian male voice |
+
+These are the public FastPitch voices on T-Bank's voice list (developer.tbank.ru/voicekit,
+"Список голосов"); the voices were replaced on 19.03.2025. The earlier `alyona` and `dorofeev`
+are sent as `anna` and `dima`, with a warning. LAM voices are UUIDs available through T-Bank
+support only.
+
+**TLS:** `api.tinkoff.ai` presents a certificate chained to "Russian Trusted Root CA" (Ministry
+of Digital Development), which the common OS trust stores do not include. The gateway's gRPC
+channel uses the OS trust store, so a host (or container image) that calls Tinkoff needs that
+root certificate installed.
 
 ### 4.3 Audio Formats
 
@@ -240,7 +250,7 @@ message SynthesisInput {
 
 message VoiceSelectionParams {
     string language_code = 1;  // "ru-RU"
-    string name = 2;           // "alyona", "dorofeev"
+    string name = 2;           // "anna", "dima"
     SsmlVoiceGender ssml_gender = 3;
 }
 

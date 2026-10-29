@@ -304,14 +304,14 @@ impl BaseTTS for TinkoffTts {
             "language": "ru-RU",
             "voices": [
                 {
-                    "id": "alyona",
-                    "name": "Alyona",
+                    "id": "anna",
+                    "name": "Anna",
                     "gender": "female",
                     "language": "ru-RU"
                 },
                 {
-                    "id": "dorofeev",
-                    "name": "Dorofeev",
+                    "id": "dima",
+                    "name": "Dima",
                     "gender": "male",
                     "language": "ru-RU"
                 }
@@ -347,7 +347,7 @@ mod tests {
         TTSConfig {
             provider: "tinkoff".to_string(),
             api_key: "test-api-key".to_string(),
-            voice_id: Some("alyona".to_string()),
+            voice_id: Some("anna".to_string()),
             model: "default".to_string(),
             audio_format: Some("linear16".to_string()),
             sample_rate: Some(24000),
@@ -365,7 +365,7 @@ mod tests {
             base: TTSConfig {
                 provider: "tinkoff".into(),
                 api_key: "test-api-key|test-secret-key".into(),
-                voice_id: Some("alyona".into()),
+                voice_id: Some("anna".into()),
                 ..Default::default()
             },
             features: TtsFeatures {
@@ -392,7 +392,7 @@ mod tests {
         let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
             provider: "tinkoff".into(),
             api_key: "test-api-key|test-secret-key".into(),
-            voice_id: Some("alyona".into()),
+            voice_id: Some("anna".into()),
             ..Default::default()
         })
         .with_endpoint_override("http://127.0.0.1:9000");
@@ -437,8 +437,8 @@ mod tests {
 
         let voices = info["voices"].as_array().unwrap();
         assert_eq!(voices.len(), 2);
-        assert_eq!(voices[0]["id"], "alyona");
-        assert_eq!(voices[1]["id"], "dorofeev");
+        assert_eq!(voices[0]["id"], "anna");
+        assert_eq!(voices[1]["id"], "dima");
     }
 
     #[test]
@@ -648,12 +648,13 @@ mod tests {
     #[test]
     fn test_tinkoff_tts_config_with_different_voices() {
         let mut config = create_test_config();
+        // The retired male voice, parsed to its successor.
         config.voice_id = Some("dorofeev".to_string());
 
         let tts = TinkoffTts::new(config).unwrap();
         let tinkoff_config = tts.config.as_ref().unwrap();
 
-        assert_eq!(tinkoff_config.voice.as_str(), "dorofeev");
+        assert_eq!(tinkoff_config.voice.as_str(), "dima");
         assert_eq!(tinkoff_config.voice.gender(), "male");
     }
 

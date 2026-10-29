@@ -79,11 +79,12 @@ impl HuaweiCloudRegion {
         }
     }
 
-    /// Get the SIS API endpoint for this region.
+    /// Get the SIS API endpoint for this region: `sis-ext.<region>` in every region (Huawei's SIS
+    /// "Endpoints" pages; the China regions' `sis.<region>` hosts do not exist).
     pub fn sis_endpoint(&self) -> &'static str {
         match self {
-            Self::CnNorth4 => "sis.cn-north-4.myhuaweicloud.com",
-            Self::CnEast3 => "sis.cn-east-3.myhuaweicloud.com",
+            Self::CnNorth4 => "sis-ext.cn-north-4.myhuaweicloud.com",
+            Self::CnEast3 => "sis-ext.cn-east-3.myhuaweicloud.com",
             Self::ApSoutheast3 => "sis-ext.ap-southeast-3.myhuaweicloud.com",
             Self::ApSoutheast1 => "sis-ext.ap-southeast-1.myhuaweicloud.com",
             Self::ApSoutheast2 => "sis-ext.ap-southeast-2.myhuaweicloud.com",
@@ -113,6 +114,12 @@ impl HuaweiCloudRegion {
     /// Check if this region is in China.
     pub fn is_china(&self) -> bool {
         matches!(self, Self::CnNorth4 | Self::CnEast3)
+    }
+
+    /// Whether Huawei offers SIS in this region. Its endpoint pages list cn-north-4, cn-east-3 and
+    /// ap-southeast-3 (and ap-southeast-1 resolves); ap-southeast-2 (Bangkok) has no SIS host.
+    pub fn has_sis(&self) -> bool {
+        !matches!(self, Self::ApSoutheast2)
     }
 
     /// Check if this region supports premium voices.
@@ -480,6 +487,14 @@ impl HuaweiCloudTtsConfig {
             return Err(TTSError::InvalidConfiguration(
                 "Volume must be between 0 and 100".to_string(),
             ));
+        }
+
+        if !self.region.has_sis() {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "Huawei Cloud offers no speech service (SIS) in {}; use cn-north-4, cn-east-3 or \
+                 ap-southeast-3",
+                self.region.code()
+            )));
         }
 
         // Check premium voice region support
@@ -1112,7 +1127,7 @@ mod tests {
     fn test_region_endpoint() {
         assert_eq!(
             HuaweiCloudRegion::CnNorth4.sis_endpoint(),
-            "sis.cn-north-4.myhuaweicloud.com"
+            "sis-ext.cn-north-4.myhuaweicloud.com"
         );
         assert_eq!(
             HuaweiCloudRegion::ApSoutheast3.sis_endpoint(),
@@ -1367,11 +1382,11 @@ mod tests {
 
         assert_eq!(
             config.get_tts_url(),
-            "https://sis.cn-north-4.myhuaweicloud.com/v1/abc123/tts"
+            "https://sis-ext.cn-north-4.myhuaweicloud.com/v1/abc123/tts"
         );
         assert_eq!(
             config.get_rtts_url(),
-            "wss://sis.cn-north-4.myhuaweicloud.com/v1/abc123/rtts"
+            "wss://sis-ext.cn-north-4.myhuaweicloud.com/v1/abc123/rtts"
         );
     }
 
@@ -1498,5 +1513,38 @@ mod tests {
         assert!(formats.contains(&"wav"));
         assert!(formats.contains(&"mp3"));
         assert!(formats.contains(&"pcm"));
+    }
+
+    /// Every region's host is `sis-ext.<region>` (Huawei's SIS endpoint pages; the China regions'
+    /// `sis.<region>` do not exist), and Bangkok, which has no SIS, is refused at config.
+    #[test]
+    fn regions_use_the_documented_sis_hosts() {
+        for (region, host) in [
+            (
+                HuaweiCloudRegion::CnNorth4,
+                "sis-ext.cn-north-4.myhuaweicloud.com",
+            ),
+            (
+                HuaweiCloudRegion::CnEast3,
+                "sis-ext.cn-east-3.myhuaweicloud.com",
+            ),
+            (
+                HuaweiCloudRegion::ApSoutheast3,
+                "sis-ext.ap-southeast-3.myhuaweicloud.com",
+            ),
+        ] {
+            assert_eq!(region.sis_endpoint(), host, "{region:?}");
+            assert!(region.has_sis());
+        }
+        let config = HuaweiCloudTtsConfig {
+            username: "test-user".to_string(),
+            password: "test-password".to_string(),
+            domain_name: "test-domain".to_string(),
+            project_id: "test-project".to_string(),
+            region: HuaweiCloudRegion::ApSoutheast2,
+            ..Default::default()
+        };
+        let refused = config.validate().unwrap_err().to_string();
+        assert!(refused.contains("no speech service"), "{refused}");
     }
 }

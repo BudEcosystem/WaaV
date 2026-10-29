@@ -6,7 +6,7 @@
 //! ## Features
 //!
 //! - Russian language synthesis
-//! - Multiple voices (alyona, dorofeev)
+//! - The public FastPitch voices (anna, dima; the retired alyona and dorofeev map to them)
 //! - SSML support
 //! - Speaking rate and pitch control
 //! - Streaming synthesis
@@ -24,7 +24,7 @@
 //!
 //! let config = TTSConfig {
 //!     provider: "tinkoff".to_string(),
-//!     voice_id: Some("alyona".to_string()),
+//!     voice_id: Some("anna".to_string()),
 //!     sample_rate: Some(24000),
 //!     ..Default::default()
 //! };
@@ -38,8 +38,12 @@
 //!
 //! | Voice ID | Gender | Language | Description |
 //! |----------|--------|----------|-------------|
-//! | alyona | Female | ru-RU | Default Russian female voice |
-//! | dorofeev | Male | ru-RU | Russian male voice |
+//! | anna | Female | ru-RU | Default Russian female voice |
+//! | dima | Male | ru-RU | Russian male voice |
+//!
+//! `api.tinkoff.ai` presents a certificate chained to "Russian Trusted Root CA", which the common
+//! OS trust stores do not carry; the gRPC channel uses the OS store, so a host that calls Tinkoff
+//! needs that root installed.
 //!
 //! ## gRPC Endpoint
 //!
@@ -83,7 +87,7 @@ mod tests {
     fn create_test_config() -> TTSConfig {
         TTSConfig {
             api_key: String::new(),
-            voice_id: Some("alyona".to_string()),
+            voice_id: Some("anna".to_string()),
             model: "default".to_string(),
             audio_format: Some("linear16".to_string()),
             sample_rate: Some(24000),
@@ -100,8 +104,21 @@ mod tests {
 
     #[test]
     fn test_tinkoff_voice_codes() {
-        assert_eq!(TinkoffVoice::Alyona.as_str(), "alyona");
-        assert_eq!(TinkoffVoice::Dorofeev.as_str(), "dorofeev");
+        assert_eq!(TinkoffVoice::Anna.as_str(), "anna");
+        assert_eq!(TinkoffVoice::Dima.as_str(), "dima");
+        // Replaced on 19.03.2025: each parses to the new voice of its gender, and says so.
+        assert_eq!(
+            TinkoffVoice::parse_with_migration("alyona"),
+            Ok((TinkoffVoice::Anna, Some("alyona")))
+        );
+        assert_eq!(
+            TinkoffVoice::parse_with_migration("Dorofeev"),
+            Ok((TinkoffVoice::Dima, Some("dorofeev")))
+        );
+        assert_eq!(
+            TinkoffVoice::parse_with_migration("dima"),
+            Ok((TinkoffVoice::Dima, None))
+        );
     }
 
     #[test]
@@ -122,7 +139,7 @@ mod tests {
     fn test_tinkoff_config_from_base() {
         let config = create_test_config();
         let tinkoff_config = TinkoffTtsConfig::from_base(config).unwrap();
-        assert_eq!(tinkoff_config.voice, TinkoffVoice::Alyona);
+        assert_eq!(tinkoff_config.voice, TinkoffVoice::Anna);
         assert_eq!(tinkoff_config.encoding, TinkoffAudioEncoding::Linear16);
     }
 

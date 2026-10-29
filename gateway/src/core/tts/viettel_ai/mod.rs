@@ -23,7 +23,7 @@
 //!
 //! - Token-based authentication via `token` header
 //! - Tokens valid for 180 days
-//! - Create tokens at https://viettelgroup.ai/dashboard/token
+//! - Create tokens at https://viettelai.vn (account, API token)
 
 mod client;
 pub mod config;
