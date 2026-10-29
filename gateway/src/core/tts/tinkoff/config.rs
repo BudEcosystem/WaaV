@@ -128,12 +128,20 @@ impl TinkoffTtsConfig {
             .unwrap_or(base_secret_key);
 
         // Parse voice
-        let voice = base
-            .voice_id
-            .as_ref()
-            .map(|v| TinkoffVoice::from_str(v))
-            .transpose()?
-            .unwrap_or_default();
+        let voice = match base.voice_id.as_deref() {
+            Some(id) => {
+                let (voice, retired) = TinkoffVoice::parse_with_migration(id)?;
+                if let Some(old) = retired {
+                    tracing::warn!(
+                        voice = old,
+                        replacement = voice.as_str(),
+                        "Tinkoff VoiceKit replaced this voice on 19.03.2025; using its successor"
+                    );
+                }
+                voice
+            }
+            None => TinkoffVoice::default(),
+        };
 
         // Parse encoding
         let encoding = base
@@ -286,33 +294,42 @@ impl TinkoffTtsConfig {
     }
 }
 
-/// Available voices for Tinkoff TTS
+/// Available voices for Tinkoff TTS: the public FastPitch voices T-Bank's voice list documents
+/// (developer.tbank.ru/voicekit, "Список голосов"). The voices were replaced on 19.03.2025 ("Теперь
+/// ... Анна и Дима"); the earlier `alyona` and `dorofeev` parse to the new voice of the same gender.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TinkoffVoice {
-    /// Alyona - Russian female voice (default)
+    /// Anna - Russian female voice (default)
     #[default]
-    Alyona,
-    /// Dorofeev - Russian male voice
-    Dorofeev,
+    Anna,
+    /// Dima - Russian male voice
+    Dima,
 }
 
 impl TinkoffVoice {
     /// Get the voice ID string for API requests
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Alyona => "alyona",
-            Self::Dorofeev => "dorofeev",
+            Self::Anna => "anna",
+            Self::Dima => "dima",
         }
     }
 
     /// Parse voice from string
     pub fn from_str(s: &str) -> Result<Self, String> {
-        match s.to_lowercase().as_str() {
-            "alyona" => Ok(Self::Alyona),
-            "dorofeev" => Ok(Self::Dorofeev),
+        Self::parse_with_migration(s).map(|(voice, _)| voice)
+    }
+
+    /// Parse a voice, reporting the retired voice it replaced when it was one.
+    pub fn parse_with_migration(s: &str) -> Result<(Self, Option<&'static str>), String> {
+        match s.trim().to_lowercase().as_str() {
+            "anna" => Ok((Self::Anna, None)),
+            "dima" => Ok((Self::Dima, None)),
+            "alyona" => Ok((Self::Anna, Some("alyona"))),
+            "dorofeev" => Ok((Self::Dima, Some("dorofeev"))),
             _ => Err(format!(
-                "Unknown Tinkoff voice: {}. Available: alyona, dorofeev",
+                "Unknown Tinkoff voice: {}. Available: anna, dima",
                 s
             )),
         }
@@ -321,22 +338,22 @@ impl TinkoffVoice {
     /// Get display name
     pub fn display_name(&self) -> &'static str {
         match self {
-            Self::Alyona => "Alyona (Female)",
-            Self::Dorofeev => "Dorofeev (Male)",
+            Self::Anna => "Anna (Female)",
+            Self::Dima => "Dima (Male)",
         }
     }
 
     /// Get gender
     pub fn gender(&self) -> &'static str {
         match self {
-            Self::Alyona => "female",
-            Self::Dorofeev => "male",
+            Self::Anna => "female",
+            Self::Dima => "male",
         }
     }
 
     /// Get all available voices
     pub fn all() -> &'static [TinkoffVoice] {
-        &[Self::Alyona, Self::Dorofeev]
+        &[Self::Anna, Self::Dima]
     }
 }
 
@@ -426,7 +443,7 @@ mod tests {
                 api_key: "test".into(),
                 // The shared TTSConfig default voice_id ("aura-asteria-en") is a Deepgram voice
                 // that Tinkoff rejects; pin a valid Tinkoff voice so from_base/from_standard resolve.
-                voice_id: Some("alyona".into()),
+                voice_id: Some("anna".into()),
                 ..Default::default()
             },
             features: TtsFeatures {
@@ -457,7 +474,7 @@ mod tests {
         let base = TTSConfig {
             provider: "tinkoff".into(),
             api_key: "test".into(),
-            voice_id: Some("alyona".into()),
+            voice_id: Some("anna".into()),
             ..Default::default()
         };
         let with_ssml = StandardTTSConfig {
@@ -480,25 +497,24 @@ mod tests {
 
     #[test]
     fn test_tinkoff_voice_from_str() {
-        assert_eq!(
-            TinkoffVoice::from_str("alyona").unwrap(),
-            TinkoffVoice::Alyona
-        );
+        assert_eq!(TinkoffVoice::from_str("anna").unwrap(), TinkoffVoice::Anna);
+        assert_eq!(TinkoffVoice::from_str("DIMA").unwrap(), TinkoffVoice::Dima);
+        // The voices T-Bank replaced on 19.03.2025 parse to their successors.
         assert_eq!(
             TinkoffVoice::from_str("ALYONA").unwrap(),
-            TinkoffVoice::Alyona
+            TinkoffVoice::Anna
         );
         assert_eq!(
             TinkoffVoice::from_str("dorofeev").unwrap(),
-            TinkoffVoice::Dorofeev
+            TinkoffVoice::Dima
         );
         assert!(TinkoffVoice::from_str("invalid").is_err());
     }
 
     #[test]
     fn test_tinkoff_voice_as_str() {
-        assert_eq!(TinkoffVoice::Alyona.as_str(), "alyona");
-        assert_eq!(TinkoffVoice::Dorofeev.as_str(), "dorofeev");
+        assert_eq!(TinkoffVoice::Anna.as_str(), "anna");
+        assert_eq!(TinkoffVoice::Dima.as_str(), "dima");
     }
 
     #[test]
@@ -533,14 +549,14 @@ mod tests {
     fn test_tinkoff_config_from_base() {
         let base = TTSConfig {
             api_key: "test".to_string(),
-            voice_id: Some("alyona".to_string()),
+            voice_id: Some("anna".to_string()),
             sample_rate: Some(24000),
             audio_format: Some("linear16".to_string()),
             ..Default::default()
         };
 
         let config = TinkoffTtsConfig::from_base(base).unwrap();
-        assert_eq!(config.voice, TinkoffVoice::Alyona);
+        assert_eq!(config.voice, TinkoffVoice::Anna);
         assert_eq!(config.encoding, TinkoffAudioEncoding::Linear16);
         assert_eq!(config.sample_rate, 24000);
     }
@@ -589,7 +605,7 @@ mod tests {
         let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
             provider: "tinkoff".into(),
             api_key: "test-api-key|test-secret-key".into(),
-            voice_id: Some("alyona".into()),
+            voice_id: Some("anna".into()),
             ..Default::default()
         })
         .with_endpoint_override("file:///tmp/socket");
@@ -623,7 +639,7 @@ mod tests {
     fn test_tinkoff_voice_all() {
         let voices = TinkoffVoice::all();
         assert_eq!(voices.len(), 2);
-        assert!(voices.contains(&TinkoffVoice::Alyona));
-        assert!(voices.contains(&TinkoffVoice::Dorofeev));
+        assert!(voices.contains(&TinkoffVoice::Anna));
+        assert!(voices.contains(&TinkoffVoice::Dima));
     }
 }

@@ -2,7 +2,7 @@
 
 > **Provider #49** | Vietnamese STT + TTS Provider
 > **Company:** Viettel Group (Vietnam's largest telecommunications company)
-> **Website:** https://viettelai.vn | https://viettelgroup.ai
+> **Website:** https://viettelai.vn
 > **Last Updated:** 2026-01-14
 
 ---
@@ -28,7 +28,7 @@ Viettel AI is a Vietnamese AI platform developed by Viettel Group, Vietnam's lar
 Viettel AI uses token-based authentication with 180-day validity.
 
 **Getting a Token:**
-1. Register at https://viettelgroup.ai
+1. Register at https://viettelai.vn (the former `viettelgroup.ai` no longer resolves)
 2. Login and navigate to Dashboard > Token
 3. Create a new token
 4. Use token in API requests
@@ -47,14 +47,24 @@ token: YOUR_TOKEN_HERE
 ### Synthesis Endpoint
 
 ```
-POST https://viettelgroup.ai/voice/api/tts/v1/rest/syn
+POST https://viettelai.vn/tts/speech_synthesis
 ```
+
+The token goes in the JSON body as `token` (this endpoint does not check the `token` header);
+the gateway sends both.
 
 ### Voice List Endpoint
 
 ```
-GET https://viettelgroup.ai/voice/api/tts/v1/rest/voices
+GET https://viettelai.vn/tts/voices
 ```
+
+Public; returns `[{name, description, code, location}]`. The current voices (16): `hn-quynhanh`
+(gateway default), `hn-phuongtrang`, `hn-thaochi`, `hn-thanhha`, `hn-thanhphuong`, `hn-thanhtung`,
+`hn-namkhanh`, `hn-tienquan`, `hcm-diemmy`, `hcm-phuongly`, `hcm-thuydung`, `hcm-thuyduyen`,
+`hn-leyen`, `hcm-minhquan`, `hue-maingoc`, `hue-baoquoc`. The earlier ids (`doanngocle`,
+`*_news_48k-fhg`) are not on the list; the gateway sends each as a current voice of the same
+region and gender.
 
 ### Request Headers
 
@@ -68,7 +78,7 @@ GET https://viettelgroup.ai/voice/api/tts/v1/rest/voices
 ```json
 {
   "text": "Xin chào, tôi là trợ lý ảo Viettel.",
-  "voice": "doanngocle",
+  "voice": "hn-quynhanh",
   "id": "1",
   "without_filter": false,
   "speed": 1.0,
@@ -81,7 +91,7 @@ GET https://viettelgroup.ai/voice/api/tts/v1/rest/voices
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `text` | string | Yes | Text to synthesize (Vietnamese) |
-| `voice` | string | Yes | Voice name (e.g., "doanngocle") |
+| `voice` | string | Yes | Voice code (e.g., "hn-quynhanh") |
 | `id` | string | No | Request identifier |
 | `without_filter` | boolean | No | Disable text preprocessing |
 | `speed` | float | No | Speech speed (default: 1.0) |
@@ -94,7 +104,7 @@ Viettel AI provides 11 Vietnamese voices categorized by region:
 **Northern Voices (5 voices):**
 - 3 female voices
 - 2 male voices
-- Example: `doanngocle`
+- Example: `hn-quynhanh`
 
 **Southern Voices (4 voices):**
 - 3 female voices
@@ -114,11 +124,12 @@ curl --request POST \
   --header "token: YOUR_TOKEN" \
   --data '{
     "text": "Xin chào",
-    "voice": "doanngocle",
+    "voice": "hn-quynhanh",
     "speed": 1.0,
-    "tts_return_option": 2
+    "tts_return_option": 2,
+    "token": "YOUR_TOKEN"
   }' \
-  https://viettelgroup.ai/voice/api/tts/v1/rest/syn > output.wav
+  https://viettelai.vn/tts/speech_synthesis > output.wav
 ```
 
 ### Response
@@ -132,7 +143,7 @@ Returns audio data directly in WAV format.
 ### File Decode Endpoint
 
 ```
-POST https://viettelgroup.ai/voice/api/asr/v1/rest/decode_file
+POST https://viettelai.vn/voice/api/asr/v1/rest/decode_file
 ```
 
 ### Request Headers
@@ -158,7 +169,7 @@ For PCM audio files, include these additional headers:
 curl --request POST \
   --header "token: YOUR_TOKEN" \
   -F "file=@/path/to/audio.wav" \
-  https://viettelgroup.ai/voice/api/asr/v1/rest/decode_file
+  https://viettelai.vn/voice/api/asr/v1/rest/decode_file
 ```
 
 ### PCM File Example
@@ -170,7 +181,7 @@ curl --request POST \
   --header "format: S16LE" \
   --header "num_of_channels: 1" \
   -F "file=@/path/to/audio.pcm" \
-  https://viettelgroup.ai/voice/api/asr/v1/rest/decode_file
+  https://viettelai.vn/voice/api/asr/v1/rest/decode_file
 ```
 
 ### Python Example
@@ -178,7 +189,7 @@ curl --request POST \
 ```python
 import requests
 
-url = "https://viettelgroup.ai/voice/api/asr/v1/rest/decode_file"
+url = "https://viettelai.vn/voice/api/asr/v1/rest/decode_file"
 headers = {
     'token': 'YOUR_TOKEN',
     # For PCM files:
@@ -263,10 +274,11 @@ print(response.json())
                               ▼
               ┌───────────────────────────────┐
               │      Viettel AI Cloud         │
-              │   viettelgroup.ai/voice/api   │
+              │         viettelai.vn          │
               ├───────────────────────────────┤
-              │  TTS: /tts/v1/rest/syn        │
-              │  STT: /asr/v1/rest/decode_file│
+              │  TTS: /tts/speech_synthesis   │
+              │  STT: /voice/api/asr/v1/rest/ │
+              │       decode_file             │
               └───────────────────────────────┘
 ```
 
@@ -279,7 +291,7 @@ print(response.json())
 ```rust
 pub struct ViettelTtsConfig {
     pub api_key: String,          // Token for authentication
-    pub voice: String,            // Voice name (e.g., "doanngocle")
+    pub voice: String,            // Voice code (e.g., "hn-quynhanh")
     pub speed: f32,               // Speech speed (default: 1.0)
     pub without_filter: bool,     // Disable text preprocessing
     pub tts_return_option: u8,    // Return format (2 = binary)
@@ -322,11 +334,10 @@ pub struct ViettelSttConfig {
 ## References
 
 - [Viettel AI Official Site](https://viettelai.vn/en)
-- [Viettel Group AI Platform](https://viettelgroup.ai)
-- [TTS Documentation](https://viettelgroup.ai/en/document/tts)
-- [ASR Documentation](https://viettelgroup.ai/en/document/rest)
-- [Speech Synthesis Service](https://viettelgroup.ai/en/service/tts)
-- [Speech Recognition Service](https://viettelgroup.ai/en/service/asr)
+- [Viettel AI Platform](https://viettelai.vn)
+- [Text to speech](https://viettelai.vn/en/text-to-speech)
+- [Speech to text](https://viettelai.vn/en/speech-to-text)
+- The former `viettelgroup.ai` documentation is offline with that domain.
 
 ---
 

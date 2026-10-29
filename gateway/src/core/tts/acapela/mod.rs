@@ -66,8 +66,9 @@ pub const MAX_TEXT_LENGTH_GET: usize = 2048;
 /// Maximum text length per request (stream output)
 pub const MAX_TEXT_LENGTH_STREAM: usize = 3000;
 
-/// Default voice ID (Alice - French female)
-pub const DEFAULT_VOICE_ID: &str = "alice";
+/// Default voice ID (Alice - French female), as Acapela names its voices
+/// (`<Speaker>[-<REGION>]22k_HQ`; `GET /api/voice/`, docs_api: "voice ... Alice22_HQ").
+pub const DEFAULT_VOICE_ID: &str = "Alice22k_HQ";
 
 /// Default sample rate (Hz)
 pub const DEFAULT_SAMPLE_RATE: u32 = 22050;

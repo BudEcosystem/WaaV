@@ -75,34 +75,27 @@ fn test_voice_default() {
 
 #[test]
 fn test_voice_ids() {
-    assert_eq!(ViettelVoice::DoanNgocLe.voice_id(), "doanngocle");
-    assert!(
-        ViettelVoice::NorthernFemale1
-            .voice_id()
-            .contains("ngochuyen")
+    for (voice, code) in [
+        (ViettelVoice::DoanNgocLe, "hn-quynhanh"),
+        (ViettelVoice::NorthernFemale1, "hn-thaochi"),
+        (ViettelVoice::NorthernFemale2, "hn-thanhha"),
+        (ViettelVoice::NorthernFemale3, "hn-phuongtrang"),
+        (ViettelVoice::NorthernMale1, "hn-namkhanh"),
+        (ViettelVoice::NorthernMale2, "hn-tienquan"),
+        (ViettelVoice::SouthernFemale1, "hcm-diemmy"),
+        (ViettelVoice::SouthernFemale2, "hcm-phuongly"),
+        (ViettelVoice::SouthernFemale3, "hcm-thuydung"),
+        (ViettelVoice::SouthernMale, "hcm-minhquan"),
+        (ViettelVoice::CentralFemale, "hue-maingoc"),
+        (ViettelVoice::CentralMale, "hue-baoquoc"),
+    ] {
+        assert_eq!(voice.voice_id(), code, "{voice:?}");
+    }
+    // An id not on the old list is sent as given (a current code).
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("hn-thanhphuong").voice_id(),
+        "hn-thanhphuong"
     );
-    assert!(ViettelVoice::NorthernFemale2.voice_id().contains("thuthao"));
-    assert!(
-        ViettelVoice::NorthernFemale3
-            .voice_id()
-            .contains("phuongtrang")
-    );
-    assert!(ViettelVoice::NorthernMale1.voice_id().contains("xuankien"));
-    assert!(ViettelVoice::NorthernMale2.voice_id().contains("quang"));
-    assert!(
-        ViettelVoice::SouthernFemale1
-            .voice_id()
-            .contains("thuphuong")
-    );
-    assert!(ViettelVoice::SouthernFemale2.voice_id().contains("minhly"));
-    assert!(
-        ViettelVoice::SouthernFemale3
-            .voice_id()
-            .contains("huonggiang")
-    );
-    assert!(ViettelVoice::SouthernMale.voice_id().contains("trongphuc"));
-    assert!(ViettelVoice::CentralFemale.voice_id().contains("maiphuong"));
-    assert!(ViettelVoice::CentralMale.voice_id().contains("thanhtung"));
 }
 
 #[test]
@@ -110,22 +103,22 @@ fn test_voice_display_names() {
     assert!(
         ViettelVoice::DoanNgocLe
             .display_name()
-            .contains("Doan Ngoc Le")
+            .contains("Quynh Anh")
     );
     assert!(
         ViettelVoice::NorthernFemale1
             .display_name()
-            .contains("Ngoc Huyen")
+            .contains("Thao Chi")
     );
     assert!(
         ViettelVoice::SouthernMale
             .display_name()
-            .contains("Trong Phuc")
+            .contains("Minh Quan")
     );
     assert!(
         ViettelVoice::CentralFemale
             .display_name()
-            .contains("Mai Phuong")
+            .contains("Mai Ngoc")
     );
 }
 
@@ -215,8 +208,13 @@ fn test_voice_from_str_central() {
         ViettelVoice::from_str_relaxed("maiphuong"),
         ViettelVoice::CentralFemale
     );
+    // Thanh Tung is on the current list as a Northern male voice: the name goes to that voice.
     assert_eq!(
-        ViettelVoice::from_str_relaxed("thanhtung"),
+        ViettelVoice::from_str_relaxed("thanhtung").voice_id(),
+        "hn-thanhtung"
+    );
+    assert_eq!(
+        ViettelVoice::from_str_relaxed("baoquoc"),
         ViettelVoice::CentralMale
     );
 }
@@ -542,7 +540,7 @@ fn test_provider_info() {
     assert_eq!(info["provider"], "viettel-ai");
     assert_eq!(info["name"], "Viettel AI TTS (Viettel Group)");
     assert_eq!(info["format"], "wav");
-    assert_eq!(info["voices"].as_array().unwrap().len(), 12);
+    assert_eq!(info["voices"].as_array().unwrap().len(), 16);
     assert!(info["features"]["regional_accents"].as_bool().unwrap());
 }
 

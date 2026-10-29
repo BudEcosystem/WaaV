@@ -222,6 +222,36 @@ impl std::str::FromStr for AcapelaOutputMode {
 // Voice Types
 // =============================================================================
 
+/// A voice as Acapela names it. Every voice Acapela lists is `<Speaker>[-<REGION>]22k_HQ`
+/// (`Alice22k_HQ`, `Alice-BE22k_HQ`); a bare speaker name (`alice`, `alice-be`) is completed to
+/// that form. Any other id (already complete, or an account's own voice) is sent as given.
+pub fn acapela_voice_name(voice: &str) -> String {
+    let voice = voice.trim();
+    let (speaker, region) = match voice.split_once('-') {
+        Some((speaker, region)) => (speaker, Some(region)),
+        None => (voice, None),
+    };
+    let bare = !speaker.is_empty()
+        && speaker.chars().all(|c| c.is_ascii_alphabetic())
+        && region.is_none_or(|r| r.len() == 2 && r.chars().all(|c| c.is_ascii_alphabetic()));
+    if !bare {
+        return voice.to_string();
+    }
+    let mut chars = speaker.chars();
+    let mut name: String = chars
+        .next()
+        .map(|c| c.to_ascii_uppercase())
+        .into_iter()
+        .collect();
+    name.push_str(chars.as_str());
+    if let Some(region) = region {
+        name.push('-');
+        name.push_str(&region.to_ascii_uppercase());
+    }
+    name.push_str("22k_HQ");
+    name
+}
+
 /// Acapela voice information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcapelaVoice {
@@ -598,7 +628,7 @@ impl AcapelaTtsConfig {
     /// Build query parameters for the command endpoint
     pub fn build_query_params(&self, text: &str) -> Vec<(&'static str, String)> {
         let mut params = vec![
-            ("voice", self.voice_id.clone()),
+            ("voice", acapela_voice_name(&self.voice_id)),
             ("text", text.to_string()),
             ("output", self.output_mode.as_str().to_string()),
             ("type", self.audio_format.as_str().to_string()),
@@ -963,7 +993,7 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = AcapelaTtsConfig::default();
-        assert_eq!(config.voice_id, "alice");
+        assert_eq!(config.voice_id, "Alice22k_HQ");
         assert_eq!(config.audio_format, AcapelaAudioFormat::Mp3);
         assert_eq!(config.output_mode, AcapelaOutputMode::Stream);
         assert_eq!(config.sample_rate, 22050);
@@ -1082,7 +1112,8 @@ mod tests {
         // Convert to map for easier testing
         let params_map: std::collections::HashMap<_, _> = params.into_iter().collect();
 
-        assert_eq!(params_map.get("voice"), Some(&"graham".to_string()));
+        // A bare speaker name goes out as Acapela names the voice.
+        assert_eq!(params_map.get("voice"), Some(&"Graham22k_HQ".to_string()));
         assert_eq!(params_map.get("text"), Some(&"Hello world".to_string()));
         assert_eq!(params_map.get("output"), Some(&"stream".to_string()));
         assert_eq!(params_map.get("type"), Some(&"wav".to_string()));
@@ -1175,5 +1206,26 @@ mod tests {
         assert_eq!(account.credits, Some(10000));
         assert_eq!(account.voices, vec!["alice", "graham", "lily"]);
         assert_eq!(account.first_name, Some("John".to_string()));
+    }
+
+    /// Acapela lists every voice as `<Speaker>[-<REGION>]22k_HQ`: a bare name is completed,
+    /// anything else is sent as given.
+    #[test]
+    fn voices_go_out_as_acapela_names_them() {
+        for (given, sent) in [
+            ("alice", "Alice22k_HQ"),
+            ("Graham", "Graham22k_HQ"),
+            ("alice-be", "Alice-BE22k_HQ"),
+            ("Alice22k_HQ", "Alice22k_HQ"),
+            ("AntoineHappy-BE22k_HQ", "AntoineHappy-BE22k_HQ"),
+            ("my_custom_voice", "my_custom_voice"),
+            ("Voice48k_HQ", "Voice48k_HQ"),
+        ] {
+            assert_eq!(acapela_voice_name(given), sent, "{given}");
+        }
+        assert_eq!(
+            acapela_voice_name(super::super::DEFAULT_VOICE_ID),
+            "Alice22k_HQ"
+        );
     }
 }

@@ -37,11 +37,12 @@ fn validate_viettel_http_endpoint(source: &str, endpoint: &str) -> Result<(), St
 // Constants
 // =============================================================================
 
-/// Viettel AI TTS synthesis endpoint.
-pub const VIETTEL_TTS_ENDPOINT: &str = "https://viettelgroup.ai/voice/api/tts/v1/rest/syn";
+/// Viettel AI TTS synthesis endpoint. Viettel AI moved to `viettelai.vn`: the former
+/// `viettelgroup.ai` no longer resolves (its name servers refuse the zone).
+pub const VIETTEL_TTS_ENDPOINT: &str = "https://viettelai.vn/tts/speech_synthesis";
 
-/// Viettel AI TTS voices list endpoint.
-pub const VIETTEL_VOICES_ENDPOINT: &str = "https://viettelgroup.ai/voice/api/tts/v1/rest/voices";
+/// Viettel AI TTS voices list endpoint (public: `[{name, description, code, location}]`).
+pub const VIETTEL_VOICES_ENDPOINT: &str = "https://viettelai.vn/tts/voices";
 
 /// Minimum speech speed.
 pub const MIN_SPEED: f32 = 0.5;
@@ -71,15 +72,32 @@ pub const DEFAULT_TTS_RETURN_OPTION: u8 = 2;
 // Voice Types
 // =============================================================================
 
+/// Viettel AI's current voices (`GET https://viettelai.vn/tts/voices`): code, name, region, gender.
+pub const CURRENT_VOICES: &[(&str, &str, &str, &str)] = &[
+    ("hn-quynhanh", "Quynh Anh", "northern", "female"),
+    ("hn-phuongtrang", "Phuong Trang", "northern", "female"),
+    ("hn-thaochi", "Thao Chi", "northern", "female"),
+    ("hn-thanhha", "Thanh Ha", "northern", "female"),
+    ("hn-thanhphuong", "Thanh Phuong", "northern", "female"),
+    ("hn-thanhtung", "Thanh Tung", "northern", "male"),
+    ("hn-namkhanh", "Nam Khanh", "northern", "male"),
+    ("hn-tienquan", "Tien Quan", "northern", "male"),
+    ("hcm-diemmy", "Diem My", "southern", "female"),
+    ("hcm-phuongly", "Phuong Ly", "southern", "female"),
+    ("hcm-thuydung", "Thuy Dung", "southern", "female"),
+    ("hcm-thuyduyen", "Thuy Duyen", "southern", "female"),
+    ("hn-leyen", "Le Yen", "southern", "female"),
+    ("hcm-minhquan", "Minh Quan", "southern", "male"),
+    ("hue-maingoc", "Mai Ngoc", "central", "female"),
+    ("hue-baoquoc", "Bao Quoc", "central", "male"),
+];
+
 /// Viettel AI TTS voice options.
 ///
-/// Viettel AI provides 11 Vietnamese voices categorized by region:
-/// - Northern (5 voices): 3 female, 2 male
-/// - Southern (4 voices): 3 female, 1 male
-/// - Central (2 voices): 1 female, 1 male
-///
-/// Note: Voice IDs are fetched dynamically from the API.
-/// Common known voice: "doanngocle"
+/// Each names a voice on Viettel AI's current list (`GET https://viettelai.vn/tts/voices`, 16
+/// voices) of the variant's region and gender; the speaker is kept where the list still has them
+/// (Phương Trang). The earlier ids (`doanngocle`, `*_news_48k-fhg`) are not on that list and parse
+/// to these variants. Any other id (a current code such as `hn-thanhphuong`) is sent as given.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ViettelVoice {
     /// Doan Ngoc Le - Popular Northern female voice.
@@ -115,18 +133,18 @@ impl ViettelVoice {
     /// Get the voice ID string for the API.
     pub fn voice_id(&self) -> &str {
         match self {
-            Self::DoanNgocLe => "doanngocle",
-            Self::NorthernFemale1 => "hn_female_ngochuyen_news_48k-fhg",
-            Self::NorthernFemale2 => "hn_female_thuthao_news_48k-fhg",
-            Self::NorthernFemale3 => "hn_female_phuongtrang_news_48k-fhg",
-            Self::NorthernMale1 => "hn_male_xuankien_news_48k-fhg",
-            Self::NorthernMale2 => "hn_male_quang_news_48k-fhg",
-            Self::SouthernFemale1 => "sg_female_thuphuong_news_48k-fhg",
-            Self::SouthernFemale2 => "sg_female_minhly_news_48k-fhg",
-            Self::SouthernFemale3 => "sg_female_huonggiang_news_48k-fhg",
-            Self::SouthernMale => "sg_male_trongphuc_news_48k-fhg",
-            Self::CentralFemale => "hn_female_maiphuong_news_48k-fhg",
-            Self::CentralMale => "hn_male_thanhtung_news_48k-fhg",
+            Self::DoanNgocLe => "hn-quynhanh",
+            Self::NorthernFemale1 => "hn-thaochi",
+            Self::NorthernFemale2 => "hn-thanhha",
+            Self::NorthernFemale3 => "hn-phuongtrang",
+            Self::NorthernMale1 => "hn-namkhanh",
+            Self::NorthernMale2 => "hn-tienquan",
+            Self::SouthernFemale1 => "hcm-diemmy",
+            Self::SouthernFemale2 => "hcm-phuongly",
+            Self::SouthernFemale3 => "hcm-thuydung",
+            Self::SouthernMale => "hcm-minhquan",
+            Self::CentralFemale => "hue-maingoc",
+            Self::CentralMale => "hue-baoquoc",
             Self::Custom(id) => id.as_str(),
         }
     }
@@ -134,18 +152,18 @@ impl ViettelVoice {
     /// Get the display name for the voice.
     pub fn display_name(&self) -> String {
         match self {
-            Self::DoanNgocLe => "Doan Ngoc Le (Northern Female)".to_string(),
-            Self::NorthernFemale1 => "Ngoc Huyen (Northern Female)".to_string(),
-            Self::NorthernFemale2 => "Thu Thao (Northern Female)".to_string(),
+            Self::DoanNgocLe => "Quynh Anh (Northern Female)".to_string(),
+            Self::NorthernFemale1 => "Thao Chi (Northern Female)".to_string(),
+            Self::NorthernFemale2 => "Thanh Ha (Northern Female)".to_string(),
             Self::NorthernFemale3 => "Phuong Trang (Northern Female)".to_string(),
-            Self::NorthernMale1 => "Xuan Kien (Northern Male)".to_string(),
-            Self::NorthernMale2 => "Quang (Northern Male)".to_string(),
-            Self::SouthernFemale1 => "Thu Phuong (Southern Female)".to_string(),
-            Self::SouthernFemale2 => "Minh Ly (Southern Female)".to_string(),
-            Self::SouthernFemale3 => "Huong Giang (Southern Female)".to_string(),
-            Self::SouthernMale => "Trong Phuc (Southern Male)".to_string(),
-            Self::CentralFemale => "Mai Phuong (Central Female)".to_string(),
-            Self::CentralMale => "Thanh Tung (Central Male)".to_string(),
+            Self::NorthernMale1 => "Nam Khanh (Northern Male)".to_string(),
+            Self::NorthernMale2 => "Tien Quan (Northern Male)".to_string(),
+            Self::SouthernFemale1 => "Diem My (Southern Female)".to_string(),
+            Self::SouthernFemale2 => "Phuong Ly (Southern Female)".to_string(),
+            Self::SouthernFemale3 => "Thuy Dung (Southern Female)".to_string(),
+            Self::SouthernMale => "Minh Quan (Southern Male)".to_string(),
+            Self::CentralFemale => "Mai Ngoc (Central Female)".to_string(),
+            Self::CentralMale => "Bao Quoc (Central Male)".to_string(),
             Self::Custom(id) => format!("Custom ({})", id),
         }
     }
@@ -220,7 +238,11 @@ impl ViettelVoice {
 
             // Central voices
             "hn_female_maiphuong_news_48k-fhg" | "maiphuong" | "mai_phuong" => Self::CentralFemale,
-            "hn_male_thanhtung_news_48k-fhg" | "thanhtung" | "thanh_tung" => Self::CentralMale,
+            // Thanh Tùng is on the current list as a Northern male voice.
+            "hn_male_thanhtung_news_48k-fhg" | "thanhtung" | "thanh_tung" => {
+                Self::Custom("hn-thanhtung".to_string())
+            }
+            "baoquoc" | "bao_quoc" => Self::CentralMale,
 
             // Custom/unknown - pass through as custom
             _ => Self::Custom(s.to_string()),
@@ -407,6 +429,22 @@ impl ViettelTtsConfig {
     }
 }
 
+impl ViettelTtsConfig {
+    /// The `/tts/speech_synthesis` body for `text`. The token travels in it: `viettelai.vn` reads
+    /// the body's `token` (the header alone is not checked).
+    pub fn request(&self, text: &str, id: u64) -> ViettelTtsRequest {
+        ViettelTtsRequest {
+            text: text.to_string(),
+            voice: self.voice.voice_id().to_string(),
+            id: id.to_string(),
+            without_filter: self.without_filter,
+            token: self.api_key.clone(),
+            speed: self.speed,
+            tts_return_option: self.tts_return_option,
+        }
+    }
+}
+
 // =============================================================================
 // Request/Response Types
 // =============================================================================
@@ -425,6 +463,9 @@ pub struct ViettelTtsRequest {
 
     /// Disable text preprocessing.
     pub without_filter: bool,
+
+    /// API token. `viettelai.vn` reads it from the body (the `token` header alone is not checked).
+    pub token: String,
 
     /// Speech speed.
     pub speed: f32,
@@ -511,13 +552,14 @@ mod tests {
 
     #[test]
     fn test_voice_ids() {
-        assert_eq!(ViettelVoice::DoanNgocLe.voice_id(), "doanngocle");
-        assert!(
-            ViettelVoice::NorthernFemale1
-                .voice_id()
-                .contains("hn_female")
-        );
-        assert!(ViettelVoice::SouthernMale.voice_id().contains("sg_male"));
+        // Each variant is a voice on the current list, of the variant's region and gender.
+        for voice in ViettelVoice::all() {
+            let listed = CURRENT_VOICES.iter().find(|v| v.0 == voice.voice_id());
+            let (_, _, region, gender) = listed.unwrap_or_else(|| panic!("{voice:?} not listed"));
+            assert_eq!(*region, voice.region().to_lowercase(), "{voice:?}");
+            assert_eq!(*gender, voice.gender(), "{voice:?}");
+        }
+        assert_eq!(ViettelVoice::DoanNgocLe.voice_id(), "hn-quynhanh");
     }
 
     #[test]
@@ -525,7 +567,7 @@ mod tests {
         assert!(
             ViettelVoice::DoanNgocLe
                 .display_name()
-                .contains("Doan Ngoc Le")
+                .contains("Quynh Anh")
         );
         assert!(ViettelVoice::NorthernMale1.display_name().contains("Male"));
         assert!(
@@ -805,5 +847,21 @@ mod tests {
 
         assert!(!response.is_success());
         assert_eq!(response.status_message(), "Custom error message");
+    }
+
+    /// The body carries the token and a current voice code (the endpoint authenticates from the
+    /// body), alongside the fields the API has always taken.
+    #[test]
+    fn the_request_body_carries_the_token_and_a_current_voice() {
+        let config = ViettelTtsConfig {
+            api_key: "test-token".to_string(),
+            ..Default::default()
+        };
+        let body = serde_json::to_value(config.request("xin chào", 7)).unwrap();
+        assert_eq!(body["token"], "test-token");
+        assert_eq!(body["voice"], "hn-quynhanh");
+        assert_eq!(body["text"], "xin chào");
+        assert_eq!(body["id"], "7");
+        assert_eq!(body["tts_return_option"], 2);
     }
 }

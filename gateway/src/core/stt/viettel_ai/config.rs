@@ -36,8 +36,9 @@ fn validate_viettel_http_endpoint(source: &str, endpoint: &str) -> Result<(), St
 // Constants
 // =============================================================================
 
-/// Viettel AI STT decode endpoint.
-pub const VIETTEL_STT_ENDPOINT: &str = "https://viettelgroup.ai/voice/api/asr/v1/rest/decode_file";
+/// Viettel AI STT decode endpoint, on Viettel AI's current host: the former `viettelgroup.ai` no
+/// longer resolves, and `viettelai.vn` serves the same path.
+pub const VIETTEL_STT_ENDPOINT: &str = "https://viettelai.vn/voice/api/asr/v1/rest/decode_file";
 
 /// Default request timeout in seconds.
 pub const DEFAULT_REQUEST_TIMEOUT: u64 = 60;

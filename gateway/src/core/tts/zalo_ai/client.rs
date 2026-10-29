@@ -17,7 +17,9 @@
 //! - Channels: Mono
 //! - Sample Width: 16-bit
 
-use super::config::{AUDIO_SAMPLE_RATE, ZALO_TTS_ENDPOINT, ZaloTtsConfig, ZaloTtsResponse};
+use super::config::{
+    AUDIO_SAMPLE_RATE, ZALO_TTS_ENDPOINT, ZaloTtsConfig, ZaloTtsResponse, encode_type_format,
+};
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
@@ -358,7 +360,7 @@ impl BaseTTS for ZaloTts {
             let data = AudioData {
                 data: audio_data,
                 sample_rate: AUDIO_SAMPLE_RATE,
-                format: "wav".to_string(),
+                format: encode_type_format(self.config.encode_type).to_string(),
                 duration_ms: None,
             };
 
@@ -414,7 +416,7 @@ impl BaseTTS for ZaloTts {
             "voice": self.config.voice.speaker_id(),
             "voice_name": self.config.voice.display_name(),
             "speed": self.config.speed,
-            "supported_formats": ["wav"],
+            "supported_formats": ["wav", "mp3", "aac"],
             "supported_languages": ["vi"],
             "sample_rate": AUDIO_SAMPLE_RATE,
             "features": {

@@ -326,7 +326,7 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     // The actual project_id is set at runtime via config
     urls.insert(
         "huawei-cloud".to_string(),
-        "https://sis.cn-north-4.myhuaweicloud.com/v1/tts".to_string(),
+        "https://sis-ext.cn-north-4.myhuaweicloud.com/v1/tts".to_string(),
     );
     urls.insert("zalo-ai".to_string(), ZALO_TTS_ENDPOINT.to_string());
     urls.insert("fpt-ai".to_string(), FPT_TTS_ENDPOINT.to_string());

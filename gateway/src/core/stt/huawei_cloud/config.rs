@@ -22,7 +22,7 @@ fn validate_huawei_stt_endpoint(source: &str, endpoint: &str) -> Result<(), Stri
 pub const HUAWEI_IAM_BASE_URL: &str = "https://iam.{region}.myhuaweicloud.com/v3/auth/tokens";
 
 /// SIS endpoint format for China regions.
-pub const SIS_CHINA_ENDPOINT_FORMAT: &str = "sis.{region}.myhuaweicloud.com";
+pub const SIS_CHINA_ENDPOINT_FORMAT: &str = "sis-ext.{region}.myhuaweicloud.com";
 
 /// SIS endpoint format for international regions.
 pub const SIS_INTL_ENDPOINT_FORMAT: &str = "sis-ext.{region}.myhuaweicloud.com";
@@ -117,6 +117,12 @@ impl HuaweiCloudRegion {
     /// Check if this is a China region.
     pub fn is_china_region(&self) -> bool {
         matches!(self, Self::CnNorth4 | Self::CnEast3)
+    }
+
+    /// Whether Huawei offers SIS in this region. Its endpoint pages list cn-north-4, cn-east-3 and
+    /// ap-southeast-3 (and ap-southeast-1 resolves); ap-southeast-2 (Bangkok) has no SIS host.
+    pub fn has_sis(&self) -> bool {
+        !matches!(self, Self::ApSoutheast2)
     }
 
     /// Check if this region supports premium voices.
@@ -598,6 +604,14 @@ impl HuaweiCloudSttConfig {
 
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), STTError> {
+        if !self.region.has_sis() {
+            return Err(STTError::ConfigurationError(format!(
+                "Huawei Cloud offers no speech service (SIS) in {}; use cn-north-4, cn-east-3 or \
+                 ap-southeast-3",
+                self.region.code()
+            )));
+        }
+
         if self.username.is_empty() {
             return Err(STTError::ConfigurationError(
                 "Huawei Cloud username is required".to_string(),
@@ -984,7 +998,7 @@ mod tests {
     #[test]
     fn test_region_sis_endpoint() {
         let cn_endpoint = HuaweiCloudRegion::CnNorth4.sis_endpoint();
-        assert_eq!(cn_endpoint, "sis.cn-north-4.myhuaweicloud.com");
+        assert_eq!(cn_endpoint, "sis-ext.cn-north-4.myhuaweicloud.com");
 
         let intl_endpoint = HuaweiCloudRegion::ApSoutheast3.sis_endpoint();
         assert_eq!(intl_endpoint, "sis-ext.ap-southeast-3.myhuaweicloud.com");
@@ -1148,11 +1162,11 @@ mod tests {
 
         assert_eq!(
             config.get_https_endpoint(),
-            "https://sis.cn-north-4.myhuaweicloud.com"
+            "https://sis-ext.cn-north-4.myhuaweicloud.com"
         );
         assert_eq!(
             config.get_short_asr_url(),
-            "https://sis.cn-north-4.myhuaweicloud.com/v1/project123/asr/short-audio"
+            "https://sis-ext.cn-north-4.myhuaweicloud.com/v1/project123/asr/short-audio"
         );
     }
 
@@ -1258,5 +1272,38 @@ mod tests {
         assert!(models.contains(&"chinese_16k_general"));
         assert!(models.contains(&"cantonese_16k_general"));
         assert!(models.len() >= 10);
+    }
+
+    /// Every region's host is `sis-ext.<region>` (Huawei's SIS endpoint pages; the China regions'
+    /// `sis.<region>` do not exist), and Bangkok, which has no SIS, is refused at config.
+    #[test]
+    fn regions_use_the_documented_sis_hosts() {
+        for (region, host) in [
+            (
+                HuaweiCloudRegion::CnNorth4,
+                "sis-ext.cn-north-4.myhuaweicloud.com",
+            ),
+            (
+                HuaweiCloudRegion::CnEast3,
+                "sis-ext.cn-east-3.myhuaweicloud.com",
+            ),
+            (
+                HuaweiCloudRegion::ApSoutheast3,
+                "sis-ext.ap-southeast-3.myhuaweicloud.com",
+            ),
+        ] {
+            assert_eq!(region.sis_endpoint(), host, "{region:?}");
+            assert!(region.has_sis());
+        }
+        let config = HuaweiCloudSttConfig {
+            username: "test-user".to_string(),
+            password: "test-password".to_string(),
+            domain_name: "test-domain".to_string(),
+            project_id: "test-project".to_string(),
+            region: HuaweiCloudRegion::ApSoutheast2,
+            ..Default::default()
+        };
+        let refused = config.validate().unwrap_err().to_string();
+        assert!(refused.contains("no speech service"), "{refused}");
     }
 }
