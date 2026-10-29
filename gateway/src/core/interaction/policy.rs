@@ -1982,10 +1982,10 @@ impl Policy {
             (Act::Progress, None) => {
                 self.speak_front(id, Act::Social, None, decision.intent, out);
             }
-            (Act::Social | Act::Question | Act::Refuse, _) if complete => {
+            (act, _) if act.speaks_its_line() && complete => {
                 self.speak_front(id, act, decision.say, decision.intent, out);
             }
-            (Act::Social | Act::Question | Act::Refuse, _) => {
+            (act, _) if act.speaks_its_line() => {
                 if let Some(turn) = &mut self.turn {
                     turn.line_for = Some(act);
                 }

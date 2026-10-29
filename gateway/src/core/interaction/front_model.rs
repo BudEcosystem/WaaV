@@ -1336,11 +1336,13 @@ async fn post_to(
 /// (`Done`, or `Failed` for output outside the offer), `false` when the body ends before that,
 /// when its time is up or, over the agent, at an act that is not a wait.
 ///
-/// The act has the request's `total_budget_ms`. Once it is known, the line has the server's
-/// `line_budget_ms` from it, and never less than the decision had left: the act settled the
-/// turn, and its caller waits for the line. Spec 029 (pde-ditto, imw-2): on a loaded CPU front
-/// two decisions together reached their act in about 1 s, and the line then ran past the 1.5 s
-/// budget; the caller heard nothing in 3 of 12 closings.
+/// The act has the request's `total_budget_ms`. Once an act whose reply is the front's own line
+/// is known (`Act::speaks_its_line`), the line has the server's `line_budget_ms` from it, and
+/// never less than the decision had left: the act settled the turn, and its caller waits for
+/// the line. Spec 029 (pde-ditto, imw-2): on a loaded CPU front two decisions together reached
+/// their act in about 1 s, and the line then ran past the 1.5 s budget; the caller heard
+/// nothing in 3 of 12 closings. Every other act's reply is the gateway's, so its line keeps the
+/// decision's budget: waiting for those lines kept the shared server busy for nothing (imw-3).
 async fn stream(
     server: &FrontModelServer,
     persona: &Persona,
@@ -1398,7 +1400,10 @@ async fn stream(
             );
         }
         for event in decoder.push(&bytes) {
-            if !request.interim && matches!(event, FrontEvent::ActKnown { .. }) {
+            if let FrontEvent::ActKnown { act, .. } = &event
+                && act.speaks_its_line()
+                && !request.interim
+            {
                 act_ms.get_or_insert(asked.elapsed().as_millis() as u64);
                 deadline = deadline.max(tokio::time::Instant::now() + server.line_budget());
             }
@@ -5668,6 +5673,50 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
         );
         let events = decided(&mut rx);
         assert_eq!(events, [FrontEvent::Failed { turn: TurnId(3) }]);
+    }
+
+    /// Only an act whose reply is the front's own line waits for it. A delegate's reply is the
+    /// gateway's acknowledgement, so its line has the decision's budget alone. On the loaded
+    /// CPU front (imw-3), 13 of 14 lines that ran past their extended deadline were delegates'.
+    /// They kept the server busy for nothing, and every other decision decoded slower.
+    #[tokio::test]
+    async fn a_delegates_line_is_not_waited_for_past_the_decision_budget() {
+        let url = slow_front(
+            r#"{"act":"delegate","say":"On"#,
+            Duration::from_millis(1_400),
+            r#" it."}"#,
+        )
+        .await;
+        let server = FrontModelServer {
+            url,
+            line_budget_ms: Some(3_000),
+            ..FrontModelServer::default()
+        };
+        let persona = Persona::load("default");
+        let mut request = request(&persona, "book me a table for two at eight", Vec::new());
+        request.total_budget_ms = 500;
+        let (tx, mut rx) = mpsc::channel(8);
+        let asked = std::time::Instant::now();
+        decide(server, persona, request, tx).await;
+        assert!(
+            asked.elapsed() < Duration::from_millis(1_200),
+            "{:?}",
+            asked.elapsed()
+        );
+        let events = decided(&mut rx);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    FrontEvent::ActKnown {
+                        act: Act::Delegate,
+                        ..
+                    },
+                    FrontEvent::Failed { .. }
+                ]
+            ),
+            "{events:?}"
+        );
     }
 
     /// A line past its own deadline fails as a decision past its budget did: the act, then
