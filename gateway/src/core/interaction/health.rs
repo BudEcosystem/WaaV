@@ -10,7 +10,10 @@
 //!   ones at most every [`STALL_GAP_MS`], at most [`MAX_STALLS`] in one outage, rotated.
 //! - **Back** - when every service is well again, a `back` line plays if a stall was heard.
 //! - **Exit** - `max_wait` after the first stall with a service that ends the call still
-//!   failing, or at once when a service the whole session needs is gone: the `exit` line.
+//!   failing, or at once when a service the whole session needs is gone: the `exit` line. An
+//!   outage that starts again within `max_wait` of the last one's last stall line is the same
+//!   outage: its first stall counts, so a service that keeps failing and coming back still
+//!   ends the call.
 
 use super::types::Ms;
 
@@ -153,6 +156,9 @@ pub struct Watcher {
     first_stall: Option<Ms>,
     /// The service of the last stall line: the back line is about it.
     stalled: Option<Service>,
+    /// The outage before this one, once it was over: its first and its last stall line. An
+    /// outage within `max_wait` of that last line continues it (it flapped back).
+    previous: Option<(Ms, Ms)>,
     /// A service the whole session needs is gone.
     gone: Option<Service>,
     /// The exit line was given.
@@ -171,6 +177,7 @@ impl Watcher {
             last_stall: None,
             first_stall: None,
             stalled: None,
+            previous: None,
             gone: None,
             exited: false,
             played: [0; 5],
@@ -233,9 +240,7 @@ impl Watcher {
     /// that the call goes on), and the next outage counts from zero.
     pub fn drop_back(&mut self) {
         if self.back_owed() {
-            self.stalls = 0;
-            self.last_stall = None;
-            self.first_stall = None;
+            self.end_outage();
             self.stalled = None;
         }
     }
@@ -261,9 +266,7 @@ impl Watcher {
                 return None;
             }
             let service = self.stalled.take().unwrap_or(Service::Background);
-            self.stalls = 0;
-            self.last_stall = None;
-            self.first_stall = None;
+            self.end_outage();
             return Some(self.line(LineKind::Back, service));
         }
         if !slot.stall {
@@ -277,7 +280,9 @@ impl Watcher {
         let service = due.service;
         self.stalls += 1;
         self.last_stall = Some(now);
-        self.first_stall.get_or_insert(now);
+        if self.first_stall.is_none() {
+            self.first_stall = Some(self.outage_start(now));
+        }
         self.stalled = Some(service);
         let kind = if service == Service::Recogniser {
             LineKind::Hearing
@@ -285,6 +290,26 @@ impl Watcher {
             LineKind::Stall
         };
         Some(self.line(kind, service))
+    }
+
+    /// This outage is over (heard back, or the agent spoke again): its stall lines are kept
+    /// as the previous outage, and the next one starts its own count unless it comes soon.
+    fn end_outage(&mut self) {
+        if let (Some(first), Some(last)) = (self.first_stall, self.last_stall) {
+            self.previous = Some((first, last));
+        }
+        self.stalls = 0;
+        self.last_stall = None;
+        self.first_stall = None;
+    }
+
+    /// The first stall of the outage whose first line plays `now`: the previous outage's,
+    /// when this one started within `max_wait` of its last line (spec 029 W-6), else `now`.
+    fn outage_start(&self, now: Ms) -> Ms {
+        match self.previous {
+            Some((first, last)) if now < last + self.max_wait_ms => first,
+            _ => now,
+        }
     }
 
     /// The service whose outage ends the call now.
@@ -327,6 +352,82 @@ impl Watcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_exit(line: &Line) -> bool {
+        matches!(line.kind, LineKind::Exit | LineKind::ExitFollowUp)
+    }
+
+    /// Spec 029 W-6: a service that fails and comes back every few seconds is one outage, not many.
+    /// The call ends `max_wait` after the first stall, however often the service flaps; before,
+    /// each "back" started the count again and the caller heard stall and back lines forever.
+    #[test]
+    fn an_outage_that_recurs_within_max_wait_counts_toward_the_same_exit() {
+        let mut watcher = Watcher::new(30, false);
+        let mut exit = None;
+        let mut at: Ms = 0;
+        while at < 120_000 && exit.is_none() {
+            // Fails for 4 s, is heard back, works for 6 s, and fails again.
+            watcher.failing(Service::Background, at);
+            for t in (at..at + 4_000).step_by(500) {
+                if watcher
+                    .next(t, Slot::OPEN)
+                    .is_some_and(|line| is_exit(&line))
+                {
+                    exit = Some(t);
+                    break;
+                }
+            }
+            if exit.is_some() {
+                break;
+            }
+            watcher.recovered(Service::Background);
+            for t in (at + 4_000..at + 10_000).step_by(500) {
+                let _ = watcher.next(t, Slot::OPEN);
+            }
+            at += 10_000;
+        }
+        let exit = exit.expect("a flapping background ends the call");
+        assert!(
+            (30_000..=34_000).contains(&exit),
+            "max_wait after the first stall, not later: {exit}"
+        );
+    }
+
+    /// The other side of spec 029 W-6: an outage long after the last one (more than `max_wait`
+    /// after its last stall line) is a new one, with its own `max_wait`.
+    #[test]
+    fn an_outage_long_after_the_last_one_starts_its_own_count() {
+        let mut watcher = Watcher::new(30, false);
+        watcher.failing(Service::Background, 0);
+        assert_eq!(
+            watcher.next(0, Slot::OPEN).map(|l| l.kind),
+            Some(LineKind::Stall)
+        );
+        watcher.recovered(Service::Background);
+        assert_eq!(
+            watcher.next(1_000, Slot::OPEN).map(|l| l.kind),
+            Some(LineKind::Back)
+        );
+        // 41 s later, more than 30 s after the last stall line.
+        watcher.failing(Service::Background, 41_000);
+        assert_eq!(
+            watcher.next(41_000, Slot::OPEN).map(|l| l.kind),
+            Some(LineKind::Stall)
+        );
+        for t in (41_500..71_000).step_by(500) {
+            assert!(
+                !watcher
+                    .next(t, Slot::OPEN)
+                    .is_some_and(|line| is_exit(&line)),
+                "no exit before 30 s of this outage: {t}"
+            );
+        }
+        assert!(
+            watcher
+                .next(71_000, Slot::OPEN)
+                .is_some_and(|line| is_exit(&line))
+        );
+    }
 
     #[test]
     fn stall_lines_are_spaced_rotated_and_capped() {

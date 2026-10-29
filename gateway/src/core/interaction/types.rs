@@ -514,6 +514,12 @@ pub enum DuplexAction {
     FinalizeStt {
         upload: bool,
     },
+    /// A turn is held on words that may be finished ("Where are you from?"): the text
+    /// end-of-turn model is asked to read them (`Duplex::on_words`).
+    JudgeWords {
+        turn: TurnId,
+        text: String,
+    },
     EndOfTurn(EndOfTurn),
 }
 

@@ -671,6 +671,7 @@ mod tests {
         });
         let server = FrontModelServer {
             url: format!("http://127.0.0.1:{port}"),
+            urls: Vec::new(),
             model: None,
             api_key: None,
             // Exits after a second: the supervisor starts it again.

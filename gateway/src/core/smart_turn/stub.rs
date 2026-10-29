@@ -106,6 +106,8 @@ pub struct SmartTurnResult {
     pub is_turn_complete: bool,
     pub inference_time_us: u64,
     pub frames_processed: usize,
+    /// As the real detector's: the model gave no verdict (its inference timed out).
+    pub timed_out: bool,
 }
 
 /// Stub SmartTurnDetector.

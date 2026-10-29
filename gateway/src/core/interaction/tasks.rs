@@ -530,6 +530,12 @@ impl Registry {
         }
     }
 
+    /// The task whose orchestrator run started `task`, for a child task.
+    pub fn parent_of(&self, task: &TaskId) -> Option<TaskId> {
+        let task = self.tasks.iter().find(|known| known.view.id == *task)?;
+        task.view.lineage.parent_id.clone()
+    }
+
     /// The task's title.
     pub fn title(&self, task: &TaskId) -> Option<String> {
         let task = self.tasks.iter().find(|known| known.view.id == *task)?;
@@ -1470,7 +1476,7 @@ impl Registry {
         }
         for idx in 0..self.tasks.len() {
             let task = &mut self.tasks[idx];
-            if !task.deadline.is_some_and(|deadline| now >= deadline) {
+            if task.deadline.is_none_or(|deadline| now < deadline) {
                 continue;
             }
             task.deadline = None;
@@ -2574,6 +2580,12 @@ mod tests {
         assert_eq!((flight.task_ref.clone(), flight.queued), (t(2), false));
         let created = events(&effects)[0];
         assert_eq!(created.lineage.parent_id, Some(request.task.clone()));
+        // Its run records itself in the caller turn of its parent's (spec 029 D-9).
+        assert_eq!(
+            registry.parent_of(&created.task),
+            Some(request.task.clone())
+        );
+        assert_eq!(registry.parent_of(&request.task), None);
         assert_eq!(created.lineage.agent.as_deref(), Some("browser"));
         assert_eq!(created.lineage.trace_id, request.lineage.trace_id);
         assert!(matches!(

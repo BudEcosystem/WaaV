@@ -772,8 +772,35 @@ pub fn turn_span(
     transcript: &str,
     attribution: Option<&TurnAttribution>,
 ) -> tracing::Span {
-    use crate::observability::voice_attrs::turn;
     let span = crate::voice_turn_span!(capability = "conversation", transport = "websocket");
+    record_turn(&span, session_id, transcript, attribution);
+    span
+}
+
+/// [`turn_span`] under an explicit `parent`: `None` makes it the root of its own trace, as a
+/// caller turn of interaction mode is; a task run of the turn is its child (spec 029 D-9).
+pub fn turn_span_under(
+    parent: Option<tracing::Id>,
+    session_id: &str,
+    transcript: &str,
+    attribution: Option<&TurnAttribution>,
+) -> tracing::Span {
+    let span = crate::voice_turn_span!(
+        parent: parent,
+        capability = "conversation",
+        transport = "websocket"
+    );
+    record_turn(&span, session_id, transcript, attribution);
+    span
+}
+
+fn record_turn(
+    span: &tracing::Span,
+    session_id: &str,
+    transcript: &str,
+    attribution: Option<&TurnAttribution>,
+) {
+    use crate::observability::voice_attrs::turn;
     span.record(turn::SESSION_ID, session_id);
     span.record(turn::TRANSCRIPT, transcript);
     if let Some(a) = attribution {
@@ -789,7 +816,6 @@ pub fn turn_span(
             }
         }
     }
-    span
 }
 
 /// Build and key the client-configured LLM legs (fast tier + optional reasoning tier).

@@ -35,6 +35,7 @@ use super::config::{FrontModelServer, InteractionConfig, ServerInteraction};
 use super::events::{self, WireEvent};
 use super::executor::{ExecHandle, Verb};
 use super::front_model;
+use super::front_pool;
 use super::front_supervisor;
 use super::guard;
 use super::health::{self, LineKind, Service, Watcher};
@@ -278,6 +279,9 @@ pub fn spawn(
         background.max_concurrent(),
     );
     let (voiced, rendered) = mpsc::unbounded_channel();
+    let pool = (deps.server.front_model.as_ref())
+        .filter(|front| front.command.is_none())
+        .and(front_pool::get());
     let session = Session {
         voice: deps.voice,
         voice_audio: deps.voice_audio,
@@ -289,8 +293,10 @@ pub fn spawn(
         reported: HashSet::new(),
         provisional: None,
         asked_question: false,
-        front: deps.server.front_model.clone(),
+        // A front the gateways share is placed on below, in the session's task.
+        front: deps.server.front_model.clone().filter(|_| pool.is_none()),
         lane: front_model::Lane::take(),
+        placement: None,
         front_down: None,
         readings: HashMap::new(),
         next_reading: 0,
@@ -330,7 +336,25 @@ pub fn spawn(
         failure: Failure::new(&deps.cfg, deps.audio, deps.output_rate),
         cfg: deps.cfg,
     };
-    tokio::spawn(session.run(inbox, rendered))
+    let mut session = session;
+    tokio::spawn(async move {
+        if let Some(pool) = pool {
+            match pool.place(&session.stream_id).await {
+                Ok(placement) => {
+                    session.front = Some(placement.server().clone());
+                    session.lane = front_model::Lane::pinned(placement.pair());
+                    session.placement = Some(placement);
+                }
+                Err(refusal) => warn!(
+                    stream_id = %session.stream_id,
+                    reason = refusal.reason(),
+                    why = refusal.why(),
+                    "interaction front: no slot pair; the caller's words are not read"
+                ),
+            }
+        }
+        session.run(inbox, rendered).await
+    })
 }
 
 /// How the words of a gateway line are checked against the provider's transcript.
@@ -435,6 +459,8 @@ struct Session {
     front: Option<FrontModelServer>,
     lane: front_model::Lane,
     front_down: Option<u64>,
+    /// The session's pair on a front server the gateways share (spec 029 §5.8).
+    placement: Option<front_pool::Placement>,
     /// The front's readings out, by the turn id each was asked under.
     readings: HashMap<TurnId, Pending>,
     next_reading: u64,
@@ -1026,7 +1052,19 @@ impl Session {
     }
 
     /// The session's front model, when it is ready (the supervisor's gate, as on the cascade).
+    /// A pair that was lost (spec 029 SF-2, SF-5) is not used again: the caller's words are no
+    /// longer read, as with a lost front.
     fn front_ready(&mut self) -> Option<FrontModelServer> {
+        if self
+            .placement
+            .as_ref()
+            .is_some_and(front_pool::Placement::lost)
+        {
+            if self.front.take().is_some() {
+                warn!(stream_id = %self.stream_id, "interaction front pair lost: the caller's words are not read");
+            }
+            return None;
+        }
         let server = self.front.clone()?;
         match front_supervisor::gate(self.front_down, front_supervisor::status()) {
             front_supervisor::Gate::Use => Some(server),
@@ -1392,6 +1430,7 @@ impl Session {
             child: false,
             handle: None,
             state: None,
+            turn: None,
         };
         self.background.clone().start(job, self.tx.clone(), cancel);
     }

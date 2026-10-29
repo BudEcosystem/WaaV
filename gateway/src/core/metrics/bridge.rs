@@ -551,6 +551,21 @@ pub fn record_degraded(component: &'static str, reason: &'static str) {
     counter!("waav_degraded_total", "component" => component, "reason" => reason).increment(1);
 }
 
+/// Interaction mode's front servers (spec 029 SF-7): the slot pairs of a server held by any
+/// gateway's sessions and free.
+pub fn set_front_pairs(server: &str, held: usize, free: usize) {
+    for (state, count) in [("held", held), ("free", free)] {
+        gauge!("waav_interaction_front_pairs", "server" => server.to_owned(), "state" => state)
+            .set(count as f64);
+    }
+}
+
+/// A session that asked for interaction mode and got no front slot pair (spec 029 SF-4,
+/// SF-8): `front_busy` or `front_unavailable`.
+pub fn record_front_refused(reason: &'static str) {
+    counter!("waav_interaction_front_refused_total", "reason" => reason).increment(1);
+}
+
 /// S3 async-tool lifecycle counter (`spoke` | `record_only` | `gated`). These are
 /// NORMAL outcomes — kept OFF `waav_degraded_total` so degradation alerting is not
 /// polluted by healthy async-tool operation.
@@ -649,6 +664,34 @@ mod tests {
         assert!(
             text.contains("unit-provider"),
             "provider label present in exposition"
+        );
+    }
+
+    /// Spec 029 SF-7: the front's slot pairs per server and the sessions refused render.
+    #[test]
+    fn front_pool_series_render() {
+        let _ = metrics_handle();
+        set_front_pairs("http://unit-front:18741", 3, 1);
+        record_front_refused("front_busy");
+        record_front_refused("front_busy");
+        let text = render();
+        let pairs = |state: &str| {
+            text.lines()
+                .find(|l| {
+                    l.starts_with("waav_interaction_front_pairs")
+                        && l.contains("unit-front")
+                        && l.contains(&format!("state=\"{state}\""))
+                })
+                .map(str::to_owned)
+        };
+        assert!(pairs("held").is_some_and(|l| l.ends_with(" 3")), "{text}");
+        assert!(pairs("free").is_some_and(|l| l.ends_with(" 1")), "{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("waav_interaction_front_refused_total")
+                    && l.contains("reason=\"front_busy\"")
+                    && l.ends_with(" 2")),
+            "{text}"
         );
     }
 

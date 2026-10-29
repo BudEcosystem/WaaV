@@ -2457,6 +2457,10 @@ impl fmt::Debug for BackendSpec {
 #[serde(deny_unknown_fields)]
 pub struct FrontModelServer {
     pub url: String,
+    /// More servers (spec 029 SF-3): every gateway shares them with `url`. A hostname with
+    /// several addresses is one server per address, in either.
+    #[serde(default)]
+    pub urls: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -2504,6 +2508,7 @@ impl fmt::Debug for FrontModelServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrontModelServer")
             .field("url", &self.url)
+            .field("urls", &self.urls)
             .field("model", &self.model)
             .field("api_key", &self.api_key.is_some())
             .field("command", &self.command)
@@ -2582,15 +2587,37 @@ impl ServerInteraction {
                 Some(_) => problems.push(format!("{key} must be JSON: true or an object")),
             }
         }
-        if let Some(url) = get("WAAV_INTERACTION_FRONT_URL") {
+        // One URL, or several separated by commas: the servers every gateway shares.
+        if let Some(urls) = get("WAAV_INTERACTION_FRONT_URL") {
+            let mut urls = urls
+                .split(',')
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_owned);
+            let url = urls.next().unwrap_or_default();
+            let more: Vec<String> = urls.collect();
             match &mut self.front_model {
-                Some(front) => front.url = url,
+                Some(front) => {
+                    front.url = url;
+                    front.urls = more;
+                }
                 None => {
                     self.front_model = Some(FrontModelServer {
                         url,
+                        urls: more,
                         ..FrontModelServer::default()
                     })
                 }
+            }
+        }
+        // The front's key from the environment (spec 029 SF-6): a key in the config file
+        // would sit in a ConfigMap.
+        if let Some(key) = get("WAAV_INTERACTION_FRONT_API_KEY").filter(|key| !key.is_empty()) {
+            match &mut self.front_model {
+                Some(front) => front.api_key = Some(key),
+                None => problems.push(
+                    "WAAV_INTERACTION_FRONT_API_KEY is set but no front model URL is".to_owned(),
+                ),
             }
         }
         for (key, is_command) in [
@@ -2836,6 +2863,7 @@ mod tests {
         ServerInteraction {
             front_model: Some(FrontModelServer {
                 url: "http://127.0.0.1:18741".to_owned(),
+                urls: Vec::new(),
                 model: None,
                 api_key: None,
                 command: None,
@@ -4911,6 +4939,7 @@ mod tests {
                 agent_default: None,
                 front_model: Some(FrontModelServer {
                     url: "http://127.0.0.1:18741".to_owned(),
+                    urls: Vec::new(),
                     model: Some("qwen1.5b".to_owned()),
                     api_key: None,
                     command: None,
@@ -4936,6 +4965,47 @@ mod tests {
             ("WAAV_INTERACTION_TOOL_SECRET", "  "),
         ]));
         assert_eq!(server, ServerInteraction::default());
+    }
+
+    /// Spec 029 SF-3 and SF-6: several front servers, and the front's key from the
+    /// environment, where a config file's would sit in a ConfigMap. It is never shown.
+    #[test]
+    fn the_front_urls_and_its_key_come_from_the_environment() {
+        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
+            ServerInteraction::from_lookup(move |key: &str| {
+                let found = pairs.iter().find(|(name, _)| *name == key);
+                found.map(|(_, value)| (*value).to_owned())
+            })
+        };
+        let server = lookup(&[
+            (
+                "WAAV_INTERACTION_FRONT_URL",
+                "http://front-a:8080, http://front-b:8080,",
+            ),
+            ("WAAV_INTERACTION_FRONT_API_KEY", "front-k3y"),
+        ]);
+        let front = server.front_model.as_ref().expect("a front");
+        assert_eq!(front.url, "http://front-a:8080");
+        assert_eq!(front.urls, ["http://front-b:8080"]);
+        assert_eq!(front.api_key.as_deref(), Some("front-k3y"));
+        let shown = format!("{server:?}");
+        assert!(!shown.contains("front-k3y"), "{shown}");
+        // A key with no front configures nothing.
+        let mut alone = ServerInteraction::default();
+        let problems = alone.apply_lookup(|key| {
+            (key == "WAAV_INTERACTION_FRONT_API_KEY").then(|| "front-k3y".to_owned())
+        });
+        assert!(alone.front_model.is_none());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        // The YAML file's key gives way to the environment's.
+        let yaml =
+            "interaction:\n  front_model:\n    url: http://front:8080\n    api_key: file-key\n";
+        let mut server = server_from_yaml(yaml).unwrap();
+        server.apply_lookup(|key| {
+            (key == "WAAV_INTERACTION_FRONT_API_KEY").then(|| "env-key".to_owned())
+        });
+        let front = server.front_model.expect("a front");
+        assert_eq!(front.api_key.as_deref(), Some("env-key"));
     }
 
     #[test]

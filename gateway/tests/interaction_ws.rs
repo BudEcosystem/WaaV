@@ -66,6 +66,7 @@ fn set_server_for_tests(mut server: ServerInteraction) {
     server.front_model.get_or_insert_with(|| {
         waav_gateway::core::interaction::config::FrontModelServer {
             url: FRONT_URL.clone(),
+            urls: Vec::new(),
             model: None,
             api_key: None,
             command: None,
@@ -730,6 +731,7 @@ async fn without_a_ready_front_the_mode_is_refused_and_the_session_runs_without_
         enabled: true,
         front_model: Some(waav_gateway::core::interaction::config::FrontModelServer {
             url: down.url.clone(),
+            urls: Vec::new(),
             model: None,
             api_key: None,
             command: None,
@@ -1760,6 +1762,7 @@ async fn a_speech_to_speech_session_warms_its_front_as_it_starts() {
         truth_ack: vec!["openai".to_owned()],
         front_model: Some(waav_gateway::core::interaction::config::FrontModelServer {
             url: front.url.clone(),
+            urls: Vec::new(),
             model: None,
             api_key: None,
             command: None,

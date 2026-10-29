@@ -26,6 +26,8 @@
     "scales": {"hundred": 100, "thousand": 1000, "million": 1000000},
     "ordinals": {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14, "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18, "nineteenth": 19, "twentieth": 20, "thirtieth": 30},
     "ordinal_second_needs_context": "the word 'second' is read as an ordinal only before 'of' or next to a month name, so 'just a second' is not a number",
+    "one_pronoun_note": "the word 'one' is not a number after one of these words, or two words after one when the word between is not a cardinal ('the one', 'this one', 'the cheaper one', 'the first one'); 'only one' and 'one of them' are numbers",
+    "one_pronoun_after": ["the", "this", "that", "which", "each", "every", "any", "another", "no", "some", "other", "last", "next", "same"],
     "digit_sequence_words": ["oh", "zero", "double", "triple"],
     "currency": {"$": "USD", "dollar": "USD", "dollars": "USD", "usd": "USD", "buck": "USD", "bucks": "USD", "€": "EUR", "euro": "EUR", "euros": "EUR", "eur": "EUR", "£": "GBP", "pound": "GBP", "pounds": "GBP", "quid": "GBP", "gbp": "GBP", "₹": "INR", "rupee": "INR", "rupees": "INR", "inr": "INR", "rs": "INR"},
     "months": ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec"],
@@ -108,9 +110,15 @@
     "start_word_stop_list": ["and", "or", "but", "so", "then", "also", "if", "whether", "because", "um", "uh", "er", "oh", "well", "okay", "ok", "yeah", "yes", "no", "hi", "hello", "hey", "please", "sorry", "actually", "just", "like", "can", "could", "would", "will", "do", "does", "did", "is", "are", "was", "were", "that", "this", "what", "which", "who", "how", "when", "where", "why", "know", "need", "want", "wanted", "ask", "tell", "see", "check", "quick", "question", "while", "look", "where's", "what's", "how's", "who's", "hmm", "erm", "mm"],
     "dangling_end_words_note": "Reference refinement of W2 section 3.7.1: an utterance that ends on one of these words is unfinished, so it is not request-shaped and request_not_wait does not turn the model's wait into delegate.",
     "dangling_end_words": ["to", "the", "a", "an", "about", "was", "is", "are", "and", "or", "but", "for", "with", "of", "my", "your", "at", "in", "on", "if", "that", "so", "because", "like", "um", "uh", "from", "by", "whether", "into"],
+    "can_end_sentence_note": "The dangling end words that also end a finished sentence: 'Where are you from?', 'What is it about?', 'I think so.', 'Count me in.' A pause after one holds the turn only when the caller began it in the quiet and no answer is expected, and the gateway's text end-of-turn model, where it has one, ends that hold when it reads the words as finished. Reviewed on the recorded finals of spec 029 WP-IM0.6: the text model scored such questions 0.95 to 0.99 and the unfinished halves ('... my booking from', '... a discount for') under 0.08. The other dangling words (articles, possessives, conjunctions, 'to', fillers) always hold.",
+    "can_end_sentence": ["about", "was", "is", "are", "for", "with", "of", "at", "in", "on", "so", "like", "that", "from", "by", "into"],
     "chain_end_punctuation": [".", "?", "!", ";", ":"],
     "chain_comma_separator": true,
     "allowed_word_pattern": "^[A-Za-z0-9$€£₹%'&/.,:?!-]+$"
+  },
+  "narration": {
+    "rule": "A spoken task update cut to its word limit keeps its meaning: the cut never drops a part holding one of these words (a contrast, an exception or a negation), because the head alone would say the opposite of the result ('The booking is confirmed.' without 'but the table was cancelled'). Such a line is refused for its length and written again.",
+    "cut_never_drops": ["but", "although", "though", "except", "however", "yet", "unless", "whereas", "instead", "not", "no", "never", "nothing", "none", "neither", "nor", "without", "cannot", "can't", "couldn't", "won't", "wouldn't", "didn't", "doesn't", "don't", "isn't", "wasn't", "aren't", "weren't", "hasn't", "haven't", "hadn't", "failed", "unable"]
   },
   "sanitiser": {
     "special_tokens": ["<|startoftext|>", "<|im_start|>", "<|im_end|>", "<|tool_call_start|>", "<|tool_call_end|>", "<|tool_list_start|>", "<|tool_list_end|>", "<|tool_response_start|>", "<|tool_response_end|>", "<think>", "</think>", "<|endoftext|>"],

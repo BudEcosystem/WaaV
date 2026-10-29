@@ -1967,6 +1967,11 @@ impl VoiceManager {
         &self.config
     }
 
+    /// The process's text end-of-turn model, when it loaded.
+    pub fn turn_detector(&self) -> Option<Arc<RwLock<TurnDetector>>> {
+        self.turn_detector.clone()
+    }
+
     /// Check if STT provider is ready
     ///
     /// # Returns

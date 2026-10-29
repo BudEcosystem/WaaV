@@ -378,7 +378,10 @@ tokio::task_local! {
 /// come last in that prompt, so each interim reads only them and what follows from the slot's
 /// cache, and a turn's decision never evicts it. Sessions spread over every slot; with as many
 /// slots as two per session each keeps its primed slot to itself.
-pub struct Lane(pub usize);
+///
+/// On a server the gateways share, the lane is the session's leased pair
+/// (`front_pool::Placement`, [`Lane::pinned`]) and this process numbers nothing.
+pub struct Lane(pub usize, bool);
 
 fn lanes() -> &'static parking_lot::Mutex<std::collections::BTreeSet<usize>> {
     static LANES: OnceLock<parking_lot::Mutex<std::collections::BTreeSet<usize>>> = OnceLock::new();
@@ -390,13 +393,20 @@ impl Lane {
         let mut held = lanes().lock();
         let lane = (0..).find(|lane| !held.contains(lane)).unwrap_or_default();
         held.insert(lane);
-        Lane(lane)
+        Lane(lane, true)
+    }
+
+    /// The pair a front pool leased to the session.
+    pub fn pinned(pair: usize) -> Self {
+        Lane(pair, false)
     }
 }
 
 impl Drop for Lane {
     fn drop(&mut self) {
-        lanes().lock().remove(&self.0);
+        if self.1 {
+            lanes().lock().remove(&self.0);
+        }
     }
 }
 
@@ -459,7 +469,19 @@ fn decision_body(server: &FrontModelServer, persona: &Persona, request: &FrontRe
 /// The request that puts the persona's system prompt into the cache of the lane's slot for
 /// its decisions (`interim`: for those about words over the agent).
 fn warm_body(server: &FrontModelServer, persona: &Persona, interim: bool) -> Value {
-    let mut body = with_model(
+    let mut body = prompt_body(server, persona);
+    if let Some(slot) = slot(server, interim) {
+        body["id_slot"] = json!(slot);
+    }
+    if interim {
+        forget_rendered(server, slot(server, true));
+    }
+    body
+}
+
+/// The persona's prompt alone, to put it in a slot's cache.
+fn prompt_body(server: &FrontModelServer, persona: &Persona) -> Value {
+    with_model(
         server,
         json!({
             "messages": [
@@ -469,14 +491,7 @@ fn warm_body(server: &FrontModelServer, persona: &Persona, interim: bool) -> Val
             "max_tokens": 1,
             "cache_prompt": true,
         }),
-    );
-    if let Some(slot) = slot(server, interim) {
-        body["id_slot"] = json!(slot);
-    }
-    if interim {
-        forget_rendered(server, slot(server, true));
-    }
-    body
+    )
 }
 
 /// A reading or a narration (their own short prompts) goes to the lane's interims' slot: on
@@ -1426,6 +1441,7 @@ pub fn relay_request(
         board,
         recent_agent_lines: &[],
         over_agent: false,
+        turn_echo: None,
     };
     FrontRequest {
         turn,
@@ -1741,6 +1757,7 @@ pub async fn canary(server: &FrontModelServer) -> Result<u64, String> {
             board: &board,
             recent_agent_lines: &[],
             over_agent: false,
+            turn_echo: None,
         };
         let asked = FrontRequest {
             turn: TurnId(0),
@@ -1790,6 +1807,43 @@ pub async fn warm(server: &FrontModelServer, persona: &Persona) -> bool {
     let first = warm_body(server, persona, false);
     matches!(
         tokio::time::timeout(WARM_TIMEOUT, post(server, &first)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// The front pool's reading of a server (spec 029 SF-9): its slots, kept for its sessions'
+/// requests, or why it cannot be the front (it does not answer, or it runs LFM weights
+/// without the licence statement).
+pub(super) async fn server_slots(server: &FrontModelServer) -> Result<usize, String> {
+    let props = props(server)
+        .await
+        .ok_or_else(|| "it does not answer GET /props".to_owned())?;
+    if let Some(problem) = served_licence_problem(&props, server.licence.as_deref()) {
+        return Err(problem);
+    }
+    let slots = props["total_slots"]
+        .as_u64()
+        .map_or(1, |slots| slots as usize);
+    set_slots(server, slots);
+    Ok(slots.max(1))
+}
+
+/// The front pool's warm-up of one slot of a server's `slots` (spec 029 SF-9): the persona's
+/// prompt in slot `slot`'s cache, as a session's own warm-up puts it there; `false` when the
+/// server did not answer in time.
+pub(super) async fn warm_slot(
+    server: &FrontModelServer,
+    persona: &Persona,
+    slot: usize,
+    slots: usize,
+) -> bool {
+    let mut body = prompt_body(server, persona);
+    if slots > 1 {
+        body["id_slot"] = json!(slot);
+        forget_rendered(server, Some(slot));
+    }
+    matches!(
+        tokio::time::timeout(WARM_TIMEOUT * 3, post(server, &body)).await,
         Ok(Ok(_))
     )
 }
@@ -2578,6 +2632,7 @@ mod tests {
             board: &board,
             recent_agent_lines: &[],
             over_agent: false,
+            turn_echo: None,
         };
         FrontRequest {
             turn: TurnId(3),
@@ -2927,6 +2982,7 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
         let request = bag_request(&persona);
         let mut server = FrontModelServer {
             url: "http://127.0.0.1:18741".to_owned(),
+            urls: Vec::new(),
             model: None,
             api_key: None,
             command: None,

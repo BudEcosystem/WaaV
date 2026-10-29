@@ -266,12 +266,26 @@ impl EndOfTurnModel for SmartTurnOnDemand {
         .map_err(|e| EndOfTurnError(e.to_string()))?;
         let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.pool.len();
         let mut detector = self.pool[i].lock().await;
-        detector
+        let result = detector
             .predict(&frames)
             .await
-            .map(|r| r.probability)
-            .map_err(|e| EndOfTurnError(e.to_string()))
+            .map_err(|e| EndOfTurnError(e.to_string()))?;
+        probability_of(&result)
     }
+}
+
+/// A prediction's probability for the engine, or an error when its inference timed out: the engine
+/// reads an error as no verdict (`Verdict::Failed`), never an earlier probability (spec 029 W-1).
+#[cfg(feature = "smart-turn")]
+fn probability_of(
+    result: &crate::core::smart_turn::SmartTurnResult,
+) -> Result<f32, EndOfTurnError> {
+    if result.timed_out {
+        return Err(EndOfTurnError(
+            "smart turn inference timed out: no verdict".to_owned(),
+        ));
+    }
+    Ok(result.probability)
 }
 
 /// The gateway's text end-of-turn model as the engine's second rung.
