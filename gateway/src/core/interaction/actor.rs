@@ -51,6 +51,7 @@ use super::duplex::Duplex;
 use super::events::{self, Refused, Sentence, WireEvent};
 use super::floor::FloorMachine;
 use super::front_model::{self, FrontRequest};
+use super::front_pool;
 use super::front_supervisor;
 use super::health::{self, LineKind, Service, Watcher};
 use super::persona::{self, Persona};
@@ -58,6 +59,7 @@ use super::policy::{self, Policy};
 use super::rules::{self, RuleCtx};
 use super::tasks::{self, AgentSpec, Registry};
 use super::tenant;
+use super::turn_record::{TurnRecord, TurnTrace};
 use super::types::{
     Act, ActDecision, ActSource, Class, CutCause, DuplexAction, DuplexEvent, EotSource, FloorCmd,
     FloorSnapshot, FrontEvent, GateCmd, HitlId, HitlKind, HitlOutcome, ItemId, Kind, Lane,
@@ -115,6 +117,14 @@ pub enum Msg {
         line: Option<String>,
         ms: u64,
     },
+    /// The text end-of-turn model's reading of the words a turn is held on
+    /// (`DuplexAction::JudgeWords`).
+    WordsJudged {
+        text: String,
+        finished: bool,
+    },
+    /// A pair on another front server, for a session whose pair was lost (spec 029 SF-5).
+    FrontPlaced(Box<front_pool::Placement>),
     /// The front's label for a turn it read (`None`: none in time), and how long it took.
     Read {
         turn: TurnId,
@@ -601,6 +611,13 @@ fn catalog_agents(
     (tools, runs, specs)
 }
 
+/// How often a session whose front pair was lost asks for one elsewhere (spec 029 SF-5).
+const REPLACE_EVERY_MS: Ms = 2_000;
+
+/// The longest the text end-of-turn model is waited for: a reading later than the hold it
+/// could end (`duplex::HOLD_MS`) ends nothing.
+const WORDS_JUDGE_WAIT: Duration = Duration::from_millis(800);
+
 /// What the actor works with. It never reads `config::server()`.
 pub struct ActorDeps {
     pub vm: Arc<VoiceManager>,
@@ -642,6 +659,9 @@ pub struct ActorDeps {
     /// A LiveKit session: the room's operation queue. Every event sent to the client is also
     /// published in the room, on the data topic [`ROOM_TOPIC`].
     pub room: Option<OperationQueue>,
+    /// The session's pair on a front server the gateways share (spec 029 §5.8); `None` when
+    /// the gateway runs its front itself.
+    pub placement: Option<front_pool::Placement>,
 }
 
 /// The room data topic of a LiveKit session's interaction events.
@@ -893,6 +913,13 @@ struct Actor {
     persona: Arc<Persona>,
 
     duplex: Duplex,
+    /// The latest caller turn's `voice.turn` record (spec 029 D-9).
+    record: Option<TurnRecord>,
+    /// The caller turn each live run records itself in, with the run's task: a child task's
+    /// run records itself in the turn of its parent's.
+    traces: HashMap<RunId, (Option<TaskId>, TurnTrace)>,
+    /// The process's text end-of-turn model, which reads the words a turn is held on.
+    text_turn: Option<Arc<tokio::sync::RwLock<crate::core::turn_detect::TurnDetector>>>,
     floor: FloorMachine,
     registry: Registry,
     policy: Policy,
@@ -900,6 +927,10 @@ struct Actor {
     /// The gateway runs the front model (`front_supervisor`) and this session lost it at
     /// that readiness generation: nothing is decided until it is ready again.
     front_down: Option<u64>,
+    /// The session's pair on a shared front server (spec 029 §5.8).
+    placement: Option<front_pool::Placement>,
+    /// When a pair elsewhere was last asked for, after the session's was lost.
+    replace_asked: Option<Ms>,
     /// When the front became unavailable: the mode ends past the restart window.
     front_lost_at: Option<Ms>,
     /// The session has a plain conversation to go on as (`ActorDeps::plain_path`).
@@ -1132,6 +1163,7 @@ fn follow_up(cfg: &InteractionConfig) -> bool {
 impl Actor {
     fn new(deps: ActorDeps, tx: mpsc::WeakSender<Msg>) -> (Self, UnboundedReceiver<PumpEvent>) {
         let cfg = deps.cfg;
+        let text_turn = deps.vm.turn_detector();
         let persona = cfg.front.load_persona();
         let floor = FloorMachine::new(&cfg, persona.clone(), deps.ctl.lead_ms());
         let speed = deps.vm.get_config().tts_config.speaking_rate;
@@ -1230,7 +1262,11 @@ impl Actor {
                 deps.request_response,
             )
             .with_provider_turns(deps.provider_turns)
-            .with_turn_end_on_claim(deps.stt_end_turn_after_ms),
+            .with_turn_end_on_claim(deps.stt_end_turn_after_ms)
+            .with_words_judge(text_turn.is_some()),
+            record: None,
+            traces: HashMap::new(),
+            text_turn,
             registry,
             policy,
             floor_wire: floor.wire_state(),
@@ -1263,6 +1299,7 @@ impl Actor {
             persona,
             front: None,
             front_down: None,
+            replace_asked: None,
             front_lost_at: None,
             plain_path: deps.plain_path,
             interim: None,
@@ -1272,7 +1309,13 @@ impl Actor {
             asides: 0,
             prime_owed: false,
             warming: None,
-            lane: front_model::Lane::take(),
+            lane: deps
+                .placement
+                .as_ref()
+                .map_or_else(front_model::Lane::take, |placed| {
+                    front_model::Lane::pinned(placed.pair())
+                }),
+            placement: deps.placement,
             agent_topics,
             state,
             caps,
@@ -1682,6 +1725,7 @@ impl Actor {
                 if event.is_last() {
                     self.runs.remove(&run);
                     self.run_at.remove(&run);
+                    self.traces.remove(&run);
                 }
                 self.task(now, TaskCmd::Run { run, event }, inputs);
             }
@@ -1709,6 +1753,25 @@ impl Actor {
                 bridge::observe_turn_stage_ms("narrator", "interaction", ms as f64);
                 inputs.push_back(PolicyInput::Narrated { item, line });
                 self.aside_done();
+            }
+            Msg::WordsJudged { text, finished } => {
+                debug!(stream_id = %self.stream_id, finished, "interaction held words read");
+                return self.duplex.on_words(now, &text, finished, floor, expected);
+            }
+            Msg::FrontPlaced(placement) => {
+                info!(
+                    stream_id = %self.stream_id,
+                    server = %placement.server().url,
+                    pair = placement.pair(),
+                    "interaction front pair taken on another server"
+                );
+                self.lane = front_model::Lane::pinned(placement.pair());
+                self.placement = Some(*placement);
+                self.front_down = None;
+                self.replace_asked = None;
+                self.front_back();
+                // The new pair has this session's prompt in neither slot.
+                self.warm_front();
             }
             Msg::Read { turn, label, ms } => {
                 debug!(
@@ -1811,19 +1874,7 @@ impl Actor {
                 if let Some(control) = wish {
                     self.control(now, control, inputs);
                 }
-                if let Some((server, tx)) = self.front_model() {
-                    let persona = self.persona.clone();
-                    let warming = self.spawn_front(async move {
-                        // The warm-up is also the probe.
-                        let msg = if front_model::warm(&server, &persona).await {
-                            Msg::FrontWarm
-                        } else {
-                            Msg::Front(FrontEvent::Unavailable)
-                        };
-                        let _ = tx.send(msg).await;
-                    });
-                    self.warming = Some(warming.abort_handle());
-                }
+                self.warm_front();
             }
             Msg::FrontWarm => {
                 // The interims' slot is warmed only while the caller is quiet and no turn has
@@ -1959,6 +2010,30 @@ impl Actor {
         lanes.extend(events);
     }
 
+    /// Ask the text end-of-turn model whether the words a turn is held on are finished. A
+    /// reading later than the hold it could end ends nothing, and a failed one is "not
+    /// finished": the hold runs out as it would without the model.
+    fn judge_words(&self, turn: TurnId, text: String) {
+        let Some(model) = self.text_turn.clone() else {
+            return;
+        };
+        let (tx, stream_id) = (self.tx.clone(), self.stream_id.clone());
+        tokio::spawn(async move {
+            let read = async { model.read().await.is_turn_complete(&text).await };
+            let finished = match tokio::time::timeout(WORDS_JUDGE_WAIT, read).await {
+                Ok(Ok(finished)) => finished,
+                Ok(Err(error)) => {
+                    debug!(%stream_id, turn = turn.0, %error, "interaction text end-of-turn model failed");
+                    false
+                }
+                Err(_) => false,
+            };
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(Msg::WordsJudged { text, finished }).await;
+            }
+        });
+    }
+
     /// The effects of a duplex action, and the policy input it becomes.
     fn on_duplex(&mut self, now: Ms, action: DuplexAction, inputs: &mut VecDeque<PolicyInput>) {
         match action {
@@ -1999,6 +2074,7 @@ impl Actor {
                 debug!(stream_id = %self.stream_id, turn = turn.0, "interaction eager end withdrawn");
                 inputs.push_back(PolicyInput::EagerWithdrawn { turn })
             }
+            DuplexAction::JudgeWords { turn, text } => self.judge_words(turn, text),
             DuplexAction::ClaimSegment => {
                 let vm = self.vm.clone();
                 tokio::spawn(async move {
@@ -2049,6 +2125,14 @@ impl Actor {
                     bridge::record_degraded("interaction", "stt_timeout");
                 }
                 let said = !turn.text.is_empty() && !turn.suspected_echo;
+                if said {
+                    // The turn's record: the root of its trace (spec 029 D-9). The previous
+                    // turn's ends with the runs it started.
+                    let span = self
+                        .background
+                        .turn_span(&self.stream_id, turn.turn.0, &turn.text);
+                    self.record = Some(TurnRecord::open(span, turn.turn, turn.at));
+                }
                 self.mark = self.ledger.len();
                 // A value that is never taken by voice is kept out of every later run.
                 let categories = self.persona.sensitive_categories();
@@ -2106,6 +2190,12 @@ impl Actor {
                 TaskEffect::Emit(event) => {
                     if matches!(event.kind, TaskEventKind::Created { .. }) {
                         self.marks.insert(event.task.clone(), self.mark);
+                        // A caller's request: the task of the turn that made it.
+                        if event.lineage.parent_id.is_none()
+                            && let Some(record) = &mut self.record
+                        {
+                            record.task(&event.task_ref.0);
+                        }
                     }
                     // The result is published the moment it exists, whatever is said of it.
                     let output = self.registry.output(&event.task);
@@ -2307,6 +2397,22 @@ impl Actor {
         // A task's revision is its request and the corrections so far.
         let revision = u32::try_from(words.len()).unwrap_or(u32::MAX);
         let task = task.map(|task| (task.clone(), revision));
+        // The caller turn the run records itself in (spec 029 D-9): a child task's run in its
+        // parent's, any other in the latest caller turn's, which started it.
+        let turn = if child {
+            let parent = task
+                .as_ref()
+                .and_then(|(task, _)| self.registry.parent_of(task));
+            (self.traces.values())
+                .find(|(task, _)| task.is_some() && *task == parent)
+                .map(|(_, trace)| trace.clone())
+        } else {
+            self.record.as_ref().map(TurnRecord::trace)
+        };
+        if let Some(trace) = &turn {
+            let id = task.as_ref().map(|(task, _)| task.clone());
+            self.traces.insert(run, (id, trace.clone()));
+        }
         if let Some(task) = &task {
             self.answers.insert(task.clone(), (run, String::new()));
             // The answers of the latest runs are the ones still heard.
@@ -2338,6 +2444,7 @@ impl Actor {
             child,
             handle: follow.flatten(),
             state: (!self.plain).then(|| self.state.to_json()),
+            turn,
         };
         backend.start(job, tx, cancel);
     }
@@ -2402,6 +2509,10 @@ impl Actor {
                     );
                     self.floor.on_settled(now, turn);
                     bridge::record_turn_outcome("interaction", act.as_str());
+                    if let Some(record) = self.record.as_ref().filter(|record| record.turn == turn)
+                    {
+                        record.settled(act);
+                    }
                     if let Some(latest) = self.turn.as_mut().filter(|latest| latest.id == turn) {
                         latest.act = Some(act);
                         let ms = now.saturating_sub(latest.e) as f64;
@@ -2552,7 +2663,17 @@ impl Actor {
     /// The front model and the inbox its task reports to; `None` while the model the gateway
     /// runs is not ready (chapter 9: no new decisions until it is back).
     fn front_model(&mut self) -> Option<(FrontModelServer, mpsc::Sender<Msg>)> {
-        let server = self.server.front_model.clone().filter(|_| !self.plain)?;
+        if self.plain {
+            return None;
+        }
+        let server = match &self.placement {
+            Some(placement) if placement.lost() => {
+                self.replace_front();
+                return None;
+            }
+            Some(placement) => placement.server().clone(),
+            None => self.server.front_model.clone()?,
+        };
         match front_supervisor::gate(self.front_down, front_supervisor::status()) {
             front_supervisor::Gate::Use => {}
             // Started again since this session lost it: the model decides again.
@@ -2570,6 +2691,35 @@ impl Actor {
         Some((server, self.tx.upgrade()?))
     }
 
+    /// The session's pair can no longer be used (spec 029 SF-2, SF-5): its lease could not be
+    /// proven, or its server was lost or restarted. The front is down for the session until a
+    /// pair elsewhere is held; one is asked for every [`REPLACE_EVERY_MS`], and the mode ends
+    /// as for a lost front when none is held within the restart window.
+    fn replace_front(&mut self) {
+        let now = self.ctl.now_ms();
+        if self.front_down.is_none() {
+            warn!(stream_id = %self.stream_id, "interaction front pair lost; asking for another");
+            self.front_down = Some(0);
+            self.front_lost();
+        }
+        if self
+            .replace_asked
+            .is_some_and(|at| now < at + REPLACE_EVERY_MS)
+        {
+            return;
+        }
+        let (Some(pool), Some(tx)) = (front_pool::get(), self.tx.upgrade()) else {
+            return;
+        };
+        self.replace_asked = Some(now);
+        let session = self.stream_id.clone();
+        tokio::spawn(async move {
+            if let Ok(placement) = pool.place(&session).await {
+                let _ = tx.send(Msg::FrontPlaced(Box::new(placement))).await;
+            }
+        });
+    }
+
     /// The model front failed this session: it is reported, and the mode ends when it is not
     /// back within the supervisor's restart window (chapter 9).
     fn front_lost(&mut self) {
@@ -2585,6 +2735,30 @@ impl Actor {
             self.service_failing(Service::Front, self.ctl.now_ms());
         }
         self.degrade(FRONT_UNAVAILABLE);
+    }
+
+    /// The front server the session asks: its pair's, else the configured one.
+    fn front_server(&self) -> Option<FrontModelServer> {
+        match &self.placement {
+            Some(placement) => Some(placement.server().clone()),
+            None => self.server.front_model.clone(),
+        }
+    }
+
+    /// Put the session's prompt in its decisions' slot; the warm-up is also the probe.
+    fn warm_front(&mut self) {
+        if let Some((server, tx)) = self.front_model() {
+            let persona = self.persona.clone();
+            let warming = self.spawn_front(async move {
+                let msg = if front_model::warm(&server, &persona).await {
+                    Msg::FrontWarm
+                } else {
+                    Msg::Front(FrontEvent::Unavailable)
+                };
+                let _ = tx.send(msg).await;
+            });
+            self.warming = Some(warming.abort_handle());
+        }
     }
 
     /// The model front answers again: the updates that waited for it are worded now.
@@ -2747,6 +2921,10 @@ impl Actor {
                 &floor.recent_agent_lines
             },
             over_agent: interim,
+            // The policy's row 1 settles every turn the duplex machine took as the agent's
+            // echo (unless it answers a read-back): a finished turn it asks about is the
+            // caller's, whatever words of the agent's it repeats.
+            turn_echo: (!interim).then_some(false),
         };
         let view = rules::rule_view(&text, &ctx, &self.persona);
         // The agent is quiet only between lines, and not after a line the caller talked over.
@@ -2886,8 +3064,9 @@ impl Actor {
     /// cache, so the whole prompt was read again) made it miss the front's budget in every such
     /// case of the r4 runs (MA3: 4 of 4). The line is primed when they are back.
     fn prime_line(&mut self, now: Ms) {
-        let second =
-            (self.server.front_model.as_ref()).is_some_and(|server| front_model::slots(server) > 1);
+        let second = self
+            .front_server()
+            .is_some_and(|server| front_model::slots(&server) > 1);
         if !second || self.interim.is_some() {
             return;
         }
@@ -4795,6 +4974,11 @@ impl Actor {
                     let took = at.saturating_sub(spoken.submitted);
                     self.policy.synth_took(took, spoken.alone);
                 }
+                if let Some(record) = &mut self.record {
+                    let answer = matches!(kind, Kind::Relay | Kind::Answer);
+                    let reply = spoken.utterance.reply_to == Some(record.turn);
+                    record.audible(at, answer, reply);
+                }
                 if let Some(turn) = &mut self.turn {
                     let ms = at.saturating_sub(turn.e) as f64;
                     if std::mem::take(&mut turn.first_audible_owed) {
@@ -5403,6 +5587,7 @@ mod tests {
             warm: true,
             plain_path: false,
             room: None,
+            placement: None,
         };
         let (mut actor, _pump_rx) = Actor::new(deps, inbox.downgrade());
         drop(inbox);

@@ -671,11 +671,13 @@ mod tests {
         });
         let server = FrontModelServer {
             url: format!("http://127.0.0.1:{port}"),
+            urls: Vec::new(),
             model: None,
             api_key: None,
             // Exits after a second: the supervisor starts it again.
             command: Some(words("sleep 1")),
             licence: None,
+            line_budget_ms: None,
         };
         assert_eq!(status(), None);
         // The stand-in answers the canary's decision.

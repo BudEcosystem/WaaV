@@ -357,6 +357,7 @@ impl FloorMachine {
             | DuplexAction::EagerWithdrawn { .. }
             | DuplexAction::Interim { .. }
             | DuplexAction::ClaimSegment
+            | DuplexAction::JudgeWords { .. }
             | DuplexAction::FinalizeStt { .. } => {}
         }
         std::mem::take(&mut self.out)

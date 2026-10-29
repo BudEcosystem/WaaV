@@ -234,6 +234,11 @@ const NARRATION_MIN_CUT_WORDS: usize = 4;
 /// boundary is left as it is, for [`narration`] to refuse. The 22-word line above becomes
 /// "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the checksums file
 /// fourteen." (17 words): the result, without the clause past the limit.
+///
+/// The cut never drops a part that holds a contrast, an exception or a negation (the pack's
+/// `narration.cut_never_drops`): "The booking is confirmed, but the table was cancelled" is not cut
+/// to "The booking is confirmed." (spec 029 W-3). Such a line is left as it is, refused for its
+/// length, and written again.
 pub fn fit_narration(line: &str) -> String {
     let line = line.trim();
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -245,7 +250,14 @@ pub fn fit_narration(line: &str) -> String {
     let clause = (NARRATION_MIN_CUT_WORDS..=most)
         .rev()
         .find(|&n| words[n - 1].ends_with([',', ';', ':']));
-    match clause {
+    let keeps_meaning = |n: usize| {
+        let dropped = norm_phrase(&words[n..].join(" "));
+        !any_phrase(
+            &dropped,
+            &persona::guard_lexicon().narration.cut_never_drops,
+        )
+    };
+    match clause.filter(|&n| keeps_meaning(n)) {
         Some(n) => {
             let head = words[..n].join(" ");
             format!("{}.", head.trim_end_matches([',', ';', ':']))
@@ -269,26 +281,35 @@ fn ends_sentence_inside(body: &str) -> bool {
 }
 
 /// The check of a task update the front worded (chapter 8): the outbound policy, with the
-/// task's result among what was given, then one finished sentence (it ends with its full
-/// stop: a line the token budget cut is no sentence) of at most [`NARRATION_MAX_WORDS`]
-/// words whose every number and every name (a capitalised word that does not start the
-/// sentence) is in `source`: the task's title and result and the caller's latest words. A
-/// point between two digits ("version 1.1.0") ends no sentence.
-pub fn narration(line: &str, source: &str) -> GuardOutcome {
+/// task's result and its request among what was given, then one finished sentence (it ends
+/// with its full stop: a line the token budget cut is no sentence) of at most
+/// [`NARRATION_MAX_WORDS`] words. Every number it says, in digits or in words, is one the
+/// `result` gives; every name (a capitalised word that does not start the sentence) is in the
+/// result or the `request` (the task's title and the caller's words). The request names what
+/// was asked, not what came of it: a number in it is no source ("a refund of 500 dollars"
+/// asked, 50 approved), except an identifier of [`LONG_NUMBER_DIGITS`] digits or more (an
+/// order number) said again. A point between two digits ("version 1.1.0") ends no sentence.
+pub fn narration(line: &str, result: &str, request: &str) -> GuardOutcome {
+    let source = &format!("{request} {result}");
     if let GuardOutcome::Blocked(rule) = outbound(line, source) {
         return GuardOutcome::Blocked(rule);
     }
     let words: Vec<&str> = line.split_whitespace().collect();
     let line = line.trim_end();
     let body = line.trim_end_matches(['.', '!']);
-    let given = given_numbers(source);
+    let lex = persona::guard_lexicon();
+    let given = given_numbers(lex, result, request);
+    let said = numbers(line)
+        .into_iter()
+        .map(str::to_owned)
+        .chain(spoken_numbers(lex, line).into_iter().map(|n| n.to_string()));
     let rule = if words.is_empty() || words.len() > NARRATION_MAX_WORDS {
         "narration_length"
     } else if !line.ends_with(['.', '!']) {
         "narration_unfinished"
     } else if ends_sentence_inside(body) {
         "narration_sentences"
-    } else if numbers(line).iter().any(|n| !given.iter().any(|g| g == n)) {
+    } else if said.into_iter().any(|n| !given.contains(&n)) {
         "number_not_given"
     } else {
         let given = norm_phrase(source);
@@ -306,79 +327,145 @@ pub fn narration(line: &str, source: &str) -> GuardOutcome {
     GuardOutcome::Blocked(rule)
 }
 
-/// The numbers a source gives, by value: in digits ([`numbers`]) and in words
-/// ([`spelled_numbers`]). Live (take 15) the browser agent wrote its result for speech,
-/// "Version one point one point oh is published as Latest", and the narrator wrote "version
-/// 1.1.0": the same number, not one the result lacks.
-fn given_numbers(source: &str) -> Vec<String> {
-    let mut given: Vec<String> = numbers(source).into_iter().map(str::to_owned).collect();
-    given.extend(spelled_numbers(source).into_iter().map(|n| n.to_string()));
+/// The numbers a narration may say, by value: the result's, in digits ([`numbers`]) and in
+/// words ([`spoken_numbers`]), and the request's identifiers ([`long_numbers`]). Live (take
+/// 15) the browser agent wrote its result for speech, "Version one point one point oh is
+/// published as Latest", and the narrator wrote "version 1.1.0": the same number, not one the
+/// result lacks.
+fn given_numbers(lex: &GuardLexicon, result: &str, request: &str) -> Vec<String> {
+    let mut given: Vec<String> = numbers(result).into_iter().map(str::to_owned).collect();
+    given.extend(
+        spoken_numbers(lex, result)
+            .into_iter()
+            .map(|n| n.to_string()),
+    );
+    given.extend(
+        long_numbers(request)
+            .iter()
+            .map(|id| match id.trim_start_matches('0') {
+                "" => "0".to_owned(),
+                id => id.to_owned(),
+            }),
+    );
     given
 }
 
-/// The numbers a text says in words, by value: "twelve" 12, "twenty-seventh" 27 (and 20 and
-/// 7), "twenty six" 26, and the "oh" of "point oh" 0. Up to ninety-nine: a larger number a
-/// result says in words is not read.
-fn spelled_numbers(text: &str) -> Vec<u32> {
-    const UNITS: [(&str, &str, u32); 20] = [
-        ("zero", "zeroth", 0),
-        ("one", "first", 1),
-        ("two", "second", 2),
-        ("three", "third", 3),
-        ("four", "fourth", 4),
-        ("five", "fifth", 5),
-        ("six", "sixth", 6),
-        ("seven", "seventh", 7),
-        ("eight", "eighth", 8),
-        ("nine", "ninth", 9),
-        ("ten", "tenth", 10),
-        ("eleven", "eleventh", 11),
-        ("twelve", "twelfth", 12),
-        ("thirteen", "thirteenth", 13),
-        ("fourteen", "fourteenth", 14),
-        ("fifteen", "fifteenth", 15),
-        ("sixteen", "sixteenth", 16),
-        ("seventeen", "seventeenth", 17),
-        ("eighteen", "eighteenth", 18),
-        ("nineteen", "nineteenth", 19),
-    ];
-    const TENS: [(&str, &str, u32); 8] = [
-        ("twenty", "twentieth", 20),
-        ("thirty", "thirtieth", 30),
-        ("forty", "fortieth", 40),
-        ("fifty", "fiftieth", 50),
-        ("sixty", "sixtieth", 60),
-        ("seventy", "seventieth", 70),
-        ("eighty", "eightieth", 80),
-        ("ninety", "ninetieth", 90),
-    ];
-    let value = |table: &[(&str, &str, u32)], word: &str| {
-        let found = table
-            .iter()
-            .find(|(name, nth, _)| *name == word || *nth == word);
-        found.map(|(.., value)| *value)
+/// The numbers a text says in words, by value, read with the pack's tables
+/// (`normalisation`): "fifteen" 15, "twenty-seventh" 27, "five hundred and fifty" 550, "two
+/// thousand" 2000. A number ends at a word that cannot go on it ("nine forty" is 9 and 40, a
+/// time), at punctuation, and at "point" ("one point five" is 1 and 5, as [`numbers`] reads
+/// "1.5"). A word that is a number only in some sentences counts where it is one: "oh" after
+/// "point" or beside another number word ("five oh two"), "second" before "of" or next to a
+/// month (`ordinal_second_needs_context`), and "one" not after a word that makes it a pronoun
+/// (`one_pronoun_after`: "the one", "the cheaper one").
+fn spoken_numbers(lex: &GuardLexicon, text: &str) -> Vec<u64> {
+    /// What a number word does to the number it is in.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Part {
+        Unit,
+        Tens,
+        Hundred,
+        Large,
+    }
+    let n = &lex.normalisation;
+    let cardinal = |word: &str| {
+        n.units.contains_key(word) || n.tens.contains_key(word) || n.scales.contains_key(word)
     };
-    let text = text.to_lowercase();
-    let words: Vec<&str> = text
-        .split(|c: char| !c.is_alphabetic())
-        .filter(|word| !word.is_empty())
-        .collect();
     let mut values = Vec::new();
-    for (at, word) in words.iter().enumerate() {
-        if *word == "oh" && at > 0 && words[at - 1] == "point" {
-            values.push(0);
-        } else if let Some(unit) = value(&UNITS, word) {
-            values.push(unit);
-        } else if let Some(tens) = value(&TENS, word) {
-            values.push(tens);
-            // "twenty-seven" and "twenty seven" are split alike.
-            if let Some(unit) = words
-                .get(at + 1)
-                .and_then(|next| value(&UNITS[1..10], next))
-            {
-                values.push(tens + unit);
+    let text = straighten(text).to_lowercase();
+    for clause in text.split([',', ';', ':', '.', '!', '?', '(', ')', '\n']) {
+        let words: Vec<&str> = clause
+            .split(|c: char| !(c.is_alphabetic() || c == '\''))
+            .filter(|word| !word.is_empty())
+            .collect();
+        let at = |i: Option<usize>| i.and_then(|i| words.get(i).copied());
+        let month =
+            |word: Option<&str>| word.is_some_and(|word| n.months.iter().any(|m| m == word));
+        let number_word = |word: Option<&str>| {
+            word.is_some_and(|word| {
+                word != "oh" && (cardinal(word) || n.ordinals.contains_key(word))
+            })
+        };
+        // (total, current, last part) of the number being read.
+        let mut reading: Option<(u64, u64, Part)> = None;
+        let mut flush = |reading: &mut Option<(u64, u64, Part)>| {
+            if let Some((total, current, _)) = reading.take() {
+                values.push(total + current);
+            }
+        };
+        for (i, word) in words.iter().copied().enumerate() {
+            let (before, after) = (at(i.checked_sub(1)), at(Some(i + 1)));
+            let pronoun = || {
+                let determiner = |word: Option<&str>| {
+                    word.is_some_and(|word| n.one_pronoun_after.iter().any(|d| d == word))
+                };
+                determiner(before)
+                    || (determiner(at(i.checked_sub(2))) && !before.is_some_and(cardinal))
+            };
+            let value = match word {
+                "oh" if before == Some("point") || number_word(before) || number_word(after) => {
+                    Some((Part::Unit, 0, false))
+                }
+                "second" if !(after == Some("of") || month(before) || month(after)) => None,
+                "one" if pronoun() => None,
+                "oh" => None,
+                _ => n
+                    .units
+                    .get(word)
+                    .map(|v| (Part::Unit, *v, false))
+                    .or_else(|| n.tens.get(word).map(|v| (Part::Tens, *v, false)))
+                    .or_else(|| {
+                        let scale = |v: u64| if v == 100 { Part::Hundred } else { Part::Large };
+                        n.scales.get(word).map(|v| (scale(*v), *v, false))
+                    })
+                    .or_else(|| {
+                        let part = |v: u64| {
+                            if v >= 20 && v.is_multiple_of(10) {
+                                Part::Tens
+                            } else {
+                                Part::Unit
+                            }
+                        };
+                        n.ordinals.get(word).map(|v| (part(*v), *v, true))
+                    }),
+            };
+            let Some((part, value, ordinal)) = value else {
+                // "five hundred and fifty": one number.
+                let joins = word == "and"
+                    && matches!(reading, Some((.., Part::Hundred | Part::Large)))
+                    && number_word(after);
+                if !joins {
+                    flush(&mut reading);
+                }
+                continue;
+            };
+            let goes_on = match (reading.map(|(.., last)| last), part) {
+                (Some(Part::Tens), Part::Unit) => (1..10).contains(&value),
+                (Some(Part::Hundred | Part::Large), Part::Unit | Part::Tens) => true,
+                (Some(Part::Unit | Part::Tens), Part::Hundred) => true,
+                (Some(_), Part::Large) => true,
+                _ => false,
+            };
+            if !goes_on {
+                flush(&mut reading);
+            }
+            let (total, current, _) = reading.get_or_insert((0, 0, part));
+            match part {
+                Part::Unit | Part::Tens => *current += value,
+                Part::Hundred => *current = (*current).max(1) * value,
+                Part::Large => {
+                    *total += (*current).max(1) * value;
+                    *current = 0;
+                }
+            }
+            if let Some((.., last)) = &mut reading {
+                *last = part;
+            }
+            if ordinal {
+                flush(&mut reading);
             }
         }
+        flush(&mut reading);
     }
     values
 }
@@ -528,7 +615,7 @@ fn long_numbers(sentence: &str) -> Vec<String> {
     for c in sentence.chars().chain(std::iter::once('x')) {
         if c.is_ascii_digit() {
             run.push(c);
-        } else if !(" -.()".contains(c) && !run.is_empty()) {
+        } else if !" -.()".contains(c) || run.is_empty() {
             if run.len() >= LONG_NUMBER_DIGITS {
                 found.push(std::mem::take(&mut run));
             }
@@ -1112,14 +1199,21 @@ mod tests {
     }
     #[test]
     fn a_task_update_says_nothing_its_result_and_the_call_do_not() {
-        let source = "Book the morning flight to Delhi on Friday Booked AI 101 at 09:40, seat 14C.";
+        let (request, result) = (
+            "Book the morning flight to Delhi on Friday",
+            "Booked AI 101 at 09:40, seat 14C.",
+        );
         let pass = [
             "Your Friday flight to Delhi is booked, AI 101 at 9:40.",
             "Good news: your Delhi flight on Friday leaves at 9:40.",
             "I booked it.",
         ];
         for line in pass {
-            assert_eq!(narration(line, source), GuardOutcome::Pass, "{line}");
+            assert_eq!(
+                narration(line, result, request),
+                GuardOutcome::Pass,
+                "{line}"
+            );
         }
         let blocked = [
             ("Your flight leaves at 10:15 on Friday.", "number_not_given"),
@@ -1140,7 +1234,7 @@ mod tests {
         ];
         for (line, rule) in blocked {
             assert_eq!(
-                narration(line, source),
+                narration(line, result, request),
                 GuardOutcome::Blocked(rule),
                 "{line}"
             );
@@ -1152,14 +1246,15 @@ mod tests {
     /// all three tries and never said; the browser task's line ended at the point of "1.1.0".
     #[test]
     fn a_long_update_is_cut_at_a_clause_and_a_version_point_ends_no_sentence() {
-        let source = "Pull the download numbers I got the counts with no errors: the x86 Linux \
-                      build has zero downloads, the ARM Linux build twelve, and the checksums \
-                      file fourteen, so the builds total twelve.";
+        let request = "Pull the download numbers";
+        let source = "I got the counts with no errors: the x86 Linux build has zero downloads, the \
+                      ARM Linux build twelve, and the checksums file fourteen, so the builds total \
+                      twelve.";
         let long = "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the \
                     checksums file fourteen, so the builds total twelve.";
         assert_eq!(long.split_whitespace().count(), 22);
         assert_eq!(
-            narration(long, source),
+            narration(long, source, request),
             GuardOutcome::Blocked("narration_length")
         );
         let fitted = fit_narration(long);
@@ -1168,7 +1263,7 @@ mod tests {
             "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the \
              checksums file fourteen."
         );
-        assert_eq!(narration(&fitted, source), GuardOutcome::Pass);
+        assert_eq!(narration(&fitted, source, request), GuardOutcome::Pass);
         // A line within the limit is left as it is; one with no clause boundary within it
         // too, for the check to refuse; a head too short to say anything is no cut.
         let short = "The ARM Linux build has twelve downloads.";
@@ -1177,7 +1272,7 @@ mod tests {
                         were all downloaded twelve or fourteen or zero times in total today.";
         assert_eq!(fit_narration(unbroken), unbroken);
         assert_eq!(
-            narration(unbroken, source),
+            narration(unbroken, source, request),
             GuardOutcome::Blocked("narration_length")
         );
         let early = "Okay, the x86 Linux build and the ARM Linux build and the checksums file \
@@ -1190,20 +1285,20 @@ mod tests {
             "The x86 Linux build has zero downloads."
         );
         assert_eq!(
-            narration("The x86 Linux build has zero downloads", source),
+            narration("The x86 Linux build has zero downloads", source, request),
             GuardOutcome::Blocked("narration_unfinished")
         );
 
         // A version's points end no sentence; a full stop between words still does.
         let release = "Version 1.1.0 is published as Latest, highlights include interaction mode.";
         let result = "Version 1.1.0 is published as Latest; highlights include interaction mode.";
-        assert_eq!(narration(release, result), GuardOutcome::Pass);
+        assert_eq!(narration(release, result, ""), GuardOutcome::Pass);
         assert_eq!(
-            narration("Version 1.1.0 is out. It is Latest.", result),
+            narration("Version 1.1.0 is out. It is Latest.", result, ""),
             GuardOutcome::Blocked("narration_sentences")
         );
         assert_eq!(
-            narration("The GitHub release for version 1.", "a new release"),
+            narration("The GitHub release for version 1.", "a new release", ""),
             GuardOutcome::Blocked("number_not_given")
         );
         // A number the result says in words is given, in digits too.
@@ -1214,15 +1309,141 @@ mod tests {
             "It was published on October 27.",
             "The ARM build has 12 downloads.",
         ] {
-            assert_eq!(narration(line, spoken), GuardOutcome::Pass, "{line}");
+            assert_eq!(narration(line, spoken, ""), GuardOutcome::Pass, "{line}");
         }
         assert_eq!(
-            narration("The ARM build has 13 downloads.", spoken),
+            narration("The ARM build has 13 downloads.", spoken, ""),
             GuardOutcome::Blocked("number_not_given")
         );
-        assert_eq!(spelled_numbers("Point oh, Oh well."), [0]);
+        assert_eq!(
+            spoken_numbers(persona::guard_lexicon(), "Point oh, Oh well."),
+            [0]
+        );
         assert!(ends_sentence_inside("Version 1. 1"));
         assert!(!ends_sentence_inside("Version 1.1.0 and 2.5"));
+    }
+
+    /// Spec 029 W-3: a number the narrator says in words is checked as its digits are. Only digits
+    /// were read, so "fifteen" passed a result of 14.
+    #[test]
+    fn a_number_said_in_words_is_checked_like_digits() {
+        let refund = "The refund of 14 dollars is approved.";
+        assert_eq!(
+            narration("Your refund of fifteen dollars is approved.", refund, ""),
+            GuardOutcome::Blocked("number_not_given")
+        );
+        assert_eq!(
+            narration("Your refund of fourteen dollars is approved.", refund, ""),
+            GuardOutcome::Pass
+        );
+        // Compounds and scales are one value each.
+        let total = "Your total is 500 dollars, due on May 3.";
+        for (line, outcome) in [
+            ("Your total is five hundred dollars.", GuardOutcome::Pass),
+            (
+                "Your total is five hundred and fifty dollars.",
+                GuardOutcome::Blocked("number_not_given"),
+            ),
+            ("It is due on the third of May.", GuardOutcome::Pass),
+            (
+                "It is due on the second of May.",
+                GuardOutcome::Blocked("number_not_given"),
+            ),
+            (
+                "Two thousand dollars are due.",
+                GuardOutcome::Blocked("number_not_given"),
+            ),
+        ] {
+            assert_eq!(narration(line, total, ""), outcome, "{line}");
+        }
+        // Digits in the result, words in the line.
+        assert_eq!(
+            narration(
+                "Your flight leaves at nine forty.",
+                "Booked AI 101 at 09:40.",
+                ""
+            ),
+            GuardOutcome::Pass
+        );
+        // Words that are numbers only in some sentences: "one" after a determiner is a
+        // pronoun, "oh" outside a number is an interjection, "second" is an ordinal only
+        // before "of" or next to a month (the pack's rule).
+        let seats = "Two seats are left; the cheaper flight is 40 dollars.";
+        for (line, outcome) in [
+            ("The cheaper one is forty dollars.", GuardOutcome::Pass),
+            (
+                "Which one you take, two seats are left.",
+                GuardOutcome::Pass,
+            ),
+            ("Oh, two seats are left.", GuardOutcome::Pass),
+            ("Just a second, two seats are left.", GuardOutcome::Pass),
+            (
+                "Only one seat is left.",
+                GuardOutcome::Blocked("number_not_given"),
+            ),
+        ] {
+            assert_eq!(narration(line, seats, ""), outcome, "{line}");
+        }
+    }
+
+    /// Spec 029 W-3: the caller's words name the request, not its outcome. A number the caller
+    /// asked for is not one the result gave ("500 dollars" asked, 50 approved), while a name or an
+    /// identifier of the request may be said again.
+    #[test]
+    fn the_callers_words_are_no_source_of_a_number() {
+        let request = "Refund for order 48213377: can I get a refund of 500 dollars?";
+        let result = "Refund approved for 50 dollars.";
+        assert_eq!(
+            narration("Your refund of 500 dollars is approved.", result, request),
+            GuardOutcome::Blocked("number_not_given")
+        );
+        for line in [
+            "Your refund of 50 dollars is approved.",
+            "Your refund for order 48213377 is approved at 50 dollars.",
+        ] {
+            assert_eq!(
+                narration(line, result, request),
+                GuardOutcome::Pass,
+                "{line}"
+            );
+        }
+        let flight = "Book the morning flight to Delhi on Friday";
+        assert_eq!(
+            narration("Your Delhi flight on Friday is booked.", "Booked.", flight),
+            GuardOutcome::Pass
+        );
+    }
+
+    /// Spec 029 W-3: a cut that drops a clause of contrast or exception says the opposite of the
+    /// result ("confirmed" without "but the table was cancelled"). Such a line is not cut: it
+    /// is refused for its length, and the narrator writes it again with the reason.
+    #[test]
+    fn a_line_is_never_cut_before_a_contrast() {
+        for line in [
+            "The restaurant booking for Friday is confirmed, but the table for eight was \
+             cancelled by the venue because of a private event.",
+            "Your flights to Delhi are booked, except the return leg on Sunday, which the \
+             airline could not confirm in time for you today.",
+            "The refund went through, although the bank says it can take up to ten working \
+             days to reach your card from today.",
+        ] {
+            assert!(
+                line.split_whitespace().count() > NARRATION_MAX_WORDS,
+                "{line}"
+            );
+            assert_eq!(fit_narration(line), line);
+        }
+        // A cut the token budget made just after the contrast began: not cut either.
+        let unfinished = "The restaurant booking for Friday is confirmed, but the ta";
+        assert_eq!(fit_narration(unfinished), unfinished);
+        // A clause past the limit that is no contrast is still cut.
+        assert_eq!(
+            fit_narration(
+                "The restaurant booking for Friday is confirmed, and the venue has your table \
+                 for eight ready from seven in the evening on."
+            ),
+            "The restaurant booking for Friday is confirmed."
+        );
     }
 
     #[test]

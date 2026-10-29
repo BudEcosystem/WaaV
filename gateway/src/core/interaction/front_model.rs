@@ -378,7 +378,10 @@ tokio::task_local! {
 /// come last in that prompt, so each interim reads only them and what follows from the slot's
 /// cache, and a turn's decision never evicts it. Sessions spread over every slot; with as many
 /// slots as two per session each keeps its primed slot to itself.
-pub struct Lane(pub usize);
+///
+/// On a server the gateways share, the lane is the session's leased pair
+/// (`front_pool::Placement`, [`Lane::pinned`]) and this process numbers nothing.
+pub struct Lane(pub usize, bool);
 
 fn lanes() -> &'static parking_lot::Mutex<std::collections::BTreeSet<usize>> {
     static LANES: OnceLock<parking_lot::Mutex<std::collections::BTreeSet<usize>>> = OnceLock::new();
@@ -390,13 +393,20 @@ impl Lane {
         let mut held = lanes().lock();
         let lane = (0..).find(|lane| !held.contains(lane)).unwrap_or_default();
         held.insert(lane);
-        Lane(lane)
+        Lane(lane, true)
+    }
+
+    /// The pair a front pool leased to the session.
+    pub fn pinned(pair: usize) -> Self {
+        Lane(pair, false)
     }
 }
 
 impl Drop for Lane {
     fn drop(&mut self) {
-        lanes().lock().remove(&self.0);
+        if self.1 {
+            lanes().lock().remove(&self.0);
+        }
     }
 }
 
@@ -459,7 +469,19 @@ fn decision_body(server: &FrontModelServer, persona: &Persona, request: &FrontRe
 /// The request that puts the persona's system prompt into the cache of the lane's slot for
 /// its decisions (`interim`: for those about words over the agent).
 fn warm_body(server: &FrontModelServer, persona: &Persona, interim: bool) -> Value {
-    let mut body = with_model(
+    let mut body = prompt_body(server, persona);
+    if let Some(slot) = slot(server, interim) {
+        body["id_slot"] = json!(slot);
+    }
+    if interim {
+        forget_rendered(server, slot(server, true));
+    }
+    body
+}
+
+/// The persona's prompt alone, to put it in a slot's cache.
+fn prompt_body(server: &FrontModelServer, persona: &Persona) -> Value {
+    with_model(
         server,
         json!({
             "messages": [
@@ -469,14 +491,7 @@ fn warm_body(server: &FrontModelServer, persona: &Persona, interim: bool) -> Val
             "max_tokens": 1,
             "cache_prompt": true,
         }),
-    );
-    if let Some(slot) = slot(server, interim) {
-        body["id_slot"] = json!(slot);
-    }
-    if interim {
-        forget_rendered(server, slot(server, true));
-    }
-    body
+    )
 }
 
 /// A reading or a narration (their own short prompts) goes to the lane's interims' slot: on
@@ -1318,28 +1333,60 @@ async fn post_to(
 }
 
 /// Send one decision request and forward the decoder's events. `true` once the turn is settled
-/// (`Done`, or `Failed` for output outside the offer), `false` when the body ends before that
-/// or, over the agent, at an act that is not a wait.
+/// (`Done`, or `Failed` for output outside the offer), `false` when the body ends before that,
+/// when its time is up or, over the agent, at an act that is not a wait.
+///
+/// The act has the request's `total_budget_ms`. Once an act whose reply is the front's own line
+/// is known (`Act::speaks_its_line`), the line has the server's `line_budget_ms` from it, and
+/// never less than the decision had left: the act settled the turn, and its caller waits for
+/// the line. Spec 029 (pde-ditto, imw-2): on a loaded CPU front two decisions together reached
+/// their act in about 1 s, and the line then ran past the 1.5 s budget; the caller heard
+/// nothing in 3 of 12 closings. Every other act's reply is the gateway's, so its line keeps the
+/// decision's budget: waiting for those lines kept the shared server busy for nothing (imw-3).
 async fn stream(
     server: &FrontModelServer,
     persona: &Persona,
     request: &FrontRequest,
     tx: &mpsc::Sender<Msg>,
 ) -> Result<bool, reqwest::Error> {
-    let asked = std::time::Instant::now();
+    let asked = tokio::time::Instant::now();
+    let mut deadline = asked + Duration::from_millis(u64::from(request.total_budget_ms));
     let rendered = request
         .interim
         .then(|| rendered_body(server, persona, request))
         .flatten();
     let client_rendered = rendered.is_some();
-    let mut response = match rendered {
-        Some(body) => post_to(server, "/completion", &body).await?,
-        None => post(server, &decision_body(server, persona, request)).await?,
+    let sent = async {
+        match rendered {
+            Some(body) => post_to(server, "/completion", &body).await,
+            None => post(server, &decision_body(server, persona, request)).await,
+        }
     };
+    let Ok(response) = tokio::time::timeout_at(deadline, sent).await else {
+        return Ok(false);
+    };
+    let mut response = response?;
     let headers_ms = asked.elapsed().as_millis() as u64;
     let mut decoder = Decoder::new(request, persona);
     let mut first = true;
-    while let Some(bytes) = response.chunk().await? {
+    let mut act_ms = None;
+    loop {
+        let Ok(chunk) = tokio::time::timeout_at(deadline, response.chunk()).await else {
+            // A turn settled at its act whose line never came: nothing is said for it.
+            if let Some(act_ms) = act_ms {
+                let line_ms = asked.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    turn = request.turn.0,
+                    act_ms,
+                    line_ms,
+                    "interaction front line missed its deadline"
+                );
+            }
+            return Ok(false);
+        };
+        let Some(bytes) = chunk? else {
+            break;
+        };
         if std::mem::take(&mut first) {
             // Where an act's time goes: the request and the server's first bytes.
             let first_ms = asked.elapsed().as_millis() as u64;
@@ -1353,6 +1400,13 @@ async fn stream(
             );
         }
         for event in decoder.push(&bytes) {
+            if let FrontEvent::ActKnown { act, .. } = &event
+                && act.speaks_its_line()
+                && !request.interim
+            {
+                act_ms.get_or_insert(asked.elapsed().as_millis() as u64);
+                deadline = deadline.max(tokio::time::Instant::now() + server.line_budget());
+            }
             let settled = matches!(event, FrontEvent::Done { .. } | FrontEvent::Failed { .. });
             // Over the agent only the act counts once it is not a wait: the rest of the line is
             // not read, and dropping the body has the server stop generating, so the turn's
@@ -1379,9 +1433,9 @@ async fn stream(
 }
 
 /// Ask the front model for one decision. Sends `ActKnown` at the first generated character and
-/// `Done` at the full line, or `Failed` when the output is not a decision or the budget runs
-/// out (also after an `ActKnown`). A request the server refuses or drops sends `Failed` and
-/// then `Unavailable`.
+/// `Done` at the full line, or `Failed` when the output is not a decision or its time runs out:
+/// the decision's budget before the act, the line's own after it (`stream`). A request the
+/// server refuses or drops sends `Failed` and then `Unavailable`.
 pub async fn decide(
     server: FrontModelServer,
     persona: Arc<Persona>,
@@ -1389,12 +1443,10 @@ pub async fn decide(
     tx: mpsc::Sender<Msg>,
 ) {
     let turn = request.turn;
-    let budget = Duration::from_millis(u64::from(request.total_budget_ms));
-    let outcome = tokio::time::timeout(budget, stream(&server, &persona, &request, &tx)).await;
-    let unreachable = match outcome {
-        Ok(Ok(true)) => return,
-        Ok(Ok(false)) | Err(_) => false,
-        Ok(Err(error)) => {
+    let unreachable = match stream(&server, &persona, &request, &tx).await {
+        Ok(true) => return,
+        Ok(false) => false,
+        Err(error) => {
             tracing::warn!(turn = turn.0, %error, "interaction front model request failed");
             true
         }
@@ -1426,6 +1478,7 @@ pub fn relay_request(
         board,
         recent_agent_lines: &[],
         over_agent: false,
+        turn_echo: None,
     };
     FrontRequest {
         turn,
@@ -1741,6 +1794,7 @@ pub async fn canary(server: &FrontModelServer) -> Result<u64, String> {
             board: &board,
             recent_agent_lines: &[],
             over_agent: false,
+            turn_echo: None,
         };
         let asked = FrontRequest {
             turn: TurnId(0),
@@ -1790,6 +1844,43 @@ pub async fn warm(server: &FrontModelServer, persona: &Persona) -> bool {
     let first = warm_body(server, persona, false);
     matches!(
         tokio::time::timeout(WARM_TIMEOUT, post(server, &first)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// The front pool's reading of a server (spec 029 SF-9): its slots, kept for its sessions'
+/// requests, or why it cannot be the front (it does not answer, or it runs LFM weights
+/// without the licence statement).
+pub(super) async fn server_slots(server: &FrontModelServer) -> Result<usize, String> {
+    let props = props(server)
+        .await
+        .ok_or_else(|| "it does not answer GET /props".to_owned())?;
+    if let Some(problem) = served_licence_problem(&props, server.licence.as_deref()) {
+        return Err(problem);
+    }
+    let slots = props["total_slots"]
+        .as_u64()
+        .map_or(1, |slots| slots as usize);
+    set_slots(server, slots);
+    Ok(slots.max(1))
+}
+
+/// The front pool's warm-up of one slot of a server's `slots` (spec 029 SF-9): the persona's
+/// prompt in slot `slot`'s cache, as a session's own warm-up puts it there; `false` when the
+/// server did not answer in time.
+pub(super) async fn warm_slot(
+    server: &FrontModelServer,
+    persona: &Persona,
+    slot: usize,
+    slots: usize,
+) -> bool {
+    let mut body = prompt_body(server, persona);
+    if slots > 1 {
+        body["id_slot"] = json!(slot);
+        forget_rendered(server, Some(slot));
+    }
+    matches!(
+        tokio::time::timeout(WARM_TIMEOUT * 3, post(server, &body)).await,
         Ok(Ok(_))
     )
 }
@@ -2578,6 +2669,7 @@ mod tests {
             board: &board,
             recent_agent_lines: &[],
             over_agent: false,
+            turn_echo: None,
         };
         FrontRequest {
             turn: TurnId(3),
@@ -2927,10 +3019,12 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
         let request = bag_request(&persona);
         let mut server = FrontModelServer {
             url: "http://127.0.0.1:18741".to_owned(),
+            urls: Vec::new(),
             model: None,
             api_key: None,
             command: None,
             licence: None,
+            line_budget_ms: None,
         };
         let body = decision_body(&server, &persona, &request);
         assert_eq!(body["stream"], true);
@@ -5456,6 +5550,208 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
                 [
                     FrontEvent::ActKnown {
                         act: Act::Delegate,
+                        ..
+                    },
+                    FrontEvent::Failed { .. }
+                ]
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// A stand-in front that streams `first` at once and `rest` after `gap` as one chat
+    /// completion, then closes. An empty part is not sent.
+    async fn slow_front(first: &'static str, gap: Duration, rest: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 1 << 16];
+            let _ = socket.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                        transfer-encoding: chunked\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let delta = |text: &str| {
+                let chunk = json!({ "choices": [{ "index": 0, "delta": { "content": text } }] });
+                format!("data: {chunk}\n\n")
+            };
+            let end = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\
+                       \n\ndata: [DONE]\n\n";
+            let parts = [
+                (Duration::ZERO, (!first.is_empty()).then(|| delta(first))),
+                (gap, Some(delta(rest) + end)),
+            ];
+            for (wait, data) in parts {
+                tokio::time::sleep(wait).await;
+                let Some(data) = data else {
+                    continue;
+                };
+                let chunk = format!("{:x}\r\n{data}\r\n", data.len());
+                if socket.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        url
+    }
+
+    /// The decision's events a test's `decide` sent.
+    fn decided(rx: &mut mpsc::Receiver<Msg>) -> Vec<FrontEvent> {
+        let mut events = Vec::new();
+        while let Ok(Msg::Front(event)) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// Spec 029 (pde-ditto, imw-2): two decisions together on a CPU front took about 1 s to
+    /// their act, and the line then ran past the 1.5 s budget. The act had settled the turn,
+    /// the line never came, and the caller heard nothing ("Great, thanks. That's all I
+    /// needed.", 3 of 12 closings). Once the act is known the line has the server's
+    /// `line_budget_ms`: here it comes 900 ms after a 500 ms budget ran out.
+    #[tokio::test]
+    async fn a_line_that_comes_after_the_decision_budget_is_still_heard() {
+        let url = slow_front(
+            r#"{"act":"social","say":"You're"#,
+            Duration::from_millis(1_400),
+            r#" welcome."}"#,
+        )
+        .await;
+        let server = FrontModelServer {
+            url,
+            line_budget_ms: Some(3_000),
+            ..FrontModelServer::default()
+        };
+        let persona = Persona::load("default");
+        let mut request = request(&persona, "great, thanks, that's all I needed", Vec::new());
+        request.total_budget_ms = 500;
+        let (tx, mut rx) = mpsc::channel(8);
+        decide(server, persona, request, tx).await;
+        let events = decided(&mut rx);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    FrontEvent::ActKnown {
+                        act: Act::Social,
+                        ..
+                    },
+                    FrontEvent::Done { decision, .. }
+                ] if decision.say.as_deref() == Some("You're welcome.")
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// The act keeps the decision's budget: a server that names none in it fails the
+    /// decision then, whatever time a line would have had after it.
+    #[tokio::test]
+    async fn an_act_past_the_decision_budget_fails_at_the_budget() {
+        let url = slow_front(
+            "",
+            Duration::from_millis(2_500),
+            r#"{"act":"social","say":"Hello."}"#,
+        )
+        .await;
+        let server = FrontModelServer {
+            url,
+            line_budget_ms: Some(3_000),
+            ..FrontModelServer::default()
+        };
+        let persona = Persona::load("default");
+        let mut request = request(&persona, "hello there", Vec::new());
+        request.total_budget_ms = 500;
+        let (tx, mut rx) = mpsc::channel(8);
+        let asked = std::time::Instant::now();
+        decide(server, persona, request, tx).await;
+        assert!(
+            asked.elapsed() < Duration::from_millis(1_500),
+            "{:?}",
+            asked.elapsed()
+        );
+        let events = decided(&mut rx);
+        assert_eq!(events, [FrontEvent::Failed { turn: TurnId(3) }]);
+    }
+
+    /// Only an act whose reply is the front's own line waits for it. A delegate's reply is the
+    /// gateway's acknowledgement, so its line has the decision's budget alone. On the loaded
+    /// CPU front (imw-3), 13 of 14 lines that ran past their extended deadline were delegates'.
+    /// They kept the server busy for nothing, and every other decision decoded slower.
+    #[tokio::test]
+    async fn a_delegates_line_is_not_waited_for_past_the_decision_budget() {
+        let url = slow_front(
+            r#"{"act":"delegate","say":"On"#,
+            Duration::from_millis(1_400),
+            r#" it."}"#,
+        )
+        .await;
+        let server = FrontModelServer {
+            url,
+            line_budget_ms: Some(3_000),
+            ..FrontModelServer::default()
+        };
+        let persona = Persona::load("default");
+        let mut request = request(&persona, "book me a table for two at eight", Vec::new());
+        request.total_budget_ms = 500;
+        let (tx, mut rx) = mpsc::channel(8);
+        let asked = std::time::Instant::now();
+        decide(server, persona, request, tx).await;
+        assert!(
+            asked.elapsed() < Duration::from_millis(1_200),
+            "{:?}",
+            asked.elapsed()
+        );
+        let events = decided(&mut rx);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    FrontEvent::ActKnown {
+                        act: Act::Delegate,
+                        ..
+                    },
+                    FrontEvent::Failed { .. }
+                ]
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// A line past its own deadline fails as a decision past its budget did: the act, then
+    /// `Failed`, once the line's time from the act is up.
+    #[tokio::test]
+    async fn a_line_past_its_own_deadline_fails() {
+        let url = slow_front(
+            r#"{"act":"social","say":"You're"#,
+            Duration::from_millis(5_000),
+            r#" welcome."}"#,
+        )
+        .await;
+        let server = FrontModelServer {
+            url,
+            line_budget_ms: Some(800),
+            ..FrontModelServer::default()
+        };
+        let persona = Persona::load("default");
+        let mut request = request(&persona, "great, thanks, that's all I needed", Vec::new());
+        request.total_budget_ms = 500;
+        let (tx, mut rx) = mpsc::channel(8);
+        let asked = std::time::Instant::now();
+        decide(server, persona, request, tx).await;
+        let took = asked.elapsed();
+        assert!(
+            took >= Duration::from_millis(700) && took < Duration::from_millis(2_000),
+            "{took:?}"
+        );
+        let events = decided(&mut rx);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    FrontEvent::ActKnown {
+                        act: Act::Social,
                         ..
                     },
                     FrontEvent::Failed { .. }

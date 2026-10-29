@@ -119,6 +119,10 @@ pub struct RuleCtx<'a> {
     pub recent_agent_lines: &'a [(Ms, String)],
     /// The words came while the agent spoke (an interim over it).
     pub over_agent: bool,
+    /// A turn's decision: the duplex machine's echo verdict on the whole turn (`EndOfTurn::
+    /// suspected_echo`), which knows whether the agent's echo was heard. `None` for words over
+    /// the agent, which this module judges itself.
+    pub turn_echo: Option<bool>,
 }
 
 /// The facts of one caller utterance the front's request carries: none of them is what the
@@ -167,22 +171,27 @@ pub fn rule_view(text: &str, ctx: &RuleCtx<'_>, _persona: &Persona) -> RuleView 
     // over "While I look that up ... until ten in the evening" cut the agent with no echo
     // defence). Not in a turn of its own: "Aisle." answers "Window or aisle?".
     let short = ctx.over_agent && !heard.is_empty() && heard.len() < 3;
-    let self_echo = (short || heard.len() >= 3)
-        && ctx
-            .recent_agent_lines
-            .iter()
-            .filter(|(ended, _)| ctx.now.saturating_sub(*ended) <= window)
-            .any(|(ended, line)| {
-                let agent: Vec<String> = word_list(line).iter().map(|w| echo_word(w)).collect();
-                if short {
-                    return ctx.now.saturating_sub(*ended) <= SHORT_ECHO_MS
-                        && agent
-                            .windows(heard.len())
-                            .any(|run| run == heard.as_slice());
-                }
-                let shared = heard.iter().filter(|word| agent.contains(word)).count();
-                shared as f64 / heard.len() as f64 >= cue_table.self_echo_threshold
-            });
+    // A turn's decision takes the duplex machine's verdict: it knows whether the agent's echo
+    // was heard near the turn, and a reply that repeats the agent's question is no echo by its
+    // words alone (spec 029 W-5: "Aisle seat, please." after "Window or aisle seat?" was dropped).
+    let self_echo = ctx.turn_echo.unwrap_or_else(|| {
+        (short || heard.len() >= 3)
+            && ctx
+                .recent_agent_lines
+                .iter()
+                .filter(|(ended, _)| ctx.now.saturating_sub(*ended) <= window)
+                .any(|(ended, line)| {
+                    let agent: Vec<String> = word_list(line).iter().map(|w| echo_word(w)).collect();
+                    if short {
+                        return ctx.now.saturating_sub(*ended) <= SHORT_ECHO_MS
+                            && agent
+                                .windows(heard.len())
+                                .any(|run| run == heard.as_slice());
+                    }
+                    let shared = heard.iter().filter(|word| agent.contains(word)).count();
+                    shared as f64 / heard.len() as f64 >= cue_table.self_echo_threshold
+                })
+    });
     RuleView {
         addressed: ctx.addressed,
         unclear: ctx.unclear,
@@ -483,6 +492,7 @@ mod tests {
             board,
             recent_agent_lines: recent,
             over_agent: false,
+            turn_echo: None,
         }
     }
 
@@ -523,6 +533,22 @@ mod tests {
         assert!(view.self_echo);
         let old = [(NOW - 6_000, line)];
         assert!(!rule_view(text, &ctx(&board, &old), &persona).self_echo);
+    }
+
+    /// Spec 029 W-5: a turn's decision takes the duplex machine's echo verdict, which knows whether
+    /// the agent's echo was heard. Words that repeat the agent's question are no echo by
+    /// themselves.
+    #[test]
+    fn a_turns_decision_takes_the_duplex_machines_echo_verdict() {
+        let board = working();
+        let persona = travel();
+        let line = "Would you like a window or an aisle seat?".to_owned();
+        let recent = [(NOW - 400, line)];
+        let mut decided = ctx(&board, &recent);
+        decided.turn_echo = Some(false);
+        assert!(!rule_view("Aisle seat, please.", &decided, &persona).self_echo);
+        decided.turn_echo = Some(true);
+        assert!(rule_view("Aisle seat, please.", &decided, &persona).self_echo);
     }
 
     /// Live S4: one or two words of the line that plays, heard back over it, are its echo;

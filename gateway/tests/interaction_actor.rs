@@ -218,10 +218,12 @@ impl Rig {
             enabled: true,
             front_model: front_url.map(|url| FrontModelServer {
                 url,
+                urls: Vec::new(),
                 model: None,
                 api_key: None,
                 command: None,
                 licence: None,
+                line_budget_ms: None,
             }),
             tool_secret: Some(TOOL_SECRET.to_owned()),
             allow_client_tools: true,
@@ -335,6 +337,7 @@ impl Rig {
             warm: true,
             plain_path: true,
             room: opts.room,
+            placement: None,
         });
         // As `handlers/ws/interaction.rs` does: the session waits for what the tasks of an
         // earlier connection of its caller came to.

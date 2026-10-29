@@ -1982,10 +1982,10 @@ impl Policy {
             (Act::Progress, None) => {
                 self.speak_front(id, Act::Social, None, decision.intent, out);
             }
-            (Act::Social | Act::Question | Act::Refuse, _) if complete => {
+            (act, _) if act.speaks_its_line() && complete => {
                 self.speak_front(id, act, decision.say, decision.intent, out);
             }
-            (Act::Social | Act::Question | Act::Refuse, _) => {
+            (act, _) if act.speaks_its_line() => {
                 if let Some(turn) = &mut self.turn {
                     turn.line_for = Some(act);
                 }
@@ -3289,9 +3289,9 @@ impl Policy {
         // to the task's agent.
         if let Some(at) = self.answering.iter().position(|asked| asked.item == item) {
             let asked = self.answering.swap_remove(at);
-            let source = format!("{} {} {}", asked.title, asked.summary, asked.text);
+            let request = format!("{} {}", asked.title, asked.text);
             let checked = line.map(|line| guard::fit_narration(&line)).filter(|line| {
-                guard::narration(line, &source) == GuardOutcome::Pass
+                guard::narration(line, &asked.summary, &request) == GuardOutcome::Pass
                     && carries_result(line, &asked.summary, &asked.text)
             });
             match checked {
@@ -3631,8 +3631,8 @@ pub fn spoken_update(
     said: &[(Ms, String)],
 ) -> Result<Say, &'static str> {
     let line = guard::fit_narration(&line.ok_or(NO_LINE)?);
-    let source = format!("{title} {summary} {caller}");
-    if let GuardOutcome::Blocked(rule) = guard::narration(&line, &source) {
+    let request = format!("{title} {caller}");
+    if let GuardOutcome::Blocked(rule) = guard::narration(&line, summary, &request) {
         return Err(rule);
     }
     // The title is the request: a line made of its words ("I checked the GitHub release")
@@ -7159,8 +7159,7 @@ mod tests {
                 "narration_sentences",
             ),
         ] {
-            let source = format!("{FLIGHT} {BOOKED}");
-            let verdict = guard::narration(line, &source);
+            let verdict = guard::narration(line, BOOKED, FLIGHT);
             let expected = if rule == "narration_length" {
                 GuardOutcome::Pass
             } else {

@@ -691,10 +691,7 @@ impl SmartTurnProcessor {
 
                 self.frames_since_inference = 0;
 
-                signals.push(TurnSignal::Audio {
-                    probability: result.probability,
-                    frames_processed: mel_frames_count,
-                });
+                signals.extend(audio_signal(&result, mel_frames_count));
 
                 if self.config.debug_logging {
                     trace!(
@@ -807,10 +804,7 @@ impl SmartTurnProcessor {
 
                 self.frames_since_inference = 0;
 
-                signals.push(TurnSignal::Audio {
-                    probability: result.probability,
-                    frames_processed: mel_frames_count,
-                });
+                signals.extend(audio_signal(&result, mel_frames_count));
             }
         }
 
@@ -903,6 +897,19 @@ impl SmartTurnProcessor {
     }
 }
 
+/// The audio signal one prediction gives the turn decision, or none when its inference timed
+/// out: no verdict, never the last probability again (spec 029 W-1).
+#[cfg(feature = "smart-turn")]
+fn audio_signal(
+    result: &super::detector::SmartTurnResult,
+    frames_processed: usize,
+) -> Option<TurnSignal> {
+    (!result.timed_out).then_some(TurnSignal::Audio {
+        probability: result.probability,
+        frames_processed,
+    })
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -910,6 +917,23 @@ impl SmartTurnProcessor {
 #[cfg(all(test, feature = "smart-turn"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timed_out_prediction_gives_no_audio_signal() {
+        let result = |timed_out| super::super::detector::SmartTurnResult {
+            probability: 0.9,
+            is_turn_complete: false,
+            inference_time_us: 60_000,
+            frames_processed: 80,
+            timed_out,
+        };
+        let signal = audio_signal(&result(false), 80);
+        assert!(
+            matches!(signal, Some(TurnSignal::Audio { probability, frames_processed: 80 }) if probability == 0.9),
+            "{signal:?}"
+        );
+        assert!(audio_signal(&result(true), 80).is_none());
+    }
 
     // =========================================================================
     // Configuration Tests
