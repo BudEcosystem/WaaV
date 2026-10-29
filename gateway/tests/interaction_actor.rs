@@ -223,6 +223,7 @@ impl Rig {
                 api_key: None,
                 command: None,
                 licence: None,
+                line_budget_ms: None,
             }),
             tool_secret: Some(TOOL_SECRET.to_owned()),
             allow_client_tools: true,

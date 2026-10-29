@@ -71,6 +71,7 @@ fn set_server_for_tests(mut server: ServerInteraction) {
             api_key: None,
             command: None,
             licence: None,
+            line_budget_ms: None,
         }
     });
     waav_gateway::core::interaction::config::set_server_for_tests(server);
@@ -736,6 +737,7 @@ async fn without_a_ready_front_the_mode_is_refused_and_the_session_runs_without_
             api_key: None,
             command: None,
             licence: None,
+            line_budget_ms: None,
         }),
         ..ServerInteraction::default()
     });
@@ -1767,6 +1769,7 @@ async fn a_speech_to_speech_session_warms_its_front_as_it_starts() {
             api_key: None,
             command: None,
             licence: None,
+            line_budget_ms: None,
         }),
         ..ServerInteraction::default()
     });

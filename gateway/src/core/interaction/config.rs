@@ -2472,6 +2472,23 @@ pub struct FrontModelServer {
     /// `lfm_open_eligible` or `liquid_commercial`: the operator may run LFM weights.
     #[serde(default)]
     pub licence: Option<String>,
+    /// How long a decision's line may take once its act is known, in milliseconds (default
+    /// [`LINE_BUDGET_MS`], at most [`MAX_LINE_BUDGET_MS`]). The act settles the turn and the
+    /// caller waits for its line: a slow server's line is late, not lost.
+    #[serde(default)]
+    pub line_budget_ms: Option<u32>,
+}
+
+/// A decision's line's time after its act, unless the operator sets another.
+pub const LINE_BUDGET_MS: u32 = 1_500;
+/// The longest an operator may give a line.
+pub const MAX_LINE_BUDGET_MS: u32 = 10_000;
+
+impl FrontModelServer {
+    /// How long a decision's line may take once its act is known.
+    pub fn line_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.line_budget_ms.unwrap_or(LINE_BUDGET_MS).into())
+    }
 }
 
 // Secrets stay out of logs.
@@ -2513,6 +2530,7 @@ impl fmt::Debug for FrontModelServer {
             .field("api_key", &self.api_key.is_some())
             .field("command", &self.command)
             .field("licence", &self.licence)
+            .field("line_budget_ms", &self.line_budget_ms)
             .finish()
     }
 }
@@ -2645,6 +2663,31 @@ impl ServerInteraction {
                 "interaction.front_model.licence must be lfm_open_eligible or liquid_commercial"
                     .to_owned(),
             );
+        }
+        if let Some(value) = get("WAAV_INTERACTION_FRONT_LINE_BUDGET_MS") {
+            match (&mut self.front_model, value.trim().parse::<u32>()) {
+                (Some(front), Ok(ms)) if ms <= MAX_LINE_BUDGET_MS => {
+                    front.line_budget_ms = Some(ms)
+                }
+                (Some(_), _) => problems.push(format!(
+                    "WAAV_INTERACTION_FRONT_LINE_BUDGET_MS must be 0 to {MAX_LINE_BUDGET_MS} \
+                     milliseconds"
+                )),
+                (None, _) => problems.push(
+                    "WAAV_INTERACTION_FRONT_LINE_BUDGET_MS is set but no front model URL is"
+                        .to_owned(),
+                ),
+            }
+        }
+        if let Some(front) = &mut self.front_model
+            && front
+                .line_budget_ms
+                .take_if(|ms| *ms > MAX_LINE_BUDGET_MS)
+                .is_some()
+        {
+            problems.push(format!(
+                "interaction.front_model.line_budget_ms must be at most {MAX_LINE_BUDGET_MS}"
+            ));
         }
         if let Some(model) = get("WAAV_INTERACTION_FRONT_MODEL") {
             match &mut self.front_model {
@@ -2868,6 +2911,7 @@ mod tests {
                 api_key: None,
                 command: None,
                 licence: None,
+                line_budget_ms: None,
             }),
             ..on()
         }
@@ -4944,6 +4988,7 @@ mod tests {
                     api_key: None,
                     command: None,
                     licence: None,
+                    line_budget_ms: None,
                 }),
                 tool_secret: Some("s3cret".to_owned()),
                 allow_client_tools: true,
@@ -5006,6 +5051,51 @@ mod tests {
         });
         let front = server.front_model.expect("a front");
         assert_eq!(front.api_key.as_deref(), Some("env-key"));
+    }
+
+    /// Once a decision's act is known, its line has the front server's own deadline (a slow CPU
+    /// front's line ran past the decision's budget and was never said): 1.5 s by default, the
+    /// operator's `line_budget_ms` from the file or `WAAV_INTERACTION_FRONT_LINE_BUDGET_MS`
+    /// (the environment's wins), at most 10 s.
+    #[test]
+    fn the_front_lines_deadline_is_the_operators() {
+        use std::time::Duration;
+        let budget =
+            |server: &ServerInteraction| server.front_model.as_ref().unwrap().line_budget();
+        let env = |value: &'static str| {
+            move |key: &str| {
+                (key == "WAAV_INTERACTION_FRONT_LINE_BUDGET_MS").then(|| value.to_owned())
+            }
+        };
+        assert_eq!(
+            FrontModelServer::default().line_budget(),
+            Duration::from_millis(1_500)
+        );
+        let yaml =
+            "interaction:\n  front_model:\n    url: http://front:8080\n    line_budget_ms: 2500\n";
+        let mut server = server_from_yaml(yaml).unwrap();
+        assert!(server.apply_lookup(|_| None).is_empty());
+        assert_eq!(budget(&server), Duration::from_millis(2_500));
+        assert!(server.apply_lookup(env("4000")).is_empty());
+        assert_eq!(budget(&server), Duration::from_millis(4_000));
+        // A value that is no number of milliseconds, or more than 10 s, is a problem and
+        // changes nothing.
+        for bad in ["soon", "10001", "-1"] {
+            let mut server = server_from_yaml(yaml).unwrap();
+            let problems = server.apply_lookup(env(bad));
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert_eq!(budget(&server), Duration::from_millis(2_500), "{bad}");
+        }
+        // Too long in the file: the default, and a problem.
+        let long =
+            "interaction:\n  front_model:\n    url: http://front:8080\n    line_budget_ms: 60000\n";
+        let mut server = server_from_yaml(long).unwrap();
+        assert_eq!(server.apply_lookup(|_| None).len(), 1);
+        assert_eq!(budget(&server), Duration::from_millis(1_500));
+        // No front, no deadline to set.
+        let mut alone = ServerInteraction::default();
+        assert_eq!(alone.apply_lookup(env("2000")).len(), 1);
+        assert!(alone.front_model.is_none());
     }
 
     #[test]
