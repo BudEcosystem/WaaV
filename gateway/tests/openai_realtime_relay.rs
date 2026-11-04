@@ -589,6 +589,8 @@ struct Setup {
     timings: Timings,
     client_secret_keys: Option<&'static str>,
     jwt_subjects: Vec<&'static str>,
+    /// Voice agents (`prompt:<name>`) KEY and the JWT subjects reach.
+    agents: Vec<&'static str>,
 }
 
 impl Default for Setup {
@@ -599,8 +601,22 @@ impl Default for Setup {
             timings: fast_timings(),
             client_secret_keys: Some("k1:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="),
             jwt_subjects: Vec::new(),
+            agents: Vec::new(),
         }
     }
+}
+
+/// A voice agent's alias entry and its `voice_agent:` projection key and blob.
+fn agent_alias(name: &str) -> (String, Json, String, String) {
+    let prompt_id = format!("pid-{name}");
+    (
+        format!("prompt:{name}"),
+        json!({"kind": "agent", "prompt_id": prompt_id, "version": 1, "project_id": PROJECT}),
+        format!("voice_agent:{prompt_id}:v1"),
+        json!({"v": 1, "prompt_id": prompt_id, "version": 1,
+               "stt": {"endpoint_id": "stt-1"}, "tts": {"endpoint_id": "tts-1", "voice": "alloy"}})
+        .to_string(),
+    )
 }
 
 struct StaticJwks;
@@ -631,9 +647,15 @@ async fn gateway(setup: Setup) -> Gateway {
         );
         Json::Object(m).to_string()
     };
+    let mut key_blob: Json = serde_json::from_str(&blob(&setup.endpoints, PROJECT)).unwrap();
+    for name in &setup.agents {
+        let (alias, entry, projection, agent) = agent_alias(name);
+        key_blob[alias.as_str()] = entry;
+        store.set(&projection, &agent);
+    }
     store.set(
         &format!("api_key:{}", bud_auth::hash_api_key(KEY)),
-        &blob(&setup.endpoints, PROJECT),
+        &key_blob.to_string(),
     );
     store.set(
         &format!("api_key:{}", bud_auth::hash_api_key(OTHER_KEY)),
@@ -652,6 +674,10 @@ async fn gateway(setup: Setup) -> Gateway {
             alias.clone(),
             json!({"endpoint_id": id, "model_id": MODEL_ID, "project_id": PROJECT}),
         );
+    }
+    for name in &setup.agents {
+        let (alias, entry, _, _) = agent_alias(name);
+        project_models.insert(alias, entry);
     }
     store.set(
         &format!("project_models:{PROJECT}"),
@@ -1739,7 +1765,7 @@ async fn tc_met_01_02_03_07_per_response_turns_and_the_session_record() {
     c.close(None).await.unwrap();
     let _ = until_close(&mut c).await;
 
-    let turns = cap.wait_for("voice.turn", 3).await;
+    let turns = cap.wait_for("voice.realtime", 3).await;
     let session = cap.wait_for("voice.session", 1).await.remove(0);
     let mut traces = std::collections::HashSet::new();
     let mut indices = Vec::new();
@@ -1846,7 +1872,7 @@ async fn tc_met_06_transcription_turn() {
         "conversation.item.input_audio_transcription.completed",
     )
     .await;
-    let t = cap.wait_for("voice.turn", 1).await.remove(0);
+    let t = cap.wait_for("voice.realtime", 1).await.remove(0);
     assert_eq!(
         text(&t, "bud.voice.rt.component").as_deref(),
         Some("input_transcription")
@@ -1868,7 +1894,7 @@ async fn tc_met_08_drop_mid_session_keeps_the_turns() {
         until_type(&mut c, "response.done").await;
     }
     drop(c);
-    let turns = cap.wait_for("voice.turn", 2).await;
+    let turns = cap.wait_for("voice.realtime", 2).await;
     assert_eq!(turns.len(), 2);
     let session = cap.wait_for("voice.session", 1).await.remove(0);
     assert_eq!(
@@ -1905,7 +1931,7 @@ async fn duration_priced_sessions_bill_segments() {
         .spans()
         .into_iter()
         .filter(|s| {
-            s.name == "voice.turn"
+            s.name == "voice.realtime"
                 && text(s, "bud.voice.rt.component").as_deref() == Some("duration_segment")
         })
         .collect();
@@ -1992,7 +2018,7 @@ async fn tc_xl_06_xai_relay_quirks() {
         Some(&*format!("Bearer {VENDOR_KEY}"))
     );
     // Two responses (and the unpriced transcription turn xAI reported without usage).
-    let turns = cap.wait_for("voice.turn", 3).await;
+    let turns = cap.wait_for("voice.realtime", 3).await;
     let responses: Vec<&SpanData> = turns
         .iter()
         .filter(|t| text(t, "bud.voice.rt.component").as_deref() == Some("response"))
@@ -2042,7 +2068,7 @@ async fn xai_priced_per_minute_bills_duration_segments() {
     let turns: Vec<SpanData> = cap
         .spans()
         .into_iter()
-        .filter(|s| s.name == "voice.turn")
+        .filter(|s| s.name == "voice.realtime")
         .collect();
     let segments: Vec<&SpanData> = turns
         .iter()
@@ -2170,7 +2196,7 @@ async fn tc_ek_01_05_mint_and_connect() {
     until_type(&mut ws, "session.created").await;
     send(&mut ws, json!({"type": "response.create"})).await;
     until_type(&mut ws, "response.done").await;
-    let t = cap.wait_for("voice.turn", 1).await.remove(0);
+    let t = cap.wait_for("voice.realtime", 1).await.remove(0);
     assert_eq!(text(&t, "bud.api_key_id").as_deref(), Some(API_KEY_ID));
     assert_eq!(text(&t, "bud.project_id").as_deref(), Some(PROJECT));
 }
@@ -2282,6 +2308,157 @@ async fn tc_ek_17_jwt_parent_revoked() {
         panic!("connected on a revoked JWT parent");
     };
     assert_eq!(s, 401);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Client secrets for a voice agent (`prompt:<name>`): the parent credential rides inside
+// ---------------------------------------------------------------------------------------------
+
+async fn agent_ek_gateway() -> (MockVendor, Gateway) {
+    let vendor = MockVendor::start(Behaviour::default()).await;
+    let gw = gateway(Setup {
+        endpoints: vec![ep(
+            "rt",
+            "a1a1a1a1-0000-4000-8000-000000000301",
+            rt_entry(&vendor, json!({})),
+        )],
+        jwt_subjects: vec!["sub-ek"],
+        agents: vec!["support", "billing"],
+        ..Default::default()
+    })
+    .await;
+    (vendor, gw)
+}
+
+fn opened(gw: &Gateway, value: &str) -> waav_gateway::auth::ephemeral::Claims {
+    gw.state
+        .realtime
+        .client_secret_keys
+        .as_ref()
+        .unwrap()
+        .open(value, now())
+        .unwrap()
+}
+
+/// An agent's secret: minted with the agent handshake's own check, its parent credential
+/// sealed inside, and it opens the agent's session.
+#[tokio::test]
+async fn an_agent_client_secret_mints_and_opens_the_agent_session() {
+    let (_v, gw) = agent_ek_gateway().await;
+    let (s, body) = mint(&gw, KEY, json!({"session": {"model": "prompt:support"}})).await;
+    assert_eq!(s, 200, "{body}");
+    let value = body["value"].as_str().unwrap().to_string();
+    assert!(value.starts_with("ek_bud_") && !value.contains(KEY));
+    assert_eq!(body["session"]["model"], "prompt:support");
+    let claims = opened(&gw, &value);
+    assert_eq!(claims.alias, "prompt:support");
+    assert_eq!(claims.cred.as_ref().map(|c| c.expose()), Some(KEY));
+    assert_eq!(claims.pid.as_deref(), Some(PROJECT));
+
+    let c = connect_with(
+        &gw,
+        "model=prompt:support",
+        Auth::Subprotocol(&value),
+        &[],
+        &[],
+    )
+    .await
+    .unwrap_or_else(|(s, b, _)| panic!("the agent session did not open: {s} {b}"));
+    let mut ws = c.ws;
+    let created = until_type(&mut ws, "session.created").await;
+    assert_eq!(created["session"]["model"], "prompt:support");
+
+    // A deployment's secret never carries a credential.
+    let (_, rt) = mint(&gw, KEY, json!({"session": {"model": "rt"}})).await;
+    assert!(opened(&gw, rt["value"].as_str().unwrap()).cred.is_none());
+}
+
+/// Every refusal of before still holds for an agent's secret.
+#[tokio::test]
+async fn an_agent_client_secret_keeps_every_refusal() {
+    let (_v, gw) = agent_ek_gateway().await;
+    // A credential that does not reach the agent cannot mint for it.
+    for model in ["prompt:support", "prompt:nobody"] {
+        let (s, body) = mint(&gw, OTHER_KEY, json!({"session": {"model": model}})).await;
+        assert_eq!(s, 403, "{model}: {body}");
+        assert_eq!(body["error"]["code"], "model_not_allowed");
+    }
+    let (s, body) = mint(&gw, KEY, json!({"session": {"model": "prompt:nobody"}})).await;
+    assert_eq!(
+        (s, body["error"]["code"].clone()),
+        (403, json!("model_not_allowed"))
+    );
+
+    let (_, ok) = mint(&gw, KEY, json!({"session": {"model": "prompt:support"}})).await;
+    let secret = ok["value"].as_str().unwrap().to_string();
+    // The sealed model must be the one asked for: not another agent, not a deployment.
+    for query in ["model=prompt:billing", "model=rt"] {
+        let Err((s, body, _)) =
+            connect_with(&gw, query, Auth::Subprotocol(&secret), &[], &[]).await
+        else {
+            panic!("{query}: an agent's secret opened something else");
+        };
+        assert_eq!(s, 403, "{query}: {body}");
+        assert_eq!(body["error"]["code"], "model_mismatch", "{query}");
+    }
+    // A deployment's secret does not open an agent.
+    let (_, rt) = mint(&gw, KEY, json!({"session": {"model": "rt"}})).await;
+    let Err((s, body, _)) = connect_with(
+        &gw,
+        "model=prompt:support",
+        Auth::Subprotocol(rt["value"].as_str().unwrap()),
+        &[],
+        &[],
+    )
+    .await
+    else {
+        panic!("a deployment's secret opened an agent");
+    };
+    assert_eq!(
+        (s, body["error"]["code"].clone()),
+        (403, json!("model_mismatch"))
+    );
+
+    // The parent revoked: the secret no longer connects.
+    let key = format!("api_key:{}", bud_auth::hash_api_key(KEY));
+    gw.store.remove(&key);
+    gw.plane
+        .on_key_event(&key, bud_auth::KeyEvent::Del)
+        .await
+        .unwrap();
+    let Err((s, _, _)) = connect_with(
+        &gw,
+        "model=prompt:support",
+        Auth::Subprotocol(&secret),
+        &[],
+        &[],
+    )
+    .await
+    else {
+        panic!("an agent's secret of a revoked parent connected");
+    };
+    assert_eq!(s, 401);
+}
+
+/// A JWT parent: sealed too, and its expiry still caps the secret's.
+#[tokio::test]
+async fn an_agent_client_secret_of_a_jwt_is_capped_by_the_token() {
+    let (_v, gw) = agent_ek_gateway().await;
+    let token = jwt("sub-ek", 120);
+    let (s, body) = mint(
+        &gw,
+        &token,
+        json!({"expires_after": {"anchor": "created_at", "seconds": 600}, "session": {"model": "prompt:support"}}),
+    )
+    .await;
+    assert_eq!(s, 200, "{body}");
+    let exp = body["expires_at"].as_u64().unwrap();
+    assert!(exp <= now() + 121, "capped at the JWT's exp: {exp}");
+    let claims = opened(&gw, body["value"].as_str().unwrap());
+    assert_eq!(
+        claims.cred.as_ref().map(|c| c.expose()),
+        Some(token.as_str())
+    );
 }
 
 /// No keys configured: the mint route answers 501.

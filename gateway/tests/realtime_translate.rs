@@ -815,7 +815,7 @@ async fn tc_xl_03_gemini_usage_is_the_response_usage_and_a_priced_turn() {
     }
     close_and_drain(&mut c).await;
 
-    let turns = cap.wait_for("voice.turn", 2).await;
+    let turns = cap.wait_for("voice.realtime", 2).await;
     assert_eq!(turns.len(), 2, "one billed record per response, never two");
     let session = cap.wait_for("voice.session", 1).await.remove(0);
     // (100 − 40)·0.5 + 40·0.05 + 50·3 + 10·2 + 50·12 = 30 + 2 + 150 + 20 + 600 = 802 per 10⁶.
@@ -1229,7 +1229,7 @@ async fn tc_xl_05_nova_sonic_cap_reconnect_and_usage_metered_once() {
     let turns: Vec<SpanData> = cap
         .spans()
         .into_iter()
-        .filter(|s| s.name == "voice.turn")
+        .filter(|s| s.name == "voice.realtime")
         .collect();
     assert_eq!(
         turns.len(),
@@ -1375,7 +1375,7 @@ async fn tc_xl_07_an_unpriced_per_minute_vendor_still_meters_its_time() {
     let segments: Vec<SpanData> = cap
         .spans()
         .into_iter()
-        .filter(|s| s.name == "voice.turn" && text(s, "bud.endpoint_id").as_deref() == Some(id))
+        .filter(|s| s.name == "voice.realtime" && text(s, "bud.endpoint_id").as_deref() == Some(id))
         .collect();
     assert!(
         segments.len() >= 2,
@@ -1465,7 +1465,8 @@ async fn tc_xl_07_per_minute_vendors_bill_duration_segments() {
             .spans()
             .into_iter()
             .filter(|s| {
-                s.name == "voice.turn" && text(s, "bud.endpoint_id").as_deref() == Some(id.as_str())
+                s.name == "voice.realtime"
+                    && text(s, "bud.endpoint_id").as_deref() == Some(id.as_str())
             })
             .collect();
         assert!(!segments.is_empty(), "{vendor}: no segment");

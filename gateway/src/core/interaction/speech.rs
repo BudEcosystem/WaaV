@@ -9,14 +9,16 @@ use tracing::{debug, warn};
 use crate::core::audio::PumpControl;
 use crate::core::voice_manager::VoiceManager;
 
-use super::types::{PumpEvent, SpeechCmd};
+use super::types::{LineSources, PumpEvent, SpeechCmd};
 
 /// Spawn the worker; it ends when every sender is dropped. `events` is the pump's event channel:
-/// a speak the VoiceManager refuses is reported there as `PumpEvent::Failed`.
+/// a speak the VoiceManager refuses is reported there as `PumpEvent::Failed`. `lines` names the
+/// line being synthesised for the session's TTS meter (spec 029 R-6).
 pub fn spawn(
     vm: Arc<VoiceManager>,
     ctl: Arc<PumpControl>,
     events: UnboundedSender<PumpEvent>,
+    lines: Arc<LineSources>,
 ) -> UnboundedSender<SpeechCmd> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -24,7 +26,12 @@ pub fn spawn(
             // How long each command holds the worker: a line waits behind the ones before it.
             let (began, what) = (std::time::Instant::now(), speech_cmd_name(&cmd));
             match cmd {
-                SpeechCmd::Speak { utt, text, discard } => {
+                SpeechCmd::Speak {
+                    utt,
+                    text,
+                    discard,
+                    source,
+                } => {
                     ctl.expect(utt, discard);
                     // Read after any earlier clear returned, so only a clear that races this
                     // very speak can refuse it.
@@ -40,7 +47,12 @@ pub fn spawn(
                         if vm.tts_cached(&text).await {
                             ctl.note_cached(utt);
                         }
-                        vm.speak_if_epoch(&text, true, true, epoch).await
+                        // The session's TTS meter is told of the synthesis within this speak, so
+                        // its record is tagged with whose words the line is.
+                        lines.speaking(&text, source);
+                        let spoken = vm.speak_if_epoch(&text, true, true, epoch).await;
+                        lines.done();
+                        spoken
                     };
                     if !matches!(spoken, Ok(true)) {
                         if let Err(error) = spoken {
@@ -107,7 +119,7 @@ fn speech_cmd_name(cmd: &SpeechCmd) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::interaction::types::UttId;
+    use crate::core::interaction::types::{LineSource, UttId};
     use crate::core::stt::STTConfig;
     use crate::core::tts::{AudioCallback, AudioData, BaseTTS, TTSConfig, TTSResult};
     use crate::core::voice_manager::VoiceManagerConfig;
@@ -191,6 +203,7 @@ mod tests {
         events: UnboundedReceiver<PumpEvent>,
         /// The first sample of every frame that reached the egress callback.
         played: Arc<Mutex<Vec<u8>>>,
+        lines: Arc<LineSources>,
     }
 
     /// A VoiceManager on the mock TTS with the metered pump, wired as `handlers/ws/interaction.rs`
@@ -238,22 +251,29 @@ mod tests {
         .await
         .expect("completion callback");
 
-        let speech = spawn(vm.clone(), ctl.clone(), tx);
+        let lines = Arc::new(LineSources::default());
+        let speech = spawn(vm.clone(), ctl.clone(), tx, lines.clone());
         Rig {
             vm,
             ctl,
             speech,
             events,
             played,
+            lines,
         }
     }
 
     impl Rig {
         fn speak(&self, utt: u64, text: &str) {
+            self.say(utt, text, false, LineSource::Front);
+        }
+
+        fn say(&self, utt: u64, text: &str, discard: bool, source: LineSource) {
             let cmd = SpeechCmd::Speak {
                 utt: UttId(utt),
                 text: text.to_string(),
-                discard: false,
+                discard,
+                source,
             };
             self.speech.send(cmd).expect("worker alive");
         }
@@ -265,6 +285,34 @@ mod tests {
 
     async fn after(ms: u64) {
         tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    /// Spec 029 R-6: the session's TTS meter, told of each synthesis within the speak, learns
+    /// whose words the line is; a warm-up line is never billed, so the meter never hears of it.
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn the_meter_learns_whose_words_each_synthesised_line_is() {
+        let rig = rig().await;
+        let billed = Arc::new(Mutex::new(Vec::new()));
+        let (sink, lines) = (billed.clone(), rig.lines.clone());
+        rig.vm.set_speak_observer(Arc::new(move |text: &str| {
+            let source = lines.source_of(text).map(LineSource::as_str);
+            sink.lock().unwrap().push((text.to_owned(), source));
+            None
+        }));
+        rig.say(1, "One moment.", false, LineSource::Front);
+        rig.say(2, "warm words", true, LineSource::Front);
+        rig.say(3, "It shipped on Monday.", false, LineSource::Agent);
+        after(2_000).await;
+        assert_eq!(
+            *billed.lock().unwrap(),
+            [
+                ("One moment.".to_owned(), Some("front")),
+                ("It shipped on Monday.".to_owned(), Some("agent")),
+            ]
+        );
+        // Between lines nothing is being spoken: another synthesis is nobody's line.
+        assert_eq!(rig.lines.source_of("It shipped on Monday."), None);
     }
 
     #[tokio::test(start_paused = true)]

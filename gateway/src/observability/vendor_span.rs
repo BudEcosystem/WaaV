@@ -395,6 +395,12 @@ impl VendorCall {
         self.fail(class, &message);
     }
 
+    /// Mark a call that stays open failed: a streaming connection the vendor errored on, which is
+    /// still ended by [`VendorCall::finish`] when it closes.
+    pub fn failed(&self, error_type: &str, message: &str) {
+        self.mark_failed(error_type, message);
+    }
+
     /// End the call failed, with `error_type` and `message`.
     pub fn fail(mut self, error_type: &str, message: &str) {
         self.mark_failed(error_type, message);

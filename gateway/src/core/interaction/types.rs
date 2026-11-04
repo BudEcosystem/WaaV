@@ -282,6 +282,58 @@ pub struct Utterance {
     pub last: bool,
 }
 
+/// Whose words a synthesised line is (spec 029 R-6): the background's answer, relayed
+/// verbatim, or a line the gateway made itself (the front's, a template, a progress or failure
+/// line, a repeat). Recorded on the line's TTS record as `bud.voice.tts.line_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineSource {
+    Agent,
+    Front,
+}
+
+impl LineSource {
+    /// A relayed answer sentence is the agent's; every other line is the front's.
+    pub fn of(utterance: &Utterance) -> Self {
+        match (&utterance.kind, &utterance.say) {
+            (Kind::Relay, Say::Verbatim(_)) => Self::Agent,
+            _ => Self::Front,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Front => "front",
+        }
+    }
+}
+
+/// The line an interaction session's speech worker is synthesising, for the session's TTS
+/// meter: the worker names it right before the VoiceManager's speak and clears it after, and
+/// the meter, told of the synthesis within that speak, tags its record with the line's source.
+/// Keyed by the text, so a synthesis of other words (a client's own `speak` racing the line)
+/// is never tagged with this line's source.
+#[derive(Debug, Default)]
+pub struct LineSources(parking_lot::Mutex<Option<(String, LineSource)>>);
+
+impl LineSources {
+    pub fn speaking(&self, text: &str, source: LineSource) {
+        *self.0.lock() = Some((text.to_owned(), source));
+    }
+
+    pub fn done(&self) {
+        *self.0.lock() = None;
+    }
+
+    /// The source of a synthesis of `text`: the line being spoken when the words are its own.
+    pub fn source_of(&self, text: &str) -> Option<LineSource> {
+        let line = self.0.lock();
+        line.as_ref()
+            .filter(|(spoken, _)| spoken == text)
+            .map(|(_, source)| *source)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CutCause {
     Interrupt,
@@ -381,6 +433,8 @@ pub enum SpeechCmd {
         utt: UttId,
         text: String,
         discard: bool,
+        /// Whose words the line is, for its TTS record (spec 029 R-6).
+        source: LineSource,
     },
     /// Synthesise `text` into the pump's clip bank.
     Clip {
@@ -800,6 +854,9 @@ pub enum TaskEventKind {
     },
 }
 
+/// The summary of a task the session ended before it started.
+pub const NOT_STARTED: &str = "not started: the session ended while it waited for a place";
+
 /// How a task ended: kept in the task store with its view, pushed when the caller is gone, and
 /// handed to the session the caller reconnects with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -826,6 +883,10 @@ impl Outcome {
         let (summary, effects) = match &event.kind {
             TaskEventKind::Completed { text, effects } => (text.clone(), effects.clone()),
             TaskEventKind::Failed { error, effects } => (error.clone(), effects.clone()),
+            // A task the session ended before it had a place says so (`tasks::NOT_STARTED_BY`).
+            TaskEventKind::Cancelled { by, effects } if *by == super::tasks::NOT_STARTED_BY => {
+                (NOT_STARTED.to_owned(), effects.clone())
+            }
             TaskEventKind::Cancelled { effects, .. } => (String::new(), effects.clone()),
             TaskEventKind::Rejected { reason } => (reason.clone(), Effects::NoneCommitted),
             _ => return None,
@@ -875,7 +936,11 @@ impl Outcome {
                 answer.into_iter().chain([event(completed)]).collect()
             }
             TaskState::Cancelled => vec![event(TaskEventKind::Cancelled {
-                by: "system",
+                by: if summary == NOT_STARTED {
+                    super::tasks::NOT_STARTED_BY
+                } else {
+                    "system"
+                },
                 effects,
             })],
             _ => vec![event(TaskEventKind::Failed {
@@ -889,6 +954,25 @@ impl Outcome {
 /// How the error of a run begins when its backend held it for a person's approval (the Bud
 /// gateway's `approval_required`): the caller is told that, not that it failed.
 pub const APPROVAL_REQUIRED: &str = "approval_required";
+
+/// A tool a background run's backend ran itself (a Bud agent's budprompt tools), as the
+/// client is told of it (`tool_started`, `tool_done`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolCall {
+    Started {
+        item_id: String,
+        name: String,
+    },
+    /// `duration_ms`: from its start item to its done item (`None` when no start item came);
+    /// `error`: what the item said went wrong.
+    Done {
+        item_id: String,
+        name: String,
+        duration_ms: Option<u64>,
+        ok: bool,
+        error: Option<String>,
+    },
+}
 
 /// What a background run reports to the registry.
 #[derive(Debug)]
@@ -1269,5 +1353,65 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(&effects).unwrap(), wire);
         }
+    }
+
+    fn line(kind: Kind, say: Say) -> Utterance {
+        Utterance {
+            item: ItemId(1),
+            lane: Lane::Main,
+            kind,
+            rank: 4,
+            say,
+            discard: false,
+            task: None,
+            reply_to: None,
+            question: None,
+            expires_at: None,
+            sentence: None,
+            last: false,
+        }
+    }
+
+    /// Spec 029 R-6: only words of the background's answer, relayed, are the agent's.
+    #[test]
+    fn a_relayed_answer_sentence_is_the_agents_and_every_other_line_the_fronts() {
+        let answer = line(Kind::Relay, Say::Verbatim("It shipped.".to_owned()));
+        assert_eq!(LineSource::of(&answer), LineSource::Agent);
+        for front in [
+            line(Kind::Ack, Say::Front("On it.".to_owned())),
+            line(Kind::Answer, Say::Front("Hello!".to_owned())),
+            line(Kind::Progress, Say::Verbatim("Comparing fares.".to_owned())),
+            line(Kind::Client, Say::Verbatim("A client's line.".to_owned())),
+            line(
+                Kind::Notice,
+                Say::Template {
+                    id: "t",
+                    slots: Vec::new(),
+                },
+            ),
+            line(Kind::Relay, Say::Repeat),
+            line(
+                Kind::Hold,
+                Say::Bank {
+                    group: "hold",
+                    intent: None,
+                },
+            ),
+        ] {
+            assert_eq!(LineSource::of(&front), LineSource::Front, "{front:?}");
+        }
+        assert_eq!(LineSource::Agent.as_str(), "agent");
+        assert_eq!(LineSource::Front.as_str(), "front");
+    }
+
+    #[test]
+    fn a_line_source_is_given_only_to_the_words_of_the_line_being_spoken() {
+        let lines = LineSources::default();
+        assert_eq!(lines.source_of("It shipped."), None);
+        lines.speaking("It shipped.", LineSource::Agent);
+        assert_eq!(lines.source_of("It shipped."), Some(LineSource::Agent));
+        assert_eq!(lines.source_of("A client's own words."), None);
+        lines.done();
+        assert_eq!(lines.source_of("It shipped."), None);
     }
 }

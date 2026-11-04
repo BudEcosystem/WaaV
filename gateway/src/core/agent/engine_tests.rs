@@ -176,7 +176,13 @@ impl TurnBackend for FakeBackend {
         });
         Ok(Box::pin(s))
     }
-    async fn cancel(&self, response_id: &str, _prompt_name: &str, _bearer: &str) {
+    async fn cancel(
+        &self,
+        response_id: &str,
+        _prompt_name: &str,
+        _bearer: &str,
+        _traceparent: Option<&str>,
+    ) {
         self.cancels.lock().push(response_id.to_string());
     }
 }
@@ -218,6 +224,7 @@ fn harness(
             conversation_id: "conv_voice_s1".into(),
             variables,
             text_only,
+            session_link: None,
         },
         Arc::clone(&backend) as Arc<dyn TurnBackend>,
         Arc::clone(&speech) as Arc<dyn SpeechOut>,
@@ -794,6 +801,7 @@ async fn a_slow_tool_gets_its_status_phrase() {
             item_id: "mcp_1".into(),
             name: "lookup_order".into(),
             ok: true,
+            error: None,
         }),
         delta("Found it."),
         completed(),
@@ -859,6 +867,7 @@ fn tool_run(run: Duration) -> Vec<Step> {
             item_id: "mcp_1".into(),
             name: "lookup_order".into(),
             ok: true,
+            error: None,
         }),
         delta("Found it."),
         completed(),
@@ -926,6 +935,7 @@ async fn the_tone_covers_the_agent_thinking_after_a_quick_tool() {
             item_id: "mcp_1".into(),
             name: "lookup_order".into(),
             ok: true,
+            error: None,
         }),
         Step::Wait(Duration::from_millis(6_000)),
         delta("Found it."),
@@ -965,6 +975,7 @@ async fn a_second_tool_in_the_span_gets_the_tone_not_a_phrase() {
                 item_id: id.into(),
                 name: "lookup_order".into(),
                 ok: true,
+                error: None,
             }),
         ]
     };
@@ -999,6 +1010,7 @@ async fn the_tone_ends_when_the_agent_speaks_again() {
             item_id: "mcp_1".into(),
             name: "lookup_order".into(),
             ok: true,
+            error: None,
         }),
         Step::Wait(Duration::from_millis(4_000)),
         delta("I found your order. "),
@@ -1219,6 +1231,7 @@ async fn the_follow_up_gap_runs_from_when_the_tool_phrase_was_due() {
             item_id: "mcp_1".into(),
             name: "lookup_order".into(),
             ok: true,
+            error: None,
         }),
         delta("Found it."),
         completed(),
@@ -1249,6 +1262,7 @@ async fn a_lead_in_before_a_tool_is_spoken_before_the_tool_runs() {
             item_id: "mcp_1".into(),
             name: "lookup_order".into(),
             ok: true,
+            error: None,
         }),
         delta("Found it."),
         completed(),
@@ -1285,6 +1299,7 @@ async fn a_tool_phrase_takes_its_place_in_the_list() {
             item_id: "mcp_1".into(),
             name: "lookup_order".into(),
             ok: true,
+            error: None,
         }),
         delta("Found it."),
         completed(),
@@ -1627,4 +1642,206 @@ async fn a_function_call_of_the_agents_own_is_still_its_tool() {
     let requests = plain.backend.requests.lock();
     assert_eq!(requests[0].extras, ClientExtras::default());
     assert_eq!(requests[0].body()["input"], "hello");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tool and turn timings; the conversation before the session
+// ---------------------------------------------------------------------------------------------
+
+fn metrics_of(signals: &[AgentSignal]) -> Option<TurnMetrics> {
+    signals
+        .iter()
+        .find_map(|s| match s {
+            AgentSignal::ResponseDone { metrics, .. } => Some(metrics.clone()),
+            _ => None,
+        })
+        .expect("a ResponseDone")
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_finished_tool_reports_how_long_it_ran_and_why_it_failed() {
+    let mut h = harness(entry(json!({})), None, true);
+    h.backend.push(Ok(vec![
+        created("resp_1"),
+        Step::Ev(AgentEvent::ToolStarted {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            kind: "mcp_call".into(),
+        }),
+        Step::Wait(Duration::from_millis(1_250)),
+        Step::Ev(AgentEvent::ToolFinished {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            ok: false,
+            error: Some("upstream 503".into()),
+        }),
+        delta("I could not look it up."),
+        completed(),
+    ]));
+    h.engine.start_turn("order?".into()).await;
+    let signals = until_done(&mut h, 0).await;
+    let tools: Vec<_> = signals
+        .iter()
+        .filter_map(|s| match s {
+            AgentSignal::Tool {
+                status,
+                duration_ms,
+                error,
+                ..
+            } => Some((*status, *duration_ms, error.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tools,
+        vec![
+            ("in_progress", None, None),
+            ("failed", Some(1_250), Some("upstream 503".to_string())),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_reports_its_timings_from_the_request_start() {
+    let mut h = harness(entry(json!({})), None, false);
+    h.backend.push(Ok(vec![
+        created("resp_1"),
+        Step::Wait(Duration::from_millis(400)),
+        delta("Let me check."),
+        Step::Ev(AgentEvent::ToolStarted {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            kind: "mcp_call".into(),
+        }),
+        Step::Wait(Duration::from_millis(2_000)),
+        Step::Ev(AgentEvent::ToolFinished {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            ok: true,
+            error: None,
+        }),
+        delta("It shipped."),
+        completed(),
+    ]));
+    h.engine.start_turn("order?".into()).await;
+    let signals = until_done(&mut h, 0).await;
+    let m = metrics_of(&signals).expect("an agent turn has metrics");
+    assert_eq!(m.ttft_ms, Some(400));
+    // "Let me check." went to speech when the tool started.
+    assert_eq!(m.ttfa_ms, Some(400));
+    assert!(m.total_ms >= 2_400, "{m:?}");
+    assert_eq!(
+        m.tools,
+        vec![ToolMetric {
+            name: "lookup_order".into(),
+            duration_ms: 2_000,
+            ok: true
+        }]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cut_turn_still_reports_what_it_measured() {
+    let mut h = harness(entry(json!({})), None, false);
+    h.backend.push(Ok(vec![
+        created("resp_1"),
+        Step::Wait(Duration::from_millis(300)),
+        delta("Your order shipped on Monday, "),
+        Step::Wait(Duration::from_secs(5)),
+        delta("and it will arrive Friday."),
+        completed(),
+    ]));
+    h.engine.start_turn("where is my order".into()).await;
+    loop {
+        if !h.speech.spoken().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    h.engine.barge_in().await;
+    let signals = until_done(&mut h, 0).await;
+    assert_eq!(done_of(&signals).0, TurnStatus::Cancelled);
+    let m = metrics_of(&signals).expect("a cut agent turn has metrics");
+    assert_eq!(m.ttft_ms, Some(300));
+    assert_eq!(m.ttfa_ms, Some(300));
+    assert!(m.tools.is_empty());
+
+    // A turn cut before its first token measured none: nothing is made up.
+    h.backend.push(Ok(vec![
+        created("resp_2"),
+        Step::Wait(Duration::from_secs(5)),
+        delta("Late."),
+        completed(),
+    ]));
+    h.engine.start_turn("hello?".into()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    h.engine.barge_in().await;
+    let signals = until_done(&mut h, 1).await;
+    let m = metrics_of(&signals).expect("metrics");
+    assert_eq!((m.ttft_ms, m.ttfa_ms), (None, None));
+    assert!(m.total_ms >= 500, "{m:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_greeting_has_no_turn_metrics() {
+    let mut h = harness(
+        entry(json!({"greeting": {"mode": "static", "text": "Hi there.", "interruptible": false}})),
+        None,
+        false,
+    );
+    h.engine.greet().await;
+    let signals = until_done(&mut h, 0).await;
+    assert_eq!(metrics_of(&signals), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_context_goes_ahead_of_the_first_run_only() {
+    let mut h = harness(entry(json!({})), None, true);
+    let context = vec![
+        json!({"type": "message", "role": "user", "content": "My order is 4417."}),
+        json!({"type": "message", "role": "assistant", "content": "Thanks, noted."}),
+    ];
+    assert_eq!(h.engine.set_context(context.clone()), Ok(()));
+    h.backend
+        .push(Ok(vec![created("resp_1"), delta("Yes."), completed()]));
+    h.engine.start_turn("did it ship".into()).await;
+    until_done(&mut h, 0).await;
+    h.backend
+        .push(Ok(vec![created("resp_2"), delta("Friday."), completed()]));
+    h.engine.start_turn("when".into()).await;
+    until_done(&mut h, 1).await;
+    {
+        let requests = h.backend.requests.lock();
+        let mut want = context.clone();
+        want.push(json!({"role": "user", "content": "did it ship"}));
+        assert_eq!(requests[0].body()["input"], Value::Array(want));
+        // The second run continues the conversation: the context is in it already.
+        assert_eq!(requests[1].body()["input"], "when");
+    }
+    // Too late once a turn ran.
+    assert!(h.engine.set_context(context).is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_context_waits_for_a_run_that_reaches_the_agent() {
+    let mut h = harness(entry(json!({})), None, true);
+    let context = vec![json!({"type": "message", "role": "user", "content": "Earlier words."})];
+    h.engine.set_context(context.clone()).unwrap();
+    // The first request never reaches budprompt.
+    h.backend.push(Err(TurnFailure::BadRequest(
+        "the agent is unavailable".into(),
+    )));
+    h.engine.start_turn("hello".into()).await;
+    until_done(&mut h, 0).await;
+    h.backend
+        .push(Ok(vec![created("resp_2"), delta("Hi."), completed()]));
+    h.engine.start_turn("hello again".into()).await;
+    until_done(&mut h, 1).await;
+    let requests = h.backend.requests.lock();
+    let last = requests.last().unwrap().body();
+    assert_eq!(last["input"][0], context[0]);
+    assert_eq!(
+        last["input"][1],
+        json!({"role": "user", "content": "hello again"})
+    );
 }

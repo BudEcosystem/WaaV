@@ -622,13 +622,18 @@ pub enum OutgoingMessage {
     /// Voice-agent and conversation sessions; their concatenation is what the caller heard.
     #[serde(rename = "assistant_transcript")]
     AssistantTranscript { turn_index: u64, delta: String },
-    /// Voice agent: a server-side tool's progress (`in_progress`, `completed`, `failed`).
+    /// Voice agent: a server-side tool's progress (`in_progress`, `completed`, `failed`). A
+    /// finished tool also says how long it ran and, when it failed and said why, the error.
     #[serde(rename = "agent_tool")]
     AgentTool {
         turn_index: u64,
         item_id: String,
         name: String,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Voice agent: a call to a function the session declared, for the client to run. Only
     /// `/v1/realtime` lets a session declare one.
@@ -664,6 +669,10 @@ pub enum OutgoingMessage {
         usage: Option<serde_json::Value>,
         /// What the caller heard (or was shown).
         transcript: String,
+        /// A voice agent turn's timings (`ttft_ms`, `ttfa_ms`, `total_ms`, `tools`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+        metrics: Option<serde_json::Value>,
     },
     /// The reply was cut off by the caller; `spoken` is what had been sent to speech and
     /// `audio_end_ms` the reply's audio delivered by then. Voice-agent and conversation sessions.

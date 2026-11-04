@@ -787,6 +787,12 @@ pub trait BaseSTT: Send + Sync {
     /// providers with an owned config override to persist it.
     fn set_config_only(&mut self, _config: STTConfig) {}
 
+    /// The URL the provider opens its streaming connection to, as it would send it now: what a
+    /// trace shows as the request to the vendor. `None` when the provider does not say.
+    fn vendor_url(&self) -> Option<String> {
+        None
+    }
+
     /// Get provider-specific information
     fn get_provider_info(&self) -> &'static str;
 

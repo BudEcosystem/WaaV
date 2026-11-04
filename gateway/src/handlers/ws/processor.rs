@@ -540,15 +540,38 @@ async fn refresh_bud_credential(
     message_tx: &mpsc::Sender<MessageRoute>,
     app_state: &Arc<AppState>,
 ) -> bool {
-    let bearer = crate::handlers::openai_realtime::handshake::Credential::new(
-        token.clone(),
-        crate::handlers::openai_realtime::handshake::CredentialSource::Bearer,
-    );
-    let caller =
-        match crate::handlers::openai_realtime::session::authenticate(app_state, &bearer).await {
-            Ok(caller) => caller,
+    // A voice agent's `ek_bud_` secret renews with the parent credential sealed in it, and only
+    // a secret minted for this session's agent may.
+    let (token, opened) = if token.starts_with(crate::auth::ephemeral::TOKEN_PREFIX) {
+        let model = state.read().await.agent_model.clone();
+        let Some(model) = model else {
+            send_error(
+                message_tx,
+                "auth_refresh_refused: a client secret renews only a voice agent session it was \
+                 minted for.",
+            )
+            .await;
+            return true;
+        };
+        match crate::handlers::openai_realtime::session::open_agent_client_secret(
+            app_state, &token, &model,
+        )
+        .await
+        {
+            Ok((caller, parent)) => (parent, Some(caller)),
+            Err(e) if e.code == "model_mismatch" => {
+                send_error(
+                    message_tx,
+                    format!(
+                        "auth_refresh_refused: this client secret was minted for another model \
+                         than this session's ({model}). The session keeps its current credential."
+                    ),
+                )
+                .await;
+                return true;
+            }
             Err(e) => {
-                warn!(code = e.code, "Bud-mode /ws credential refresh refused");
+                warn!(code = e.code, "Bud-mode client secret refresh refused");
                 send_error(
                     message_tx,
                     format!(
@@ -559,7 +582,33 @@ async fn refresh_bud_credential(
                 .await;
                 return true;
             }
-        };
+        }
+    } else {
+        (token, None)
+    };
+    let bearer = crate::handlers::openai_realtime::handshake::Credential::new(
+        token.clone(),
+        crate::handlers::openai_realtime::handshake::CredentialSource::Bearer,
+    );
+    let authenticated = match opened {
+        Some(caller) => Ok(caller),
+        None => crate::handlers::openai_realtime::session::authenticate(app_state, &bearer).await,
+    };
+    let caller = match authenticated {
+        Ok(caller) => caller,
+        Err(e) => {
+            warn!(code = e.code, "Bud-mode /ws credential refresh refused");
+            send_error(
+                message_tx,
+                format!(
+                    "auth_refresh_failed: {}. The session keeps its current credential.",
+                    e.message
+                ),
+            )
+            .await;
+            return true;
+        }
+    };
     let guard = state.read().await;
     let same = guard.caller_check.as_ref() == Some(&caller.check);
     let Some(credential) = guard.credential.clone().filter(|_| same) else {
@@ -901,6 +950,119 @@ mod ws_auth_path_tests {
         let error = first_error(&mut rx).expect("an error frame");
         assert!(error.starts_with("auth_refresh_failed"), "{error}");
         assert_eq!(credential.current(), KEY);
+    }
+
+    /// A voice agent session's state as the realtime handshake leaves it, on a gateway that
+    /// seals client secrets.
+    async fn agent_session() -> (Arc<AppState>, Arc<RwLock<ConnectionState>>) {
+        let mut app_state = refresh_plane().await;
+        Arc::get_mut(&mut app_state).expect("unshared").realtime =
+            Arc::new(crate::handlers::openai_realtime::RealtimeRuntime {
+                client_secret_keys: Some(
+                    crate::auth::ephemeral::ClientSecretKeys::parse(
+                        "k1:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+                    )
+                    .unwrap(),
+                ),
+                ..Default::default()
+            });
+        let state = authenticated(&app_state).await;
+        state.write().await.agent_model = Some("prompt:support".into());
+        (app_state, state)
+    }
+
+    /// An agent's secret as the mint seals it, for `parent` and `model`.
+    fn agent_secret(app_state: &AppState, parent: &str, model: &str, exp: u64) -> String {
+        use crate::auth::ephemeral::{Claims, Parent, SealedCredential};
+        let claims = Claims {
+            v: 1,
+            iat: crate::auth::ephemeral::now_epoch(),
+            exp,
+            ep: model.into(),
+            alias: model.into(),
+            parent: Parent::ApiKey {
+                h: bud_auth::hash_api_key(parent),
+                ck: false,
+            },
+            pid: Some("p1".into()),
+            uid: None,
+            akid: None,
+            cred: Some(SealedCredential::new(parent)),
+        };
+        app_state
+            .realtime
+            .client_secret_keys
+            .as_ref()
+            .unwrap()
+            .seal(&claims)
+            .unwrap()
+    }
+
+    /// A voice agent's call outlives its client secret: a fresh one for the same agent and
+    /// the same parent renews the session's credential with the parent it seals.
+    #[tokio::test]
+    async fn an_agent_session_refreshes_with_a_fresh_client_secret() {
+        let (app_state, state) = agent_session().await;
+        let credential = state.read().await.credential.clone().unwrap();
+        credential.replace("stale".to_string());
+        let (tx, mut rx) = mpsc::channel(8);
+        let exp = crate::auth::ephemeral::now_epoch() + 600;
+        let fresh = agent_secret(&app_state, KEY, "prompt:support", exp);
+        assert!(handle_auth_message(fresh, &state, &tx, &app_state).await);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(MessageRoute::Outgoing(
+                OutgoingMessage::Authenticated { .. }
+            ))
+        ));
+        assert_eq!(
+            credential.current(),
+            KEY,
+            "the sealed parent, not the secret"
+        );
+    }
+
+    /// A secret for another agent, of another parent, expired, or not one at all: refused,
+    /// and the session keeps its credential.
+    #[tokio::test]
+    async fn an_agent_session_refuses_a_client_secret_that_is_not_its_own() {
+        let (app_state, state) = agent_session().await;
+        let credential = state.read().await.credential.clone().unwrap();
+        let now = crate::auth::ephemeral::now_epoch();
+        for (token, want) in [
+            (
+                agent_secret(&app_state, KEY, "prompt:billing", now + 600),
+                "auth_refresh_refused",
+            ),
+            (
+                agent_secret(&app_state, OTHER_KEY, "prompt:support", now + 600),
+                "auth_refresh_refused",
+            ),
+            (
+                agent_secret(&app_state, KEY, "prompt:support", now - 5),
+                "auth_refresh_failed",
+            ),
+            (
+                "ek_bud_k1.bm90LWEtc2VjcmV0".to_string(),
+                "auth_refresh_failed",
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            assert!(handle_auth_message(token, &state, &tx, &app_state).await);
+            let error = first_error(&mut rx).expect("an error frame");
+            assert!(error.starts_with(want), "{want}: {error}");
+            assert_eq!(credential.current(), KEY, "unchanged");
+        }
+        // A session that is not an agent's takes no client secret.
+        state.write().await.agent_model = None;
+        let (tx, mut rx) = mpsc::channel(8);
+        let fresh = agent_secret(&app_state, KEY, "prompt:support", now + 600);
+        assert!(handle_auth_message(fresh, &state, &tx, &app_state).await);
+        assert!(
+            first_error(&mut rx)
+                .unwrap()
+                .starts_with("auth_refresh_refused")
+        );
     }
 
     /// First-message auth in Bud mode keeps the credential and fixes the identity.

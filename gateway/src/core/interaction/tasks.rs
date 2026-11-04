@@ -24,8 +24,9 @@ use super::types::{
     TaskEvent, TaskEventKind, TaskId, TaskOutput, TaskRef, TaskState, TaskView, TurnId,
 };
 
-/// A Bud agent's runs share one conversation, which takes one run at a time.
-const MAX_ACTIVE_AGENT: usize = 1;
+/// Who cancelled a task the session ended before it started (`task_cancelled.by`): the
+/// task was queued for a place and never ran. Its reason is `not_started`.
+pub const NOT_STARTED_BY: &str = "session_end";
 /// How often a request queued only by its tenant's limit looks for a free place.
 const TENANT_POLL_MS: Ms = 250;
 /// A provisional run is adopted by E + 600 ms or discarded.
@@ -124,9 +125,55 @@ fn first_sentence(text: &str) -> &str {
     &text[..end]
 }
 
+/// The words that only tie a request to the task already running ("while you're checking that,",
+/// "can you also"): they say nothing of what the request is, so its title starts after them.
+fn without_preamble(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    loop {
+        let lower = rest.to_lowercase();
+        let mut cut = None;
+        if let Some(after) = ["while you're ", "while you are ", "while you "]
+            .iter()
+            .find_map(|lead| lower.strip_prefix(lead))
+        {
+            // "while you're checking that," / "while you do that": up to the clause's end.
+            let words: Vec<&str> = after.split_whitespace().take(3).collect();
+            if let Some(at) = words
+                .iter()
+                .position(|w| matches!(w.trim_end_matches([',', '.']), "that" | "it" | "this"))
+            {
+                let clause: usize = words[..=at].iter().map(|w| w.len() + 1).sum();
+                cut = Some(lower.len() - after.len() + clause.min(after.len()));
+            }
+        }
+        for lead in [
+            "and also ",
+            "also ",
+            "and ",
+            "can you also ",
+            "could you also ",
+            "would you also ",
+            "can you ",
+            "could you ",
+            "would you ",
+        ] {
+            if cut.is_none() && lower.starts_with(lead) {
+                cut = Some(lead.len());
+            }
+        }
+        match cut {
+            // Lower-casing keeps byte offsets for the ASCII leads matched above.
+            Some(at) if rest.is_char_boundary(at) && at < rest.len() => {
+                rest = rest[at..].trim_start_matches([',', ' ']);
+            }
+            _ => return rest,
+        }
+    }
+}
+
 fn title(text: &str) -> String {
     let mut title = String::new();
-    for word in text.split_whitespace() {
+    for word in without_preamble(text).split_whitespace() {
         if !title.is_empty() && title.chars().count() + 1 + word.chars().count() > TITLE_MAX_CHARS {
             break;
         }
@@ -306,13 +353,14 @@ impl Registry {
         }
     }
 
-    /// The session's background is the Bud agent `name`: one run at a time, and no tools of
-    /// the gateway's. `side_effects`: the agent has tools, so a task may change something.
-    pub fn set_agent(&mut self, name: &str, side_effects: bool) {
+    /// The session's background is the Bud agent `name`: `max_parallel` of its tasks run at
+    /// once (`background.max_parallel`), and no tools of the gateway's. `side_effects`: the
+    /// agent has tools, so a task may change something.
+    pub fn set_agent(&mut self, name: &str, side_effects: bool, max_parallel: usize) {
         self.set_backend(
             format!("agent:{name}"),
             Some(side_effects),
-            Some(MAX_ACTIVE_AGENT),
+            Some(max_parallel.max(1)),
         );
     }
 
@@ -331,6 +379,14 @@ impl Registry {
             self.remote_effects = side_effects;
             self.tools.clear();
         }
+    }
+
+    /// How the caller is asked before a tool of the backend's own runs ([`Backend::confirmations`]):
+    /// looked up by the name of a gate the backend raises, after [`Registry::set_backend`].
+    ///
+    /// [`Backend::confirmations`]: super::background::Backend::confirmations
+    pub fn set_confirmations(&mut self, tools: Vec<ToolSpec>) {
+        self.tools.extend(tools);
     }
 
     /// The catalog entries of the session: `entry` runs the caller's requests (a named
@@ -528,6 +584,22 @@ impl Registry {
             open_question: self.question.as_ref().map(|q| q.request.clone()),
             provisional: self.provisional.as_ref().map(|provisional| provisional.run),
         }
+    }
+
+    /// The task a run is for, the replaced runs' included.
+    pub fn task_of_run(&self, run: RunId) -> Option<TaskId> {
+        let idx = *self.runs.get(&run)?;
+        Some(self.tasks.get(idx)?.view.id.clone())
+    }
+
+    /// The run of the same task started before `run`, the replaced or adopted one: the run
+    /// `run` revises.
+    pub fn run_before(&self, run: RunId) -> Option<RunId> {
+        let idx = self.runs.get(&run)?;
+        (self.runs.iter())
+            .filter(|(other, of)| *of == idx && **other < run)
+            .map(|(other, _)| *other)
+            .max()
     }
 
     /// The task whose orchestrator run started `task`, for a child task.
@@ -1134,18 +1206,23 @@ impl Registry {
         let Some(held) = self.waiting.pop_front() else {
             return;
         };
-        // An agent's questions may have less time: the deadline its backend gave the question
-        // (`expires_in_ms`), else its entry's `question_deadline_ms`. Either is the job's own,
-        // and never moved.
+        // The deadline its backend gave the question (`expires_in_ms`; IM3: the hold's
+        // `bud_expires_at`, less the vote's way back) is the caller's whole window: re-asks
+        // happen inside it, so it is not cut to `hitl_answer_timeout_ms` (live, 3 Nov: a 30 s
+        // hold left 20 s, and a re-ask used them up). Else an agent's question may have less
+        // time: its entry's `question_deadline_ms`. Either is the job's own, and never moved.
         let agent = self.tasks[held.task].view.lineage.agent.as_ref();
         let given = held
             .args
             .get("expires_in_ms")
             .and_then(serde_json::Value::as_u64);
-        let deadline =
-            given.or_else(|| agent.and_then(|agent| self.agents.get(agent)?.question_deadline_ms));
-        let answer_ms =
-            deadline.map_or(self.answer_timeout_ms, |ms| ms.min(self.answer_timeout_ms));
+        let entry = agent.and_then(|agent| self.agents.get(agent)?.question_deadline_ms);
+        let deadline = given.or(entry);
+        let answer_ms = match (given, entry) {
+            (Some(ms), _) => ms,
+            (None, Some(ms)) => ms.min(self.answer_timeout_ms),
+            (None, None) => self.answer_timeout_ms,
+        };
         let task = &mut self.tasks[held.task];
         task.questions += 1;
         let id = HitlId(format!("q_{}_{}", task.view.id.0, task.questions));
@@ -1170,9 +1247,11 @@ impl Registry {
         if confirm {
             request.verb_phrase = tool
                 .and_then(|tool| tool.confirm_phrase.clone())
-                .unwrap_or_else(|| held.op_name.replace('_', " "));
+                .unwrap_or_else(|| held.op_name.replace(['_', '-'], " "));
             if let serde_json::Value::Object(args) = held.args {
-                request.params = args.into_iter().collect();
+                // The deadline its backend gave is the question's, not an argument to say.
+                let said = |(name, _): &(String, serde_json::Value)| name != "expires_in_ms";
+                request.params = args.into_iter().filter(said).collect();
                 // Read back in the order the tool's schema lists what it requires (the
                 // order its author thinks in), anything else after that.
                 let required = tool.and_then(|tool| tool.parameters["required"].as_array());
@@ -1464,6 +1543,9 @@ impl Registry {
             } else if let Some(until) = task.orphan_until {
                 task.deadline = Some(until);
                 self.close_gates(idx, now, HitlOutcome::Timeout, AnsweredBy::SessionEnd, out);
+            } else if task.view.state == TaskState::Submitted {
+                // Queued for a place and never run: said so, not taken for a cancel of work.
+                self.cancel(now, idx, NOT_STARTED_BY, AnsweredBy::SessionEnd, out);
             } else {
                 self.cancel(now, idx, "system", AnsweredBy::SessionEnd, out);
             }
@@ -1488,8 +1570,12 @@ impl Registry {
             }
             if self.ended && reported {
                 // The call reported and the run did not end in time: it is stopped, and the
-                // task ends with what it really did.
-                task.cancel_by = "system";
+                // task ends with what it really did. One still queued never started.
+                task.cancel_by = if task.view.state == TaskState::Submitted {
+                    NOT_STARTED_BY
+                } else {
+                    "system"
+                };
                 self.settle_cancelled(idx, now, out);
                 continue;
             }
@@ -1524,6 +1610,7 @@ impl Drop for Registry {
 
 #[cfg(test)]
 mod tests {
+    use super::super::bud_agent::DEFAULT_MAX_PARALLEL;
     use super::*;
     use serde_json::json;
 
@@ -1664,6 +1751,83 @@ mod tests {
             .map(|(name, _)| name.as_str())
             .collect();
         assert_eq!(names, ["restaurant", "party", "day", "note"]);
+    }
+
+    /// Spec 029 §7.3: a Bud agent's held call is read back in its author's words
+    /// (`tool_confirmations`); with none, its name is said with its underscores and dashes as
+    /// spaces and it needs a strong "yes". budprompt's deadline is the question's, firm, and
+    /// never read back as an argument.
+    #[test]
+    fn an_agents_held_call_is_read_back_in_its_authors_words() {
+        let mut registry = registry();
+        registry.set_agent("support", true, DEFAULT_MAX_PARALLEL);
+        let mut refund = tool("refund_order", true, false);
+        refund.confirm_phrase = Some("refund your order".to_owned());
+        refund.confirm_template = Some("refund order {order_id}".to_owned());
+        registry.set_confirmations(vec![refund]);
+        let ask = |registry: &mut Registry, at: Ms, op_name: &str| {
+            let (first, _) = delegate(registry, at, at);
+            let (reply, decision) = oneshot::channel();
+            let event = RunEvent::Gate {
+                op_name: op_name.to_owned(),
+                args: json!({"order_id": "4417", "expires_in_ms": 5_000}),
+                kind: HitlKind::Confirm,
+                reply,
+            };
+            let asked = run(registry, at + 10, first, event);
+            let Some(TaskEventKind::InputRequired(request)) = kinds(&asked).pop().cloned() else {
+                panic!("a confirmation: {asked:?}");
+            };
+            (request, decision)
+        };
+        let (request, _decision) = ask(&mut registry, 1_000, "refund_order");
+        assert_eq!(request.verb_phrase, "refund your order");
+        assert_eq!(request.question.as_deref(), Some("refund order 4417"));
+        assert!(!request.irreversible);
+        assert_eq!((request.expires_at, request.firm), (1_010 + 5_000, true));
+        let names: Vec<&str> = request.params.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["order_id"]);
+
+        let mut plain = registry_with(SessionEnd::CancelAll);
+        plain.set_agent("support", true, DEFAULT_MAX_PARALLEL);
+        let (request, _decision) = ask(&mut plain, 1_000, "create-support_ticket");
+        assert_eq!(request.verb_phrase, "create support ticket");
+        assert_eq!(request.question, None);
+        assert!(request.irreversible, "a call the entry does not word");
+    }
+
+    /// The deadline a backend gives its question (IM3: the hold's `bud_expires_at`, less the
+    /// vote's way back) is the caller's whole window to answer: it is not cut to
+    /// `hitl_answer_timeout_ms` (live, 3 Nov: a 30 s hold gave the caller 20 s, and re-asks
+    /// used them up). A question with no deadline of its backend keeps that.
+    #[test]
+    fn a_backends_deadline_is_the_whole_answer_window() {
+        let mut registry = registry();
+        registry.set_agent("support", true, DEFAULT_MAX_PARALLEL);
+        let ask = |registry: &mut Registry, at: Ms, args: serde_json::Value| {
+            let (first, _) = delegate(registry, at, at);
+            let (reply, decision) = oneshot::channel();
+            let event = RunEvent::Gate {
+                op_name: "refund_order".to_owned(),
+                args,
+                kind: HitlKind::Confirm,
+                reply,
+            };
+            let asked = run(registry, at + 10, first, event);
+            let Some(TaskEventKind::InputRequired(request)) = kinds(&asked).pop().cloned() else {
+                panic!("a confirmation: {asked:?}");
+            };
+            (request, decision)
+        };
+        let held = json!({"order_id": "4417", "expires_in_ms": 30_000});
+        let (request, _decision) = ask(&mut registry, 1_000, held);
+        assert_eq!((request.expires_at, request.firm), (1_010 + 30_000, true));
+
+        let mut plain = registry_with(SessionEnd::CancelAll);
+        plain.set_agent("support", true, DEFAULT_MAX_PARALLEL);
+        let (request, _decision) = ask(&mut plain, 1_000, json!({"order_id": "4417"}));
+        let timeout = Ms::from(InteractionConfig::default().policy.hitl_answer_timeout_ms);
+        assert_eq!((request.expires_at, request.firm), (1_010 + timeout, false));
     }
 
     /// A task whose `book_table` call was accepted and has not reported back. The session
@@ -2277,6 +2441,15 @@ mod tests {
             by: "user",
         };
         assert!(registry.apply(2_200, again).is_empty());
+    }
+
+    #[test]
+    fn a_run_is_known_by_its_task() {
+        let mut registry = registry();
+        let (first, _) = delegate(&mut registry, 1_000, 1);
+        let task = registry.board().tasks[0].id.clone();
+        assert_eq!(registry.task_of_run(first), Some(task));
+        assert_eq!(registry.task_of_run(RunId(9_999)), None);
     }
 
     #[test]
@@ -2906,16 +3079,17 @@ mod tests {
         assert_eq!(registry.tasks[0].view.revision, 2);
     }
 
-    /// A registry whose background is a Bud agent with tools.
+    /// A registry whose background is a Bud agent with tools, at its default parallelism.
     fn agent_registry() -> Registry {
         let mut registry = registry();
-        registry.set_agent("support", true);
+        registry.set_agent("support", true, DEFAULT_MAX_PARALLEL);
         registry
     }
 
     #[test]
-    fn an_agent_runs_one_task_at_a_time_and_queues_the_next() {
-        let mut registry = agent_registry();
+    fn an_agent_at_its_limit_queues_the_next_task() {
+        let mut registry = registry();
+        registry.set_agent("support", true, 1);
         // Nothing is started before the turn is settled: a run of the agent cannot be dropped
         // unseen. (The session's policy never asks; the registry has room, so it would.)
         let (first, effects) = delegate(&mut registry, 1_000, 1);
@@ -2932,7 +3106,7 @@ mod tests {
         );
         assert_eq!(created.state, TaskState::Working);
 
-        // The conversation is taken: a second request waits, and nothing starts for it.
+        // The agent's one place is taken: a second request waits, and nothing starts for it.
         let second = TaskCmd::Delegate {
             turn: TurnId(2),
             text: "request 2".to_owned(),
@@ -2948,7 +3122,7 @@ mod tests {
         };
         assert!(registry.apply(1_200, speculative).is_empty());
 
-        // The first run ends: the queued task gets the conversation.
+        // The first run ends: the queued task gets its place.
         let finished = RunEvent::Finished {
             text: "Done.".to_owned(),
         };
@@ -2963,7 +3137,7 @@ mod tests {
 
         // A tool-free agent's tasks change nothing.
         let mut tool_free = Registry::new(&InteractionConfig::default());
-        tool_free.set_agent("faq", false);
+        tool_free.set_agent("faq", false, DEFAULT_MAX_PARALLEL);
         let (_, effects) = delegate(&mut tool_free, 1_000, 1);
         assert!(matches!(
             events(&effects)[0].kind,
@@ -2972,6 +3146,123 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn an_agents_tasks_run_side_by_side_up_to_its_limit() {
+        let mut registry = agent_registry();
+        // Two requests: two runs at once.
+        let (first, effects) = delegate(&mut registry, 1_000, 1);
+        assert_eq!(events(&effects)[0].state, TaskState::Working);
+        let (second, effects) = delegate(&mut registry, 1_100, 2);
+        assert_eq!(events(&effects)[0].state, TaskState::Working);
+        assert_ne!(first, second);
+        let (_third, _) = delegate(&mut registry, 1_200, 3);
+        // The fourth is beyond `background.max_parallel` (3): it waits.
+        let fourth = TaskCmd::Delegate {
+            turn: TurnId(4),
+            text: "request 4".to_owned(),
+            adopt: false,
+        };
+        let effects = registry.apply(1_300, fourth);
+        assert!(started(&effects).is_empty());
+        assert_eq!(events(&effects)[0].state, TaskState::Submitted);
+
+        // A revision of the first task replaces only its run; it knows the run it follows.
+        let revised = registry.apply(
+            1_400,
+            TaskCmd::Revise {
+                task: t(1),
+                correction: "the other one".to_owned(),
+            },
+        );
+        assert_eq!(cancelled_runs(&revised), [first]);
+        let [again] = started(&revised)[..] else {
+            panic!("one run for the revision: {revised:?}");
+        };
+        assert_eq!(registry.run_before(again), Some(first));
+        assert_eq!(
+            registry.run_before(second),
+            None,
+            "the second task's own run"
+        );
+        assert_eq!(registry.run_before(first), None);
+
+        // The second task finishes: its place goes to the queued one.
+        let done = RunEvent::Finished {
+            text: "Done.".to_owned(),
+        };
+        let effects = run(&mut registry, 2_000, second, done);
+        assert_eq!(started(&effects).len(), 1);
+        let working = events(&effects)
+            .into_iter()
+            .any(|event| event.task_ref == t(4) && event.kind == TaskEventKind::Working);
+        assert!(working, "{effects:?}");
+    }
+
+    #[test]
+    fn a_task_still_queued_at_hang_up_is_reported_as_not_started() {
+        // A tool-free agent's tasks do not run on after the session.
+        let mut registry = registry();
+        registry.set_agent("faq", false, 1);
+        let (first, _) = delegate(&mut registry, 1_000, 1);
+        let queued = TaskCmd::Delegate {
+            turn: TurnId(2),
+            text: "request 2".to_owned(),
+            adopt: false,
+        };
+        registry.apply(1_100, queued);
+        let hung_up = TaskCmd::SessionEnded {
+            push: false,
+            grace_ms: 0,
+        };
+        let effects = registry.apply(2_000, hung_up);
+        assert_eq!(cancelled_runs(&effects), [first]);
+        let ended: Vec<(&TaskRef, &TaskEventKind)> = events(&effects)
+            .into_iter()
+            .filter(|event| matches!(event.kind, TaskEventKind::Cancelled { .. }))
+            .map(|event| (&event.task_ref, &event.kind))
+            .collect();
+        let (task, kind) = ended
+            .iter()
+            .find(|(task, _)| **task == t(2))
+            .expect("the queued task ends");
+        assert_eq!(**task, t(2));
+        assert!(
+            matches!(
+                kind,
+                TaskEventKind::Cancelled {
+                    by: NOT_STARTED_BY,
+                    effects: Effects::NoneCommitted
+                }
+            ),
+            "{kind:?}"
+        );
+        // Its outcome and its wire event say it never started.
+        let event = events(&effects)
+            .into_iter()
+            .find(|event| {
+                event.task_ref == t(2) && matches!(event.kind, TaskEventKind::Cancelled { .. })
+            })
+            .unwrap();
+        let outcome = Outcome::of(event).unwrap();
+        assert_eq!(outcome.summary, super::super::types::NOT_STARTED);
+        assert!(matches!(
+            &outcome.events(3_000)[0].kind,
+            TaskEventKind::Cancelled {
+                by: NOT_STARTED_BY,
+                ..
+            }
+        ));
+        let wire = super::super::events::task_event_to_wire(event, false).unwrap();
+        let wire = serde_json::to_value(wire).unwrap();
+        assert_eq!(
+            (wire["by"].as_str(), wire["reason"].as_str()),
+            (Some("session_end"), Some("not_started"))
+        );
+        // The running one is cancelled as any other at hang-up.
+        assert!(ended.iter().any(|(task, kind)| **task == t(1)
+            && matches!(kind, TaskEventKind::Cancelled { by: "system", .. })));
     }
 
     fn agent_tool(name: &str) -> RunEvent {
@@ -3485,7 +3776,8 @@ mod tests {
         assert_eq!(states, [TaskState::Completed, TaskState::Cancelled]);
 
         // `continue_all`: a queued task starts when a slot frees after the call.
-        let mut registry = agent_registry();
+        let mut registry = self::registry();
+        registry.set_agent("support", true, 1);
         registry.session_end = SessionEnd::ContinueAll;
         let (first, _) = delegate(&mut registry, 1_000, 1);
         registry.apply(
@@ -3609,5 +3901,25 @@ mod tests {
             "please find me a flight from Boston to Denver next Friday"
         );
         assert_eq!(title(&"x".repeat(100)).chars().count(), 60);
+    }
+
+    #[test]
+    fn a_second_requests_title_leaves_out_what_ties_it_to_the_first() {
+        assert_eq!(
+            title("While you are doing that, can you also tell me how many nodes the cluster has?"),
+            "tell me how many nodes the cluster has"
+        );
+        assert_eq!(
+            title(
+                "While you're checking that Can you also check the pods in the PD Ditto? namespace"
+            ),
+            "check the pods in the PD Ditto? namespace"
+        );
+        assert_eq!(title("And also check the logs"), "check the logs");
+        // A request that only starts like one keeps its words.
+        assert_eq!(
+            title("While you wait, read me the news"),
+            "While you wait, read me the news"
+        );
     }
 }

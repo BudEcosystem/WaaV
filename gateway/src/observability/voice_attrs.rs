@@ -146,7 +146,23 @@ pub mod session {
     /// that stopped answering, and marks the session span ERROR.
     pub const END_REASON: &str = "bud.voice.session.end_reason";
     pub const CLOSE_CODE: &str = "bud.voice.session.close_code";
+    /// The API the client opened the session on, as the HTTP conventions name it: `GET` and
+    /// `/v1/realtime` or `/ws`. Observability titles the session row with them, as it titles every
+    /// other request by its method and route.
+    pub const HTTP_METHOD: &str = "http.request.method";
+    pub const HTTP_ROUTE: &str = "http.route";
+    /// A voice agent's session: the agent's prompt id, so the agent's own Observability page (the
+    /// trace list filtered by prompt) lists it.
+    pub const PROMPT_ID: &str = "bud.prompt_id";
 }
+
+/// The session span's trace-list attributes. Not in [`ALL`] / [`SESSION`]: those are exactly what
+/// VoiceTurnFact / VoiceSessionFact read, and these are for the trace list only.
+pub const SESSION_LISTING: &[&str] = &[
+    session::HTTP_METHOD,
+    session::HTTP_ROUTE,
+    session::PROMPT_ID,
+];
 
 /// Attributes carried by a CLIENT span covering one leg of a turn.
 ///
@@ -193,6 +209,9 @@ pub mod interaction {
     pub const ACK_LATENCY_MS: &str = "bud.voice.interaction.ack_latency_ms";
     /// End of the caller's turn to the first sentence of the answer.
     pub const ANSWER_LATENCY_MS: &str = "bud.voice.interaction.answer_latency_ms";
+    /// A TTS record's line in interaction mode (spec 029 R-6): `agent` for words of the
+    /// background's answer, `front` for a line the gateway made itself. Absent outside the mode.
+    pub const TTS_LINE_SOURCE: &str = "bud.voice.tts.line_source";
 }
 
 /// Every attribute this crate emits, for the contract test.
@@ -214,6 +233,7 @@ pub const ALL: &[&str] = &[
     interaction::TASK_REF,
     interaction::ACK_LATENCY_MS,
     interaction::ANSWER_LATENCY_MS,
+    interaction::TTS_LINE_SOURCE,
     turn::BARGE_IN,
     turn::TURN_DETECTOR,
     turn::LANGUAGE,
@@ -315,7 +335,37 @@ pub const SESSION: &[&str] = &[
     session::CLOSE_CODE,
 ];
 
-/// Open a `voice.turn` span that declares EVERY attribute in [`ALL`] up front.
+/// What a billed voice record is, as its span's name says (budmetrics `TURN_SPAN_NAMES`
+/// ingests every one into VoiceTurnFact). All were once `voice.turn`, and a trace of one call
+/// read as rows of "turns" that were lines spoken, utterances transcribed and the agent's run.
+pub mod span_names {
+    /// The caller's turn (`conversation`).
+    pub const TURN: &str = "voice.turn";
+    /// A line spoken (`text_to_speech`).
+    pub const SPEECH: &str = "voice.speech";
+    /// An utterance transcribed (`audio_transcription`).
+    pub const TRANSCRIPTION: &str = "voice.transcription";
+    /// The agent's work on a turn (`agent_turn`).
+    pub const AGENT_TURN: &str = "voice.agent_turn";
+    /// A realtime vendor's billed response (`realtime_session`).
+    pub const REALTIME: &str = "voice.realtime";
+    /// Every name a billed record's span may have.
+    pub const ALL: [&str; 5] = [TURN, SPEECH, TRANSCRIPTION, AGENT_TURN, REALTIME];
+
+    /// The name the span of a record of `capability` gets.
+    pub fn for_capability(capability: &str) -> &'static str {
+        match capability {
+            "text_to_speech" => SPEECH,
+            "audio_transcription" => TRANSCRIPTION,
+            "agent_turn" => AGENT_TURN,
+            "realtime_session" => REALTIME,
+            _ => TURN,
+        }
+    }
+}
+
+/// Open the span of a billed voice record, named for what it is ([`span_names::for_capability`]),
+/// that declares EVERY attribute in [`ALL`] up front.
 ///
 /// This exists because of a failure mode that produces no error of any kind: `Span::record` on a
 /// field the span did not declare at creation is a silent no-op. A leg that measures its vendor
@@ -335,23 +385,55 @@ pub const SESSION: &[&str] = &[
 /// extra field can be written in any form tracing accepts, `{ CONST } = value` included.
 #[macro_export]
 macro_rules! voice_turn_span {
+    // A record whose name is its role, not its capability: an agent's caller turn is a `voice.turn`
+    // whose capability is `agent_turn`, the same as the run beneath it.
+    (named $name:literal, parent: $parent:expr, capability = $capability:expr, transport = $transport:expr $(, $($extra:tt)*)?) => {
+        $crate::__voice_turn_span_fields!((parent: $parent,) $name, $capability, $transport $(, $($extra)*)?)
+    };
     // FRD-023 D-19: a realtime billed record is the ROOT of its own trace.
     (parent: $parent:expr, capability = $capability:expr, transport = $transport:expr $(, $($extra:tt)*)?) => {
-        $crate::__voice_turn_span_fields!((parent: $parent,) $capability, $transport $(, $($extra)*)?)
+        $crate::__voice_turn_span_named!((parent: $parent,) $capability, $transport $(, $($extra)*)?)
     };
     (capability = $capability:expr, transport = $transport:expr $(, $($extra:tt)*)?) => {
-        $crate::__voice_turn_span_fields!(() $capability, $transport $(, $($extra)*)?)
+        $crate::__voice_turn_span_named!(() $capability, $transport $(, $($extra)*)?)
     };
 }
 
-/// The field list behind [`voice_turn_span!`], in one place for both of its forms.
+/// The span named for what the record is ([`span_names`]): a span's name is fixed where it is
+/// built, so each name is its own `info_span!`, and the capability picks one.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __voice_turn_span_named {
+    (($($parent:tt)*) $capability:expr, $transport:expr $(, $($extra:tt)*)?) => {{
+        let capability: &'static str = $capability;
+        match capability {
+            "text_to_speech" => $crate::__voice_turn_span_fields!(
+                ($($parent)*) "voice.speech", capability, $transport $(, $($extra)*)?
+            ),
+            "audio_transcription" => $crate::__voice_turn_span_fields!(
+                ($($parent)*) "voice.transcription", capability, $transport $(, $($extra)*)?
+            ),
+            "agent_turn" => $crate::__voice_turn_span_fields!(
+                ($($parent)*) "voice.agent_turn", capability, $transport $(, $($extra)*)?
+            ),
+            "realtime_session" => $crate::__voice_turn_span_fields!(
+                ($($parent)*) "voice.realtime", capability, $transport $(, $($extra)*)?
+            ),
+            _ => $crate::__voice_turn_span_fields!(
+                ($($parent)*) "voice.turn", capability, $transport $(, $($extra)*)?
+            ),
+        }
+    }};
+}
+
+/// The field list behind [`voice_turn_span!`], in one place for every name.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __voice_turn_span_fields {
-    (($($parent:tt)*) $capability:expr, $transport:expr $(, $($extra:tt)*)?) => {
+    (($($parent:tt)*) $name:literal, $capability:expr, $transport:expr $(, $($extra:tt)*)?) => {
         ::tracing::info_span!(
             $($parent)*
-            "voice.turn",
+            $name,
                 { $crate::observability::voice_attrs::turn::CAPABILITY } = $capability,
                 { $crate::observability::voice_attrs::turn::TRANSPORT } = $transport,
                 { $crate::observability::voice_attrs::turn::PROJECT_ID } = ::tracing::field::Empty,
@@ -369,6 +451,7 @@ macro_rules! __voice_turn_span_fields {
                 { $crate::observability::voice_attrs::interaction::TASK_REF } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::interaction::ACK_LATENCY_MS } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::interaction::ANSWER_LATENCY_MS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::interaction::TTS_LINE_SOURCE } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::turn::BARGE_IN } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::turn::TURN_DETECTOR } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::turn::LANGUAGE } = ::tracing::field::Empty,
@@ -427,12 +510,26 @@ macro_rules! __voice_turn_span_fields {
 
 /// Open a `voice.session` span (FRD-023 §5.10): the ROOT of its own trace, declaring every
 /// attribute in [`SESSION`] up front (the declare-before-record rule of [`voice_turn_span!`]).
+///
+/// `name = "voice.ws_session"` opens the same span for a `/ws` session (and the `/v1/realtime`
+/// agent cascade that runs on one). It is named apart because `voice.session` is what
+/// `VoiceSessionFact` ingests: the vendor relay's session, billed in tokens.
 #[macro_export]
 macro_rules! voice_session_span {
     (capability = $capability:expr, transport = $transport:expr) => {
+        $crate::voice_session_span!(
+            name = "voice.session",
+            capability = $capability,
+            transport = $transport
+        )
+    };
+    (name = $name:literal, capability = $capability:expr, transport = $transport:expr) => {
         ::tracing::info_span!(
             parent: None,
-            "voice.session",
+            $name,
+            // A session is a request a client opened on WaaV, as an HTTP call's root is: SERVER, not the
+            // INTERNAL every span gets by default (Observability tagged `GET /ws` rows "internal").
+            otel.kind = "server",
             { $crate::observability::voice_attrs::turn::CAPABILITY } = $capability,
             { $crate::observability::voice_attrs::turn::TRANSPORT } = $transport,
             { $crate::observability::voice_attrs::turn::PROJECT_ID } = ::tracing::field::Empty,
@@ -462,6 +559,9 @@ macro_rules! voice_session_span {
             { $crate::observability::voice_attrs::session::TURNS } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::session::END_REASON } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::session::CLOSE_CODE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::session::HTTP_METHOD } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::session::HTTP_ROUTE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::session::PROMPT_ID } = ::tracing::field::Empty,
             otel.status_code = ::tracing::field::Empty,
             otel.status_message = ::tracing::field::Empty
         )
@@ -471,6 +571,43 @@ macro_rules! voice_session_span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_span_is_named_for_what_it_is() {
+        let named = |capability: &'static str| {
+            tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+                let span =
+                    crate::voice_turn_span!(capability = capability, transport = "websocket");
+                span.metadata().map(|m| m.name()).unwrap_or_default()
+            })
+        };
+        for (capability, name) in [
+            ("conversation", "voice.turn"),
+            ("agent_turn", "voice.agent_turn"),
+            ("text_to_speech", "voice.speech"),
+            ("audio_transcription", "voice.transcription"),
+            ("realtime_session", "voice.realtime"),
+            ("something_new", "voice.turn"),
+        ] {
+            assert_eq!(named(capability), name, "{capability}");
+            assert_eq!(span_names::for_capability(capability), name, "{capability}");
+            assert!(span_names::ALL.contains(&name));
+        }
+        let caller_turn = tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let span = crate::voice_turn_span!(
+                named "voice.turn",
+                parent: None,
+                capability = "agent_turn",
+                transport = "websocket"
+            );
+            span.metadata().map(|m| m.name()).unwrap_or_default()
+        });
+        assert_eq!(
+            caller_turn,
+            span_names::TURN,
+            "an agent's caller turn is a turn"
+        );
+    }
 
     #[test]
     fn every_attribute_is_namespaced() {
@@ -693,12 +830,23 @@ mod tests {
                 capability = "realtime_session",
                 transport = "websocket"
             );
-            for name in SESSION {
+            let ws = crate::voice_session_span!(
+                name = "voice.ws_session",
+                capability = "realtime_session",
+                transport = "websocket"
+            );
+            assert_eq!(span.metadata().map(|m| m.name()), Some("voice.session"));
+            assert_eq!(ws.metadata().map(|m| m.name()), Some("voice.ws_session"));
+            for name in SESSION.iter().chain(SESSION_LISTING) {
                 span.record(*name, "x");
             }
         });
         let seen = seen.lock().unwrap();
-        let missing: Vec<_> = SESSION.iter().filter(|a| !seen.contains(**a)).collect();
+        let missing: Vec<_> = SESSION
+            .iter()
+            .chain(SESSION_LISTING)
+            .filter(|a| !seen.contains(**a))
+            .collect();
         assert!(
             missing.is_empty(),
             "voice_session_span! does not declare {missing:?}"

@@ -63,9 +63,9 @@ use super::turn_record::{TurnRecord, TurnTrace};
 use super::types::{
     Act, ActDecision, ActSource, Class, CutCause, DuplexAction, DuplexEvent, EotSource, FloorCmd,
     FloorSnapshot, FrontEvent, GateCmd, HitlId, HitlKind, HitlOutcome, ItemId, Kind, Lane,
-    LaneEvent, Ms, Narration, Outcome, PolicyAction, PolicyInput, PumpEvent, Reading, RunEvent,
-    RunId, Say, SpeechCmd, TaskCmd, TaskEffect, TaskEvent, TaskEventKind, TaskId, TaskState,
-    TaskView, TurnId, UttId, Utterance, Verbosity, WaitReason,
+    LaneEvent, LineSource, Ms, Narration, Outcome, PolicyAction, PolicyInput, PumpEvent, Reading,
+    RunEvent, RunId, Say, SpeechCmd, TaskCmd, TaskEffect, TaskEvent, TaskEventKind, TaskId,
+    TaskState, TaskView, TurnId, UttId, Utterance, Verbosity, WaitReason,
 };
 
 /// The actor's inbox. Pump events arrive on the pump's own channel.
@@ -191,6 +191,8 @@ pub enum Msg {
     RunAlive(RunId),
     /// A round of a run's tool calls and their results (`background::tool_round`).
     ToolRound(RunId, Vec<ChatMessage>),
+    /// A tool the run's backend ran itself started or finished (a Bud agent's).
+    ToolCall(RunId, super::types::ToolCall),
     /// The operator's answer to a webhook hand-off to a person (`controls.human.url`).
     Person(super::remote::PersonAnswer),
     /// The call's recording, paused while a sensitive value is typed on the keypad.
@@ -355,6 +357,8 @@ pub struct InteractionHandle {
     tx: mpsc::Sender<Msg>,
     echo: Arc<serde_json::Value>,
     stopped: CancellationToken,
+    /// The session's Bud agent, when it is the background (`session.bud_context` seeds it).
+    agent: Option<Arc<AgentBackground>>,
 }
 
 impl InteractionHandle {
@@ -365,7 +369,13 @@ impl InteractionHandle {
             tx,
             echo: Arc::new(echo),
             stopped,
+            agent: None,
         }
+    }
+
+    /// The session's Bud agent, when it does the session's tasks.
+    pub fn agent(&self) -> Option<&Arc<AgentBackground>> {
+        self.agent.as_ref()
     }
 
     /// The inbox itself, for a task that reports to the actor on its own (the analyser).
@@ -681,6 +691,10 @@ pub fn spawn(deps: ActorDeps) -> (InteractionHandle, JoinHandle<()>) {
         stopped: stopped.clone(),
         // The actor keeps only a weak sender, so it ends when the session lets go of it.
         tx: tx.clone(),
+        agent: match &deps.background {
+            Background::Agent(agent) => Some(Arc::clone(agent)),
+            _ => None,
+        },
     };
     let language = deps.cfg.front.language.clone();
     let tx = tx.downgrade();
@@ -1209,6 +1223,10 @@ impl Actor {
             background.own_tools(),
             background.max_concurrent(),
         );
+        // A Bud agent's wording for the calls it holds for the caller, and for the ones only
+        // someone else may approve (spec 029 §7.3, FR-APR-1).
+        registry.set_confirmations(background.confirmations());
+        policy.set_approval_message(background.approval_message());
         // The conversation state starts from the caller's settings; what the session can do is
         // completed by `Msg::Caps` once its voice is known.
         let stt_language = deps.vm.get_config().stt_config.language.clone();
@@ -1720,6 +1738,7 @@ impl Actor {
                 }
             }
             Msg::ToolRound(run, round) => self.tool_round(run, round),
+            Msg::ToolCall(run, call) => self.tool_call(now, run, call),
             Msg::Run(run, event) => {
                 self.first_token_due.remove(&run);
                 if event.is_last() {
@@ -2445,6 +2464,7 @@ impl Actor {
             handle: follow.flatten(),
             state: (!self.plain).then(|| self.state.to_json()),
             turn,
+            after: self.registry.run_before(run),
         };
         backend.start(job, tx, cancel);
     }
@@ -4114,6 +4134,7 @@ impl Actor {
             return Vec::new();
         }
         let discard = utterance.discard;
+        let source = LineSource::of(&utterance);
         // A line said again slower or louder: that line only.
         let style = (!discard)
             .then(|| self.line_style.take_if(|(say, ..)| *say == utterance.say))
@@ -4142,7 +4163,13 @@ impl Actor {
         if gain_db > 0.0 {
             self.ctl.set_line_gain(utt, gain_db);
         }
-        let _ = self.speech.send(SpeechCmd::Speak { utt, text, discard });
+        let speak = SpeechCmd::Speak {
+            utt,
+            text,
+            discard,
+            source,
+        };
+        let _ = self.speech.send(speak);
         if rate.is_some() {
             let _ = self.speech.send(SpeechCmd::Rate(self.state.rate));
         }
@@ -4165,10 +4192,12 @@ impl Actor {
     fn prerender(&mut self, utt: UttId, text: String) -> Vec<LaneEvent> {
         debug!(stream_id = %self.stream_id, utt = utt.0, "interaction urgent line rendered ahead");
         self.synth = Some(utt);
+        // Never heard, so never billed: its source is only for the command's shape.
         let _ = self.speech.send(SpeechCmd::Speak {
             utt,
             text,
             discard: true,
+            source: LineSource::Front,
         });
         Vec::new()
     }
@@ -5015,7 +5044,9 @@ impl Actor {
                 self.line_ended(&spoken);
                 let event = transcript(self.turn.as_ref(), &spoken, None, "full");
                 self.send(&event, MessageClass::Transcript);
-                if spoken.utterance.kind == Kind::Relay {
+                // The agent's own words: a relay's lead-in ("About your request to ...:") is
+                // not part of its answer.
+                if LineSource::of(&spoken.utterance) == LineSource::Agent {
                     self.heard_answer(spoken.utterance.task.as_ref(), &spoken.text, false);
                 }
                 // Stepped down, the history is the plain path's: the caller and the answers.
@@ -5044,7 +5075,12 @@ impl Actor {
                 }
                 let heard: String = spoken.text.chars().take(heard_chars).collect();
                 if spoken.utterance.kind == Kind::Relay {
-                    self.heard_answer(spoken.utterance.task.as_ref(), &heard, true);
+                    let heard = if LineSource::of(&spoken.utterance) == LineSource::Agent {
+                        heard.as_str()
+                    } else {
+                        ""
+                    };
+                    self.heard_answer(spoken.utterance.task.as_ref(), heard, true);
                 }
                 // What the caller cut off is said again on `resume`, from its first sentence
                 // they did not hear in full (chapter 9).
@@ -5161,6 +5197,39 @@ impl Actor {
         if let Ok(event) = serde_json::to_value(wire) {
             tasks::store().publish(&self.stored, event);
         }
+    }
+
+    /// A tool of a run's backend, for the client: under the task the run is for.
+    fn tool_call(&mut self, now: Ms, run: RunId, call: super::types::ToolCall) {
+        use super::types::ToolCall;
+        let Some(task) = self.registry.task_of_run(run) else {
+            // A provisional run (not adopted yet) or a discarded one: no task to name.
+            return;
+        };
+        let event = match call {
+            ToolCall::Started { item_id, name } => WireEvent::ToolStarted {
+                task_id: task.0,
+                item_id,
+                name,
+                t_ms: now,
+            },
+            ToolCall::Done {
+                item_id,
+                name,
+                duration_ms,
+                ok,
+                error,
+            } => WireEvent::ToolDone {
+                task_id: task.0,
+                item_id,
+                name,
+                duration_ms,
+                ok,
+                error,
+                t_ms: now,
+            },
+        };
+        self.send(&event, MessageClass::Transcript);
     }
 
     fn send(&mut self, event: &WireEvent, class: MessageClass) {
@@ -5353,7 +5422,8 @@ fn transcript(
     heard: &'static str,
 ) -> WireEvent {
     let utterance = &spoken.utterance;
-    let relay = utterance.kind == Kind::Relay;
+    // The agent's own words; a relay's lead-in is the gateway's.
+    let relay = LineSource::of(utterance) == LineSource::Agent;
     let front = matches!(utterance.say, Say::Front(_));
     WireEvent::AssistantTranscript {
         turn_index: turn.map_or(0, |turn| turn.id.0),

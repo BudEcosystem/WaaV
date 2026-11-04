@@ -90,6 +90,7 @@ impl TurnReport {
             status,
             usage: None,
             transcript,
+            metrics: None,
         });
     }
 }
@@ -130,6 +131,7 @@ mod tests {
                     status: TurnStatus::Completed,
                     usage: None,
                     transcript: "Paris is the capital. It is in France.".into(),
+                    metrics: None,
                 },
             ]
         );

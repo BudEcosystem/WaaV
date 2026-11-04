@@ -346,12 +346,16 @@ fn an_agent_turn_reads_as_a_ga_response() {
         item_id: "mcp_1".into(),
         name: "lookup_order".into(),
         status: "in_progress".into(),
+        duration_ms: None,
+        error: None,
     }));
     all.extend(s.core(&OutgoingMessage::AgentTool {
         turn_index: 0,
         item_id: "mcp_1".into(),
         name: "lookup_order".into(),
         status: "completed".into(),
+        duration_ms: None,
+        error: None,
     }));
     all.extend(s.core(&OutgoingMessage::AssistantTranscript {
         turn_index: 0,
@@ -365,6 +369,7 @@ fn an_agent_turn_reads_as_a_ga_response() {
         status: "completed".into(),
         usage: Some(json!({"input_tokens": 10, "output_tokens": 4, "total_tokens": 14})),
         transcript: "It shipped.".into(),
+        metrics: None,
     }));
     assert_eq!(
         types(&all),
@@ -378,8 +383,10 @@ fn an_agent_turn_reads_as_a_ga_response() {
             "response.created",
             "response.output_item.added",
             "response.mcp_call.in_progress",
+            "bud.tool.started",
             "response.mcp_call.completed",
             "response.output_item.done",
+            "bud.tool.done",
             "response.output_item.added",
             "conversation.item.added",
             "response.content_part.added",
@@ -451,6 +458,7 @@ fn a_barge_in_cancels_and_truncates_the_assistant_item() {
         status: "cancelled".into(),
         usage: None,
         transcript: "Hello".into(),
+        metrics: None,
     }));
     let last = done.last().unwrap();
     assert_eq!(last["response"]["status"], "cancelled");
@@ -484,6 +492,7 @@ fn text_mode_streams_text_events() {
         status: "completed".into(),
         usage: None,
         transcript: "Hi".into(),
+        metrics: None,
     }));
     assert!(done.contains(&"response.output_text.done".to_string()));
     assert!(!done.contains(&"response.output_audio.done".to_string()));
@@ -529,6 +538,7 @@ fn the_greeting_is_a_response_of_its_own() {
         status: "completed".into(),
         usage: None,
         transcript: "Hi there.".into(),
+        metrics: None,
     }));
     assert_eq!(
         done.last().unwrap()["response"]["metadata"]["bud_greeting"],
@@ -828,21 +838,27 @@ fn a_turn_answered_before_its_transcript_completes_when_the_transcript_comes() {
     let mut s = interactive(json!({}));
     let floor = json!({"type": "floor_state", "holder": "user", "lane": null, "reason": "user_speech", "t_ms": 1});
     s.interaction(&floor.to_string());
-    // The agent speaks at the eager end of the turn; the final transcript follows.
+    // The agent speaks at the eager end of the turn: the caller's speech ends there, as on a
+    // plain session; the final transcript follows and completes the same item.
     let early = types(&s.interaction(&line("u_1", 1, "Okay.", "none", json!({}))));
-    assert_eq!(early[0], "response.created");
+    assert_eq!(
+        early[..3],
+        [
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed",
+            "response.created"
+        ]
+    );
     let late = s.core(&final_transcript("book a table"));
     assert_eq!(
         types(&late),
         vec![
             "conversation.item.input_audio_transcription.delta",
-            "input_audio_buffer.speech_stopped",
-            "input_audio_buffer.committed",
             "conversation.item.input_audio_transcription.completed",
             "conversation.item.done",
         ]
     );
-    assert_eq!(parse(&late)[3]["transcript"], "book a table");
+    assert_eq!(parse(&late)[1]["transcript"], "book a table");
 }
 
 #[test]
@@ -991,6 +1007,7 @@ fn a_function_call_is_an_item_and_its_output_starts_the_next_run() {
         status: "completed".into(),
         usage: None,
         transcript: String::new(),
+        metrics: None,
     }));
     assert_eq!(
         types(&all),
@@ -1084,6 +1101,7 @@ fn a_response_with_instructions_is_a_run_of_its_own_with_the_clients_metadata() 
         status: "completed".into(),
         usage: None,
         transcript: String::new(),
+        metrics: None,
     }));
     assert_eq!(done[0]["response"]["metadata"]["bud_kind"], "say");
     assert_eq!(
@@ -1720,6 +1738,7 @@ fn a_conversation_turn_reads_as_a_ga_response() {
         status: "completed".into(),
         usage: None,
         transcript: "Paris.".into(),
+        metrics: None,
     }));
     let evs = parse(&all);
     let kinds = types(&all);
@@ -1752,4 +1771,574 @@ fn an_alias_typed_message_and_cancel_become_acts() {
         s.client(&json!({"type": "response.cancel"}).to_string()).1,
         vec![ClientAct::Cancel]
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// bud.tool.*, bud.turn.metrics and session.bud_context
+// ---------------------------------------------------------------------------------------------
+
+fn agent_tool(status: &str, duration_ms: Option<u64>, error: Option<&str>) -> OutgoingMessage {
+    OutgoingMessage::AgentTool {
+        turn_index: 0,
+        item_id: "mcp_1".into(),
+        name: "lookup_order".into(),
+        status: status.into(),
+        duration_ms,
+        error: error.map(str::to_string),
+    }
+}
+
+fn started(turn: u64, input: Option<&str>) -> OutgoingMessage {
+    OutgoingMessage::AgentResponseStarted {
+        turn_index: turn,
+        kind: "agent".into(),
+        input: input.map(str::to_string),
+    }
+}
+
+fn done(turn: u64, status: &str, metrics: Option<Value>) -> OutgoingMessage {
+    OutgoingMessage::AgentResponseDone {
+        turn_index: turn,
+        kind: "agent".into(),
+        response_id: Some(format!("resp_bp_{turn}")),
+        status: status.into(),
+        usage: None,
+        transcript: "It shipped.".into(),
+        metrics,
+    }
+}
+
+fn engine_metrics() -> Value {
+    json!({"ttft_ms": 300, "ttfa_ms": 500, "total_ms": 900,
+           "tools": [{"name": "lookup_order", "duration_ms": 1200, "ok": true}]})
+}
+
+fn of_type<'a>(evs: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    evs.iter().filter(|e| e["type"] == kind).collect()
+}
+
+#[test]
+fn tool_events_name_the_response_and_report_duration_and_error() {
+    let mut s = ga(json!({}));
+    let created = parse(&s.core(&started(0, Some("where is my order"))));
+    let rid = of_type(&created, "response.created")[0]["response"]["id"].clone();
+
+    let evs = parse(&s.core(&agent_tool("in_progress", None, None)));
+    let kinds: Vec<_> = evs.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "response.output_item.added",
+            "response.mcp_call.in_progress",
+            "bud.tool.started"
+        ],
+        "the GA events are unchanged; the Bud event follows them"
+    );
+    let ev = &evs[2];
+    assert!(ev["event_id"].as_str().unwrap().starts_with("evt_bud_"));
+    assert_eq!(ev["response_id"], rid);
+    assert_eq!(ev["item_id"], "mcp_1");
+    assert_eq!(ev["name"], "lookup_order");
+
+    let evs = parse(&s.core(&agent_tool("failed", Some(1_250), Some("upstream 503"))));
+    let kinds: Vec<_> = evs.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "response.mcp_call.failed",
+            "response.output_item.done",
+            "bud.tool.done"
+        ]
+    );
+    let ev = &evs[2];
+    assert_eq!(ev["response_id"], rid);
+    assert_eq!(ev["item_id"], "mcp_1");
+    assert_eq!(ev["name"], "lookup_order");
+    assert_eq!(ev["duration_ms"], 1_250);
+    assert_eq!(ev["ok"], false);
+    assert_eq!(ev["error"], "upstream 503");
+
+    // A tool that succeeded: `error` is there, and null.
+    s.core(&agent_tool("in_progress", None, None));
+    let evs = parse(&s.core(&agent_tool("completed", Some(80), None)));
+    let ev = of_type(&evs, "bud.tool.done")[0];
+    assert_eq!(ev["ok"], true);
+    assert_eq!(ev["duration_ms"], 80);
+    assert!(ev.get("error").is_some_and(Value::is_null), "{ev}");
+}
+
+#[test]
+fn tool_and_turn_events_are_off_with_the_other_bud_events() {
+    let mut s = ga(json!({}));
+    s.set_bud_session_events(false);
+    let mut all = s.core(&started(0, Some("hi")));
+    all.extend(s.core(&agent_tool("in_progress", None, None)));
+    all.extend(s.core(&agent_tool("completed", Some(10), None)));
+    all.extend(s.core(&done(0, "completed", Some(engine_metrics()))));
+    let kinds = types(&all);
+    assert!(!kinds.iter().any(|k| k.starts_with("bud.")), "{kinds:?}");
+    assert_eq!(kinds.last().unwrap(), "response.done");
+}
+
+#[test]
+fn a_segmented_turn_reports_its_metrics_just_before_response_done() {
+    let mut s = ga(json!({}));
+    s.core(&segmented_ready());
+    s.core(&vad("turn_start", 1));
+    s.core(&vad("turn_end", 1));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    s.core(&stt("where is my order", true));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let mut all = s.core(&started(0, Some("where is my order")));
+    all.extend(s.core(&OutgoingMessage::AgentResponseCreated {
+        turn_index: 0,
+        response_id: "resp_bp_0".into(),
+    }));
+    all.extend(s.core(&OutgoingMessage::AssistantTranscript {
+        turn_index: 0,
+        delta: "It shipped.".into(),
+    }));
+    all.extend(s.audio(&[0u8, 1, 2, 3]));
+    all.extend(s.core(&done(0, "completed", Some(engine_metrics()))));
+    let evs = parse(&all);
+    let n = evs.len();
+    assert_eq!(evs[n - 2]["type"], "bud.turn.metrics");
+    assert_eq!(evs[n - 1]["type"], "response.done");
+    let m = &evs[n - 2];
+    let item = of_type(&evs, "response.output_item.added")[0]["item"]["id"].clone();
+    assert_eq!(m["response_id"], evs[n - 1]["response"]["id"]);
+    assert_eq!(m["bud_response_id"], "resp_bp_0");
+    assert_eq!(m["item_id"], item);
+    assert!(m["stt_ms"].as_u64().is_some_and(|ms| ms >= 20), "{m}");
+    assert!(
+        m["endpoint_to_audio_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms >= 50),
+        "{m}"
+    );
+    assert_eq!(m["ttft_ms"], 300);
+    assert_eq!(m["ttfa_ms"], 500);
+    assert_eq!(m["total_ms"], 900);
+    assert_eq!(
+        m["tools"],
+        json!([{"name": "lookup_order", "duration_ms": 1200, "ok": true}])
+    );
+    assert_eq!(m["status"], "completed");
+}
+
+#[test]
+fn metrics_are_null_where_nothing_was_measured() {
+    // A streaming STT ends the caller's speech and transcript together: no STT time, but the
+    // end of speech is known.
+    let mut s = ga(json!({}));
+    s.core(&stt("where is my order", true));
+    let mut all = s.core(&started(0, Some("where is my order")));
+    all.extend(s.core(&OutgoingMessage::AssistantTranscript {
+        turn_index: 0,
+        delta: "It shipped.".into(),
+    }));
+    all.extend(s.audio(&[0u8, 1, 2, 3]));
+    all.extend(s.core(&done(0, "completed", Some(engine_metrics()))));
+    let evs = parse(&all);
+    let m = of_type(&evs, "bud.turn.metrics")[0];
+    assert!(m["stt_ms"].is_null(), "{m}");
+    assert!(m["endpoint_to_audio_ms"].is_u64(), "{m}");
+
+    // A typed turn: no speech, so no end of it.
+    let mut all = s.core(&started(1, Some("typed words")));
+    all.extend(s.core(&OutgoingMessage::AssistantTranscript {
+        turn_index: 1,
+        delta: "Sure.".into(),
+    }));
+    all.extend(s.audio(&[0u8, 1, 2, 3]));
+    all.extend(s.core(&done(
+        1,
+        "completed",
+        Some(json!({"ttft_ms": null, "ttfa_ms": null, "total_ms": 40, "tools": []})),
+    )));
+    let evs = parse(&all);
+    let m = of_type(&evs, "bud.turn.metrics")[0];
+    assert!(
+        m["stt_ms"].is_null() && m["endpoint_to_audio_ms"].is_null(),
+        "{m}"
+    );
+    assert!(m["ttft_ms"].is_null() && m["ttfa_ms"].is_null(), "{m}");
+    assert_eq!(m["total_ms"], 40);
+
+    // A turn the engine did not measure (an alias session's loop) has no metrics event.
+    let mut all = s.core(&started(2, Some("hello")));
+    all.extend(s.core(&done(2, "completed", None)));
+    assert!(of_type(&parse(&all), "bud.turn.metrics").is_empty());
+}
+
+#[test]
+fn a_turn_cut_by_the_next_still_reports_its_metrics() {
+    let mut s = ga(json!({}));
+    let first = parse(&s.core(&started(0, Some("where is my order"))));
+    let rid0 = of_type(&first, "response.created")[0]["response"]["id"].clone();
+    // The caller spoke again: the next turn starts before the first one's end arrives.
+    let cut = parse(&s.core(&started(1, Some("never mind"))));
+    assert_eq!(
+        of_type(&cut, "response.done")[0]["response"]["status"],
+        "cancelled"
+    );
+    let evs = parse(&s.core(&done(0, "cancelled", Some(engine_metrics()))));
+    let m = of_type(&evs, "bud.turn.metrics");
+    assert_eq!(m.len(), 1, "{evs:?}");
+    assert_eq!(m[0]["response_id"], rid0);
+    assert_eq!(m[0]["status"], "cancelled");
+    assert!(
+        of_type(&evs, "response.done").is_empty(),
+        "the response was already done"
+    );
+}
+
+fn bud_context(ctx: Value) -> String {
+    json!({"type": "session.update", "event_id": "e9", "session": {"bud_context": ctx}}).to_string()
+}
+
+fn context_of(acts: &[ClientAct]) -> Option<Vec<Value>> {
+    acts.iter().find_map(|a| match a {
+        ClientAct::Context(items) => Some(items.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn bud_context_becomes_message_items_for_the_first_run() {
+    let mut s = ga(json!({}));
+    let (events, acts) = s.client(&bud_context(json!([
+        {"role": "user", "text": "My order is 4417."},
+        {"role": "assistant", "text": "Thanks, noted."}
+    ])));
+    let evs = parse(&events);
+    assert!(of_type(&evs, "error").is_empty(), "{evs:?}");
+    assert_eq!(of_type(&evs, "session.updated").len(), 1);
+    assert_eq!(
+        context_of(&acts),
+        Some(vec![
+            json!({"type": "message", "role": "user", "content": "My order is 4417."}),
+            json!({"type": "message", "role": "assistant", "content": "Thanks, noted."}),
+        ])
+    );
+    // `null` changes nothing.
+    let (events, acts) = s.client(&bud_context(Value::Null));
+    assert!(of_type(&parse(&events), "error").is_empty());
+    assert_eq!(context_of(&acts), None);
+}
+
+#[test]
+fn malformed_bud_context_is_refused_and_the_session_goes_on() {
+    for bad in [
+        json!("earlier we talked"),
+        json!([1]),
+        json!([{"role": "system", "text": "be terse"}]),
+        json!([{"role": "user", "text": "   "}]),
+        json!([{"role": "user"}]),
+        json!([{"role": "assistant", "text": 5}]),
+        json!([{"role": "user", "text": "fine"}, {"role": "tool", "text": "x"}]),
+    ] {
+        let mut s = ga(json!({}));
+        let (events, acts) = s.client(&bud_context(bad.clone()));
+        let evs = parse(&events);
+        let errors = of_type(&evs, "error");
+        assert_eq!(errors.len(), 1, "{bad}: {evs:?}");
+        assert_eq!(errors[0]["error"]["type"], "invalid_request_error");
+        assert_eq!(errors[0]["error"]["param"], "session.bud_context");
+        assert_eq!(errors[0]["error"]["event_id"], "e9");
+        assert_eq!(of_type(&evs, "session.updated").len(), 1, "{bad}");
+        assert_eq!(context_of(&acts), None, "{bad}: nothing of it is used");
+    }
+}
+
+#[test]
+fn bud_context_keeps_the_newest_within_its_limits() {
+    let mut s = ga(json!({}));
+    let many: Vec<Value> = (0..50)
+        .map(|i| json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "text": format!("turn {i}")}))
+        .collect();
+    let (_, acts) = s.client(&bud_context(Value::Array(many)));
+    let items = context_of(&acts).unwrap();
+    assert_eq!(items.len(), 40);
+    assert_eq!(items[0]["content"], "turn 10");
+    assert_eq!(items[39]["content"], "turn 49");
+
+    let long = |c: char| json!({"role": "user", "text": c.to_string().repeat(10_000)});
+    let (_, acts) = s.client(&bud_context(json!([long('a'), long('b'), long('c')])));
+    let items = context_of(&acts).unwrap();
+    assert_eq!(items.len(), 2, "the oldest goes first");
+    assert!(items[0]["content"].as_str().unwrap().starts_with('b'));
+
+    // One entry longer than the whole budget keeps its newest characters.
+    let text = format!("{}{}", "x".repeat(6_000), "é".repeat(24_000));
+    let (_, acts) = s.client(&bud_context(json!([{"role": "user", "text": text}])));
+    let items = context_of(&acts).unwrap();
+    let kept = items[0]["content"].as_str().unwrap();
+    assert_eq!(kept.chars().count(), 24_000);
+    assert!(kept.chars().all(|c| c == 'é'));
+}
+
+#[test]
+fn bud_context_after_the_first_turn_is_too_late() {
+    let mut s = ga(json!({}));
+    s.core(&started(0, Some("hello")));
+    let (events, acts) = s.client(&bud_context(json!([{"role": "user", "text": "earlier"}])));
+    let evs = parse(&events);
+    let errors = of_type(&evs, "error");
+    assert_eq!(errors.len(), 1, "{evs:?}");
+    assert_eq!(errors[0]["error"]["code"], "bud_context_too_late");
+    assert_eq!(errors[0]["error"]["param"], "session.bud_context");
+    assert_eq!(errors[0]["error"]["type"], "invalid_request_error");
+    assert_eq!(context_of(&acts), None);
+    assert_eq!(of_type(&evs, "session.updated").len(), 1);
+}
+
+#[test]
+fn bud_context_in_interaction_mode_seeds_the_agent_until_the_first_turn() {
+    let mut s = interactive(json!({}));
+    let (events, acts) = s.client(&bud_context(
+        json!([{"role": "user", "text": "My order is 4417."}]),
+    ));
+    let evs = parse(&events);
+    assert!(of_type(&evs, "error").is_empty(), "{evs:?}");
+    assert_eq!(
+        context_of(&acts),
+        Some(vec![
+            json!({"type": "message", "role": "user", "content": "My order is 4417."})
+        ])
+    );
+    // Malformed is still `invalid_value`.
+    let (events, acts) = s.client(&bud_context(json!([{"role": "system", "text": "x"}])));
+    let evs = parse(&events);
+    assert_eq!(of_type(&evs, "error")[0]["error"]["code"], "invalid_value");
+    assert_eq!(context_of(&acts), None);
+
+    // The agent's first line answers the caller's first turn: from then on it is too late.
+    s.interaction(&line("u_1", 1, "Sure, one moment.", "none", json!({})));
+    let (events, acts) = s.client(&bud_context(json!([{"role": "user", "text": "earlier"}])));
+    let evs = parse(&events);
+    let errors = of_type(&evs, "error");
+    assert_eq!(errors.len(), 1, "{evs:?}");
+    assert_eq!(errors[0]["error"]["code"], "bud_context_too_late");
+    assert_eq!(errors[0]["error"]["param"], "session.bud_context");
+    assert_eq!(context_of(&acts), None);
+}
+
+fn floor(holder: &str) -> String {
+    json!({"type": "floor_state", "holder": holder, "lane": null, "reason": "test", "t_ms": 1})
+        .to_string()
+}
+
+fn tool_wire(kind: &str, item: &str, extra: Value) -> String {
+    let mut event = json!({"type": kind, "task_id": "task_1", "item_id": item,
+                           "name": "lookup_order", "t_ms": 5});
+    event
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    event.to_string()
+}
+
+#[test]
+fn interaction_lines_report_their_metrics_and_the_agents_tools() {
+    let mut s = interactive(json!({}));
+    s.interaction(&floor("user"));
+    s.interaction(&floor("agent"));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // The front's line for the caller's turn: an acknowledgement that starts a task.
+    let ack = json!({"source": "front", "kind": "ack", "act": "delegate", "task_id": "task_1"});
+    let opened = parse(&s.interaction(&line("u_1", 1, "Sure, one moment.", "none", ack)));
+    let ack_id = of_type(&opened, "response.created")[0]["response"]["id"].clone();
+    s.audio(&[1u8; 480]);
+    let done = parse(&s.interaction(&line("u_1", 1, "", "full", json!({}))));
+    let n = done.len();
+    assert_eq!(done[n - 1]["type"], "response.done");
+    let m = &done[n - 2];
+    assert_eq!(m["type"], "bud.turn.metrics", "{done:?}");
+    assert_eq!(m["response_id"], ack_id);
+    assert!(m["item_id"].is_string());
+    assert!(
+        m["endpoint_to_audio_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms >= 20),
+        "{m}"
+    );
+    assert!(m["total_ms"].as_u64().is_some_and(|ms| ms >= 20), "{m}");
+    // Interaction lines measure nothing from a request start, and the STT here streams.
+    for unmeasured in ["ttft_ms", "ttfa_ms", "stt_ms", "bud_response_id"] {
+        assert!(m[unmeasured].is_null(), "{unmeasured}: {m}");
+    }
+    assert_eq!(m["act"], "delegate");
+    assert_eq!(m["source"], "front");
+    assert_eq!(m["kind"], "ack");
+    assert_eq!(m["task_id"], "task_1");
+    assert_eq!(m["tools"], json!([]));
+    assert_eq!(m["status"], "completed");
+
+    // The task's tool, while no line of it plays: no response to name.
+    let started = parse(&s.interaction(&tool_wire("tool_started", "mcp_1", json!({}))));
+    assert_eq!(types_of(&started), vec!["bud.tool.started"]);
+    assert!(started[0]["response_id"].is_null());
+    assert_eq!(started[0]["task_id"], "task_1");
+    assert_eq!(started[0]["item_id"], "mcp_1");
+    assert_eq!(started[0]["name"], "lookup_order");
+    let finished = parse(&s.interaction(&tool_wire(
+        "tool_done",
+        "mcp_1",
+        json!({"duration_ms": 1250, "ok": false, "error": "upstream 503"}),
+    )));
+    assert_eq!(types_of(&finished), vec!["bud.tool.done"]);
+    let ev = &finished[0];
+    assert!(ev["response_id"].is_null());
+    assert_eq!(
+        (
+            ev["duration_ms"].clone(),
+            ev["ok"].clone(),
+            ev["error"].clone()
+        ),
+        (json!(1250), json!(false), json!("upstream 503"))
+    );
+
+    // The task's answer: a tool that starts while it plays names it, and its metrics list the
+    // tools that ran for the task.
+    let answer = json!({"source": "background", "kind": "relay", "task_id": "task_1"});
+    let opened = parse(&s.interaction(&line("u_2", 1, "It shipped.", "none", answer)));
+    let answer_id = of_type(&opened, "response.created")[0]["response"]["id"].clone();
+    let started = parse(&s.interaction(&tool_wire("tool_started", "mcp_2", json!({}))));
+    assert_eq!(started[0]["response_id"], answer_id);
+    s.audio(&[1u8; 480]);
+    let done = parse(&s.interaction(&line("u_2", 1, "", "full", json!({}))));
+    let m = of_type(&done, "bud.turn.metrics")[0];
+    assert_eq!(m["response_id"], answer_id);
+    assert!(m["act"].is_null(), "{m}");
+    assert_eq!(m["source"], "background");
+    assert_eq!(
+        m["tools"],
+        json!([{"name": "lookup_order", "duration_ms": 1250, "ok": false}])
+    );
+    assert!(
+        m["endpoint_to_audio_ms"].is_u64(),
+        "the same caller turn: {m}"
+    );
+}
+
+#[test]
+fn interaction_bud_events_are_off_with_the_others() {
+    let mut s = interactive(json!({}));
+    s.set_bud_session_events(false);
+    let mut all = s.interaction(&line(
+        "u_1",
+        1,
+        "Sure.",
+        "none",
+        json!({"task_id": "task_1"}),
+    ));
+    all.extend(s.interaction(&tool_wire("tool_started", "mcp_1", json!({}))));
+    all.extend(s.interaction(&tool_wire(
+        "tool_done",
+        "mcp_1",
+        json!({"duration_ms": 5, "ok": true, "error": null}),
+    )));
+    all.extend(s.interaction(&line("u_1", 1, "", "full", json!({}))));
+    let kinds = types(&all);
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| k.starts_with("bud.tool") || k == "bud.turn.metrics"),
+        "{kinds:?}"
+    );
+}
+
+fn types_of(evs: &[Value]) -> Vec<String> {
+    evs.iter()
+        .map(|e| e["type"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// An interaction-mode session whose speech-to-text is gateway-endpointed (segmented).
+fn interactive_segmented() -> CascadeGa {
+    let mut s = interactive(json!({}));
+    s.core(&segmented_ready());
+    s
+}
+
+/// The caller's turn on a segmented interaction session: the floor opens the item, the
+/// detector times the speech, the segment's text grows it, and the agent's first line of
+/// the turn completes it, on the item the floor opened.
+#[test]
+fn a_segmented_interaction_turn_is_transcribed_on_its_own_item() {
+    let mut s = interactive_segmented();
+    let opened = parse(&s.interaction(&floor("user")));
+    let item = of_type(&opened, "conversation.item.added")[0]["item"]["id"].clone();
+    let mut all = s.core(&vad("turn_start", 1));
+    all.extend(s.core(&stt("where is my", false)));
+    all.extend(s.core(&stt("where is my order", true)));
+    all.extend(s.core(&vad("turn_end", 1)));
+    all.extend(s.interaction(&floor("agent")));
+    all.extend(s.interaction(&line("u_1", 1, "Let me check.", "none", json!({}))));
+    let evs = parse(&all);
+    let kinds = types_of(&evs);
+    let at = |kind: &str| {
+        kinds
+            .iter()
+            .position(|k| k == kind)
+            .unwrap_or_else(|| panic!("no {kind}: {kinds:?}"))
+    };
+    for kind in [
+        "conversation.item.input_audio_transcription.delta",
+        "input_audio_buffer.speech_stopped",
+        "input_audio_buffer.committed",
+        "conversation.item.input_audio_transcription.completed",
+        "conversation.item.done",
+    ] {
+        assert_eq!(
+            evs[at(kind)]["item_id"]
+                .as_str()
+                .or(evs[at(kind)]["item"]["id"].as_str()),
+            item.as_str(),
+            "{kind}"
+        );
+    }
+    assert!(
+        at("input_audio_buffer.speech_stopped")
+            < at("conversation.item.input_audio_transcription.completed")
+    );
+    assert!(at("conversation.item.input_audio_transcription.completed") < at("response.created"));
+    assert_eq!(
+        evs[at("conversation.item.input_audio_transcription.completed")]["transcript"],
+        "where is my order"
+    );
+    assert!(evs[at("input_audio_buffer.speech_stopped")]["audio_end_ms"].is_u64());
+    // One item for the turn: no second user item was opened.
+    let users = evs
+        .iter()
+        .filter(|e| e["type"] == "conversation.item.added" && e["item"]["role"] == "user")
+        .count();
+    assert_eq!(users, 0, "the floor's item is the turn's: {kinds:?}");
+}
+
+/// A streaming-STT interaction turn the floor ended before the agent's line: speech_stopped
+/// and committed at the end of the turn, then the transcript completes the same item.
+#[test]
+fn a_streaming_interaction_turn_ends_its_speech_on_the_floor_and_completes() {
+    let mut s = interactive(json!({}));
+    let opened = parse(&s.interaction(&floor("user")));
+    let item = of_type(&opened, "conversation.item.added")[0]["item"]["id"].clone();
+    let mut all = s.core(&stt("where is my order", true));
+    all.extend(s.interaction(&floor("agent")));
+    all.extend(s.interaction(&line("u_1", 1, "Let me check.", "none", json!({}))));
+    let evs = parse(&all);
+    let kinds = types_of(&evs);
+    for kind in [
+        "conversation.item.input_audio_transcription.delta",
+        "input_audio_buffer.speech_stopped",
+        "input_audio_buffer.committed",
+        "conversation.item.input_audio_transcription.completed",
+    ] {
+        let ev = evs
+            .iter()
+            .find(|e| e["type"] == kind)
+            .unwrap_or_else(|| panic!("no {kind}: {kinds:?}"));
+        assert_eq!(ev["item_id"], item, "{kind}");
+    }
 }

@@ -384,6 +384,76 @@ async fn authenticate_client_secret(
     Ok((caller, claims.ep, alias))
 }
 
+/// Open a voice agent's `ek_bud_` secret for `model` (`prompt:<name>`): the caller it acts as and
+/// the parent credential sealed in it, which the agent's turns are run with.
+///
+/// The secret must be an agent's (it carries `cred`) minted for exactly `model`; its parent must
+/// still authenticate, as itself, now: a revoked key, a removed user or an expired token ends
+/// it, whatever the secret's own lifetime says.
+pub async fn open_agent_client_secret(
+    state: &AppState,
+    token: &str,
+    model: &str,
+) -> Result<(Caller, String), HandshakeError> {
+    if state.bud_mode.is_none() {
+        return Err(bud_mode_required());
+    }
+    let Some(keys) = state.realtime.client_secret_keys.as_ref() else {
+        return Err(HandshakeError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client_secret",
+            "Client secrets are not enabled on this gateway.",
+        ));
+    };
+    let claims = keys
+        .open(token, ephemeral::now_epoch())
+        .map_err(|e| match e {
+            OpenError::Expired => HandshakeError::new(
+                StatusCode::UNAUTHORIZED,
+                "client_secret_expired",
+                "The client secret has expired; mint a new one.",
+            ),
+            _ => HandshakeError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client_secret",
+                "The client secret is not valid.",
+            ),
+        })?;
+    let parent = match claims.cred.as_ref() {
+        Some(cred) if claims.alias == model => cred.expose().to_string(),
+        _ => {
+            return Err(HandshakeError::new(
+                StatusCode::FORBIDDEN,
+                "model_mismatch",
+                "This client secret was minted for a different model.",
+            )
+            .param("model"));
+        }
+    };
+    let gone = || {
+        HandshakeError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client_secret",
+            "The credential that minted this client secret is no longer valid.",
+        )
+    };
+    let bearer = Credential::new(parent.clone(), super::handshake::CredentialSource::Bearer);
+    let mut caller = authenticate(state, &bearer).await.map_err(|_| gone())?;
+    // The sealed parent is the one the claims name (they were sealed together).
+    let named = match &claims.parent {
+        Parent::ApiKey { h, ck } => CallerCheck::ApiKey {
+            hashed: h.clone(),
+            client_key: *ck,
+        },
+        Parent::Jwt { sub } => CallerCheck::Jwt { sub: sub.clone() },
+    };
+    if caller.check != named {
+        return Err(gone());
+    }
+    caller.via_client_secret = true;
+    Ok((caller, parent))
+}
+
 /// The two engines behind `/v1/realtime` (FRD-023 D-2, §5.7).
 pub enum Engine {
     /// The vendor speaks OpenAI Realtime GA: frames are relayed after policy.

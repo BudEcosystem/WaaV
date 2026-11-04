@@ -256,6 +256,19 @@ pub const DEFAULT_DEGRADATION_MESSAGE: &str =
     "Sorry, I'm having trouble right now. Please try again.";
 pub const DEFAULT_APPROVAL_MESSAGE: &str = "I need approval before I can do that.";
 
+/// How the caller is asked before one of the agent's tools runs under an approval policy
+/// (spec 029 §7.3, `tool_confirmations`). Each field is published only when the author set it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolConfirmation {
+    /// The verb phrase of the read-back ("refund the order"); else the tool's name.
+    pub phrase: Option<String>,
+    /// The read-back in the author's words, with `{argument}` slots.
+    pub template: Option<String>,
+    /// Whether a strong "yes" is needed; absent: it is.
+    pub irreversible: Option<bool>,
+}
+
 /// One agent version's voice projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VoiceAgentEntry {
@@ -285,6 +298,10 @@ pub struct VoiceAgentEntry {
     /// The agent's interaction-mode block (`true` or an object), as published. Kept as raw JSON:
     /// the gateway's lenient parser reads it, so one value it does not know never costs the entry.
     pub interaction: Option<Value>,
+    /// `{tool name: wording}` for the tools a caller approves by voice (spec 029 §7.3).
+    /// `None` when the entry carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_confirmations: Option<HashMap<String, ToolConfirmation>>,
 }
 
 impl VoiceAgentEntry {
@@ -316,6 +333,11 @@ impl VoiceAgentEntry {
                     || key.ends_with(&format!(":{tool_name}"))
             })
             .and_then(|(_, phrases)| phrases.first().map(String::as_str))
+    }
+
+    /// The author's wording for asking the caller before `tool_name` runs, when there is one.
+    pub fn tool_confirmation(&self, tool_name: &str) -> Option<&ToolConfirmation> {
+        self.tool_confirmations.as_ref()?.get(tool_name)
     }
 }
 
@@ -373,6 +395,7 @@ const KNOWN_FIELDS: &[&str] = &[
     "tool_status_messages",
     "allow_preemptive",
     "interaction",
+    "tool_confirmations",
 ];
 
 /// Parse one `voice_agent:` blob.
@@ -470,6 +493,7 @@ pub fn parse_voice_agent_blob(raw: &str) -> Result<VoiceAgentEntry, String> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         interaction: obj.get("interaction").filter(|v| !v.is_null()).cloned(),
+        tool_confirmations: block(&obj, "tool_confirmations", &key),
         prompt_id,
         version,
     })
@@ -609,6 +633,46 @@ mod tests {
         assert_eq!(on.interaction, Some(Value::Bool(true)));
         let off = parse_voice_agent_blob(FIXTURE).unwrap();
         assert_eq!((on.prompt_id, on.version), (off.prompt_id, off.version));
+    }
+
+    /// Spec 029 §7.3: `tool_confirmations` is additive. Absent, `null` or malformed it is
+    /// `None` (the rest of the entry stands); a key a newer budapp adds is ignored.
+    #[test]
+    fn the_tool_confirmations_are_read_when_published() {
+        let entry = |extra: &str| {
+            let raw = format!(
+                r#"{{"prompt_id":"p","version":1,"stt":{{"endpoint_id":"s"}},"tts":{{"endpoint_id":"t"}}{extra}}}"#
+            );
+            parse_voice_agent_blob(&raw).expect("entry parses")
+        };
+        assert_eq!(entry("").tool_confirmations, None);
+        assert_eq!(
+            entry(r#","tool_confirmations":null"#).tool_confirmations,
+            None
+        );
+        let e = entry(
+            r#","tool_confirmations":{"refund_order":{"phrase":"refund the order","template":"refund order {order_id}","irreversible":false,"new":1},"create-ticket":{}}"#,
+        );
+        let confirmations = e.tool_confirmations.as_ref().expect("read");
+        assert_eq!(
+            confirmations["refund_order"],
+            ToolConfirmation {
+                phrase: Some("refund the order".into()),
+                template: Some("refund order {order_id}".into()),
+                irreversible: Some(false),
+            }
+        );
+        assert_eq!(confirmations["create-ticket"], ToolConfirmation::default());
+        assert_eq!(
+            e.tool_confirmation("refund_order")
+                .and_then(|c| c.irreversible),
+            Some(false)
+        );
+        assert_eq!(e.tool_confirmation("lookup_order"), None);
+        // Malformed: the entry stands without it.
+        let bad = entry(r#","tool_confirmations":{"refund_order":{"phrase":7}}"#);
+        assert_eq!(bad.tool_confirmations, None);
+        assert_eq!(bad.approval_message, DEFAULT_APPROVAL_MESSAGE);
     }
 
     #[test]

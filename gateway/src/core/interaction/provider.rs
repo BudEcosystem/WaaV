@@ -278,6 +278,7 @@ pub fn spawn(
         background.own_tools(),
         background.max_concurrent(),
     );
+    registry.set_confirmations(background.confirmations());
     let (voiced, rendered) = mpsc::unbounded_channel();
     let pool = (deps.server.front_model.as_ref())
         .filter(|front| front.command.is_none())
@@ -1431,6 +1432,7 @@ impl Session {
             handle: None,
             state: None,
             turn: None,
+            after: None,
         };
         self.background.clone().start(job, self.tx.clone(), cancel);
     }

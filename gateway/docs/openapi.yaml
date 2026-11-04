@@ -2988,7 +2988,9 @@ components:
             enum:
             - assistant_transcript
       - type: object
-        description: 'Voice agent: a server-side tool''s progress (`in_progress`, `completed`, `failed`).'
+        description: |-
+          Voice agent: a server-side tool's progress (`in_progress`, `completed`, `failed`). A
+          finished tool also says how long it ran and, when it failed and said why, the error.
         required:
         - turn_index
         - item_id
@@ -2996,6 +2998,16 @@ components:
         - status
         - type
         properties:
+          duration_ms:
+            type:
+            - integer
+            - 'null'
+            format: int64
+            minimum: 0
+          error:
+            type:
+            - string
+            - 'null'
           item_id:
             type: string
           name:
@@ -3073,6 +3085,9 @@ components:
         properties:
           kind:
             type: string
+          metrics:
+            type: object
+            description: A voice agent turn's timings (`ttft_ms`, `ttfa_ms`, `total_ms`, `tools`).
           response_id:
             type:
             - string

@@ -46,6 +46,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use waav_gateway::config::{DAGTimeoutsConfig, PluginConfig};
+use waav_gateway::observability::voice_attrs::span_names;
 use waav_gateway::{ServerConfig, state::AppState};
 
 // =============================================================================================
@@ -329,6 +330,21 @@ fn names(spans: &[SpanData]) -> Vec<String> {
 }
 
 #[track_caller]
+/// The call's one record span, whatever kind of record it is (`voice.speech`, `voice.transcription`).
+fn only_record(spans: &[SpanData]) -> &SpanData {
+    let found: Vec<&SpanData> = spans
+        .iter()
+        .filter(|s| span_names::ALL.contains(&&*s.name))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one record span, exported: {:?}",
+        names(spans)
+    );
+    found[0]
+}
+
 fn only<'a>(spans: &'a [SpanData], name: &str) -> &'a SpanData {
     let found: Vec<&SpanData> = spans.iter().filter(|s| s.name == name).collect();
     assert_eq!(
@@ -896,7 +912,7 @@ fn check_root(
     vendor_model: Option<&str>,
 ) {
     let root = root_of(spans);
-    let turn = only(spans, "voice.turn");
+    let turn = only_record(spans);
     let want_name = format!("POST {route}");
     f.check(root.name == want_name.as_str(), || {
         format!("{ctx}: root is named {:?}, want {want_name:?}", root.name)
@@ -1027,7 +1043,7 @@ async fn tts_success_records_identity_units_cost_and_the_server_root() {
     assert_eq!(reply.body.len(), 48_000);
 
     let spans = cap.take().await;
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     let mut f = Findings::default();
     let ctx = "tts success";
     f.present(ctx, turn, TTS_SUCCESS);
@@ -1133,7 +1149,7 @@ async fn a_published_deployment_serves_a_customer_key_attributed_to_both_project
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
 
     let spans = cap.take().await;
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     let root = root_of(&spans);
     let mut f = Findings::default();
     for (ctx, span) in [("published turn", turn), ("published root", root)] {
@@ -1184,7 +1200,7 @@ async fn an_endpoint_id_outside_the_callers_allowlist_is_not_found() {
         let reply = speech_as(&app, bearer, body(TTS_EP)).await;
         assert_eq!(reply.status, StatusCode::OK, "{bearer}: {}", reply.text());
         let spans = cap.take().await;
-        let turn = only(&spans, "voice.turn");
+        let turn = only_record(&spans);
         let mut f = Findings::default();
         // Named by id, attributed through the entry that reaches it (no longer DEG-3's gap).
         f.eq_text(bearer, turn, MODEL_ID, Some(TTS_MODEL_ID));
@@ -1244,7 +1260,7 @@ async fn stt_success_records_the_same_on_transcription_and_translation() {
         assert_eq!(reply.status, StatusCode::OK, "{route}: {}", reply.text());
 
         let spans = cap.take().await;
-        let turn = only(&spans, "voice.turn");
+        let turn = only_record(&spans);
         let ctx = capability;
         f.present(ctx, turn, STT_SUCCESS);
         f.eq_text(ctx, turn, CAPABILITY, Some(capability));
@@ -1334,7 +1350,7 @@ async fn minute_and_request_pricing() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     let spans = cap.take().await;
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     f.eq_number("stt minute", turn, AUDIO_SECONDS, Some(90.0));
     // 90 s / 60 × 0.0043
     f.eq_number("stt minute", turn, COST, Some(0.00645));
@@ -1347,7 +1363,7 @@ async fn minute_and_request_pricing() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     let spans = cap.take().await;
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     f.eq_number("tts request", turn, COST, Some(0.002));
     f.eq_text("tts request", turn, PRICING_UNIT, Some("request"));
     f.assert_none();
@@ -1426,7 +1442,7 @@ async fn unpriced_calls_record_no_cost() {
             format!("{ctx}: HTTP {} {}", reply.status, reply.text())
         });
         let spans = cap.take().await;
-        let turn = only(&spans, "voice.turn");
+        let turn = only_record(&spans);
         f.absent(ctx, turn, &[COST, PRICING_UNIT]);
         f.present(
             ctx,
@@ -1456,7 +1472,7 @@ async fn a_raw_endpoint_id_is_attributed_through_the_entry_that_reaches_it() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     let spans = cap.take().await;
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     let mut f = Findings::default();
     f.eq_text("raw id", turn, ENDPOINT_ID, Some(TTS_EP));
     f.eq_text("raw id", turn, ENDPOINT_NAME, Some(TTS_EP));
@@ -1481,7 +1497,10 @@ fn check_failure(
     want_class: &str,
     want_vendor_status: Option<u16>,
 ) {
-    let turns: Vec<&SpanData> = spans.iter().filter(|s| s.name == "voice.turn").collect();
+    let turns: Vec<&SpanData> = spans
+        .iter()
+        .filter(|s| span_names::ALL.contains(&&*s.name))
+        .collect();
     let Some(turn) = turns.first().copied() else {
         f.check(false, || {
             format!(
@@ -1905,9 +1924,10 @@ async fn a_refusal_before_resolution_has_a_root_and_no_turn() {
     assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.text());
     let spans = cap.take().await;
     let mut f = Findings::default();
-    f.check(!spans.iter().any(|s| s.name == "voice.turn"), || {
-        "an unresolved model produced a voice.turn".to_string()
-    });
+    f.check(
+        !spans.iter().any(|s| span_names::ALL.contains(&&*s.name)),
+        || "an unresolved model produced a voice.turn".to_string(),
+    );
     let root = root_of(&spans);
     f.check(
         root.name == "POST /v1/audio/speech" && root.span_kind == SpanKind::Server,
@@ -1963,7 +1983,7 @@ async fn tts_ttfb_is_the_vendors_first_audio() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     let spans = cap.take().await;
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     let ttfb = number(turn, TTS_TTFB);
     let duration = number(turn, TTS_DURATION);
     assert!(
@@ -2027,7 +2047,7 @@ async fn tts_output_duration_for_wav_and_compressed_formats() {
         .await;
         assert_eq!(reply.status, StatusCode::OK, "{ctx}: {}", reply.text());
         let spans = cap.take().await;
-        let turn = only(&spans, "voice.turn");
+        let turn = only_record(&spans);
         f.eq_number(ctx, turn, OUTPUT_AUDIO_SECONDS, want_secs);
         f.eq_number(ctx, turn, SAMPLE_RATE, want_rate);
         f.eq_text(ctx, turn, AUDIO_FORMAT, Some(format));
@@ -2279,7 +2299,7 @@ async fn child_capture_off() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     let spans = cap.take().await;
-    f.present("tts, capture off", only(&spans, "voice.turn"), TTS_SUCCESS);
+    f.present("tts, capture off", only_record(&spans), TTS_SUCCESS);
     for s in &spans {
         f.absent("tts, capture off", s, &[REQUEST_BODY, RESPONSE_BODY]);
     }
@@ -2293,7 +2313,7 @@ async fn child_capture_off() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     let spans = cap.take().await;
-    f.present("stt, capture off", only(&spans, "voice.turn"), STT_SUCCESS);
+    f.present("stt, capture off", only_record(&spans), STT_SUCCESS);
     for s in &spans {
         f.absent("stt, capture off", s, &[REQUEST_BODY, RESPONSE_BODY]);
     }
@@ -2343,7 +2363,7 @@ async fn child_server_span_off() {
         root,
         &["http.route", PROJECT_ID, REQUEST_BODY],
     );
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     f.present("server span off", turn, TTS_SUCCESS);
     f.eq_text("server span off", turn, ENDPOINT_ID, Some(TTS_EP));
     f.assert_none();
@@ -2598,7 +2618,7 @@ fn check_vendor<'a>(
         )
     });
     let vendor = *clients.first()?;
-    let turn = only(spans, "voice.turn");
+    let turn = only_record(spans);
     f.check(vendor.name == want.name, || {
         format!(
             "{ctx}: vendor span is named {:?}, want {:?}",
@@ -3553,7 +3573,7 @@ async fn a_fallback_served_synthesis_records_each_key_once() {
         "the fallback must have served"
     );
     let spans = cap.take().await;
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     let root = root_of(&spans);
     for (key, want) in [
         (TTS_VENDOR, "openai_compatible"),
@@ -3590,7 +3610,7 @@ async fn a_fallback_served_transcription_records_each_key_once() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     let spans = cap.take().await;
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     let root = root_of(&spans);
     for (key, want) in [
         (STT_VENDOR, "openai_compatible"),
@@ -3621,7 +3641,7 @@ async fn a_chain_that_fails_everywhere_keeps_the_primary_leg_once() {
     .await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.text());
     let spans = cap.take().await;
-    let turn = only(&spans, "voice.turn");
+    let turn = only_record(&spans);
     for (key, want) in [
         (TTS_VENDOR, "self_hosted"),
         (TTS_MODEL, TTS_VENDOR_MODEL),
@@ -3806,7 +3826,7 @@ async fn the_detected_language_is_normalized() {
             format!("{said}: HTTP {} {}", reply.status, reply.text())
         });
         let spans = cap.take().await;
-        let turn = only(&spans, "voice.turn");
+        let turn = only_record(&spans);
         f.eq_text(said, turn, DETECTED_LANGUAGE, Some(want));
     }
     f.assert_none();

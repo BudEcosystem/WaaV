@@ -122,28 +122,44 @@ pub async fn mint(
         })?
         .to_string();
 
-    let resolved = state
-        .resolve_voice_endpoint(&model, REALTIME_CAPABILITY, Some(credential.expose()))
-        .ok_or_else(|| {
-            HandshakeError::new(
-                StatusCode::FORBIDDEN,
-                "model_not_allowed",
-                format!("Model '{model}' is not a realtime deployment this credential can reach."),
-            )
-            .param("session.model")
-        })?;
-
-    // Validate the rest of `session` against the deployment's policy (§5.5). Echoed, not bound
-    // (DEG-3).
-    let rules = ClientRules::from_settings(resolved.endpoint.config.realtime.as_ref());
-    let probe = serde_json::json!({"type": "session.update", "session": session}).to_string();
-    if let ClientOutcome::Refuse(r) = policy::client_event(&probe, &rules) {
-        return Err(HandshakeError::new(
-            StatusCode::BAD_REQUEST,
-            "event_not_allowed",
-            r.message,
-        ));
-    }
+    let not_allowed = || {
+        HandshakeError::new(
+            StatusCode::FORBIDDEN,
+            "model_not_allowed",
+            format!("Model '{model}' is not a realtime deployment this credential can reach."),
+        )
+        .param("session.model")
+    };
+    // A voice agent (`prompt:<name>`): the agent handshake's own check, with this credential.
+    // Its secret seals the credential itself, which the agent's turns run with; a deployment's
+    // never does (its vendor is reached with the deployment's own key).
+    let agent = super::cascade::is_agent_model(&model);
+    let (ep, cred) = if agent {
+        let resolved = state
+            .resolve_voice_agent(&model, credential.expose())
+            .await
+            .map_err(|_| not_allowed())?;
+        (
+            resolved.alias,
+            Some(ephemeral::SealedCredential::new(credential.expose())),
+        )
+    } else {
+        let resolved = state
+            .resolve_voice_endpoint(&model, REALTIME_CAPABILITY, Some(credential.expose()))
+            .ok_or_else(not_allowed)?;
+        // Validate the rest of `session` against the deployment's policy (§5.5). Echoed, not
+        // bound (DEG-3).
+        let rules = ClientRules::from_settings(resolved.endpoint.config.realtime.as_ref());
+        let probe = serde_json::json!({"type": "session.update", "session": session}).to_string();
+        if let ClientOutcome::Refuse(r) = policy::client_event(&probe, &rules) {
+            return Err(HandshakeError::new(
+                StatusCode::BAD_REQUEST,
+                "event_not_allowed",
+                r.message,
+            ));
+        }
+        (resolved.endpoint_id, None)
+    };
 
     // The parent's lifetime caps the secret's (TC-EK-12).
     let mut exp = now + seconds;
@@ -177,12 +193,13 @@ pub async fn mint(
         v: 1,
         iat: now,
         exp,
-        ep: resolved.endpoint_id.clone(),
+        ep,
         alias: model.clone(),
         parent,
         pid: caller.principal.project_id.clone(),
         uid: caller.principal.user_id.clone(),
         akid: caller.principal.api_key_id.clone(),
+        cred,
     };
     let value = keys
         .seal(&claims)

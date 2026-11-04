@@ -1,8 +1,9 @@
 //! Recording one voice call on its spans (FRD-021 §6.1, §6.7, §6.8).
 //!
 //! A `/v1/audio/*` call has two spans: the HTTP SERVER root that `request_id_middleware` opens,
-//! and the `voice.turn` child the handler opens. `voice.turn` is the analytics source — budmetrics'
-//! ingest keys on its name — and the root is what the trace listing shows and filters on. The
+//! and the record child the handler opens (`voice.speech` or `voice.transcription`,
+//! [`crate::observability::voice_attrs::span_names`]). The record is the analytics source — budmetrics' ingest keys on
+//! its name — and the root is what the trace listing shows and filters on. The
 //! attribution, units, cost and error class they share are written through [`VoiceSpans`] so the
 //! two cannot disagree: one call records both, and the root takes exactly the keys in
 //! [`ROOT_MIRRORED`], which [`server_root_span`] declares.
@@ -317,7 +318,7 @@ pub struct Leg {
     pub noise_suppression: Option<bool>,
 }
 
-/// The spans of one HTTP voice call: `voice.turn`, and the SERVER root when there is one.
+/// The spans of one HTTP voice call: its record span, and the SERVER root when there is one.
 pub struct VoiceSpans {
     turn: Span,
     root: Option<Span>,
@@ -329,7 +330,7 @@ pub struct VoiceSpans {
 }
 
 impl VoiceSpans {
-    /// Open `voice.turn` for an HTTP call, beneath the current span (the root).
+    /// Open the record span for an HTTP call, beneath the current span (the root).
     pub fn open(capability: &'static str, root: &Root) -> Self {
         let turn = crate::voice_turn_span!(capability = capability, transport = "http");
         if let Some(r) = root.span() {
@@ -617,7 +618,7 @@ mod tests {
             );
             spans.fail(VoiceErrorType::RateLimited, Some(429), "slow down");
         });
-        let turn_fields = &seen["voice.turn"];
+        let turn_fields = &seen["voice.speech"];
         let root = &seen["http.server"];
         for key in [
             turn::CAPABILITY,
@@ -717,7 +718,7 @@ mod tests {
             span.record(leg::TTS_VENDOR, "elevenlabs");
             span.record(leg::TTS_VENDOR, "deepgram");
         });
-        let turn = exported::named(&spans, "voice.turn");
+        let turn = exported::named(&spans, "voice.speech");
         assert_eq!(
             exported::values(turn, leg::TTS_VENDOR),
             ["elevenlabs", "deepgram"]
@@ -754,7 +755,7 @@ mod tests {
                 Some("ep-fallback"),
             );
         });
-        let turn = exported::named(&spans, "voice.turn");
+        let turn = exported::named(&spans, "voice.speech");
         for (key, want) in [
             (leg::TTS_VENDOR, "deepgram"),
             (leg::TTS_MODEL, "aura-2"),
@@ -812,7 +813,7 @@ mod tests {
                 },
             );
         });
-        let turn = exported::named(&spans, "voice.turn");
+        let turn = exported::named(&spans, "voice.transcription");
         assert_eq!(exported::values(turn, leg::STT_VENDOR), ["elevenlabs"]);
         assert!(exported::values(turn, leg::STT_MODEL).is_empty());
         assert!(exported::values(turn, leg::TTS_VOICE).is_empty());
@@ -842,7 +843,7 @@ mod tests {
             spans.update_leg(|l| l.voice = Some("George".into()));
             spans.fail(VoiceErrorType::Vendor5xx, Some(503), "down");
         });
-        let turn = exported::named(&spans, "voice.turn");
+        let turn = exported::named(&spans, "voice.speech");
         assert_eq!(exported::values(turn, leg::TTS_VENDOR), ["elevenlabs"]);
         assert_eq!(exported::values(turn, leg::TTS_MODEL), ["eleven_v3"]);
         assert_eq!(exported::values(turn, leg::TTS_VOICE), ["George"]);

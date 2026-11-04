@@ -1082,6 +1082,33 @@
           "tags": ["hitl:continuation"]
         }
       ]
+    },
+    {
+      "id": "T24",
+      "persona": "travel",
+      "summary": "A second, independent request said while the first task runs (\"while you're checking that, also ...\"), then a real change of the running task.",
+      "origin": ["live pde-ditto 2026-11-03"],
+      "caller": {},
+      "decisions": [
+        {
+          "id": "T24.d1", "trigger": "user_turn_ended", "time": {"elapsed_s": 30},
+          "said": [{"text": "Okay, let me check flights to Denver on Friday."}],
+          "user": {"text": "While you're checking that, can you also check hotels in Denver for Friday night?", "confidence": 0.94},
+          "tasks": [{"alias": "t1", "state": "working", "title": "flights to Denver on Friday", "elapsed_s": 12}],
+          "gold": {"act": "delegate", "alternatives": [], "related": null, "say": "Okay, let me check hotels in Denver for Friday night."},
+          "forbidden": {"acts": ["update", "follow_up", "question"], "patterns": ["^(Yes|No|Sure|Of course|Yep)\\b"]},
+          "tags": ["hitl:new_request_while_running", "parallel_tasks"]
+        },
+        {
+          "id": "T24.d2", "trigger": "user_turn_ended", "time": {"elapsed_s": 41},
+          "said": [{"text": "Okay, let me check hotels in Denver for Friday night."}],
+          "user": {"text": "Actually, make the flight Saturday instead.", "confidence": 0.94},
+          "tasks": [{"alias": "t1", "state": "working", "title": "flights to Denver on Friday", "elapsed_s": 23}, {"alias": "t2", "state": "working", "title": "hotels in Denver for Friday night", "elapsed_s": 9}],
+          "gold": {"act": "update", "alternatives": [], "task": "t1", "say": "Got it, Saturday."},
+          "forbidden": {"acts": ["delegate"]},
+          "tags": ["correction", "parallel_tasks"]
+        }
+      ]
     }
   ]
 }

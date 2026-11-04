@@ -697,6 +697,7 @@ pub async fn handle_config_message(
                         let mut guard = state.write().await;
                         guard.leg_meter = Some(Arc::clone(&meter));
                         guard.leg_admissions = legs.admissions;
+                        meter.set_route(guard.route);
                     }
                     let m = Arc::clone(&meter);
                     vm.set_speak_observer(Arc::new(move |text: &str| m.tts_spoken(text)));
@@ -2117,7 +2118,7 @@ async fn initialize_conversation_loop(
     {
         let (signal_tx, signal_rx) = mpsc::unbounded_channel();
         orchestrator.set_turn_signals(signal_tx);
-        super::agent::spawn_signal_forwarder(signal_rx, message_tx.clone(), tracker);
+        super::agent::spawn_signal_forwarder(signal_rx, message_tx.clone(), tracker, None);
     }
 
     // S3 (docs/research/REALTIME_REASONING.md §5): wire the async-tool final sink so an async
@@ -2984,6 +2985,12 @@ async fn initialize_voice_manager(
     if defer_turn_models {
         voice_manager.defer_smart_turn();
     }
+    // A Bud session traces its STT connection beneath the session span: the URL, what it asked
+    // for, and the vendor's error if it would not connect.
+    if let Some(scope) = bud_legs.and_then(|legs| legs.meter.stt_connection_scope()) {
+        voice_manager.set_stt_vendor_scope(scope);
+    }
+
     // Start voice manager (callbacks above are live for any connect-time error)
     if let Err(e) = voice_manager.start().await {
         error!("Failed to start voice manager: {}", e);

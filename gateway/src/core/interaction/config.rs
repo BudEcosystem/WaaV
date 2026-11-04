@@ -287,6 +287,11 @@ pub enum Tri {
     Off,
 }
 
+/// `background.max_parallel` unless declared: a Bud agent's tasks that run at once.
+pub const DEFAULT_MAX_PARALLEL: u32 = 3;
+/// The most `background.max_parallel` takes.
+pub const MAX_PARALLEL_TOP: u32 = 16;
+
 #[derive(Clone, PartialEq)]
 pub struct TasksConfig {
     /// Raw `/ws` sessions only: the same JSON shape as `conversation_config`. The `/ws`
@@ -297,6 +302,10 @@ pub struct TasksConfig {
     /// `background.answer_marker`: the line a Bud agent is known to write before its final
     /// answer. Only the agent's entry or the operator can declare it.
     pub answer_marker: Option<String>,
+    /// `background.max_parallel`: how many of the caller's requests a Bud agent runs at once
+    /// (1 to [`MAX_PARALLEL_TOP`], 3 unless declared). Only the agent's entry or the operator
+    /// can declare it.
+    pub max_parallel: u32,
     /// How long a caller whose connection dropped may come back, with the same `stream_id`,
     /// for the result of a task that went on without them.
     pub reconnect_grace_s: u32,
@@ -369,6 +378,7 @@ impl Default for TasksConfig {
             tools: Vec::new(),
             speculative_start: Tri::default(),
             answer_marker: None,
+            max_parallel: DEFAULT_MAX_PARALLEL,
             reconnect_grace_s: 60,
             push_url: None,
             push_secret: None,
@@ -395,6 +405,7 @@ impl fmt::Debug for TasksConfig {
             .field("tools", &self.tools)
             .field("speculative_start", &self.speculative_start)
             .field("answer_marker", &self.answer_marker)
+            .field("max_parallel", &self.max_parallel)
             .field("reconnect_grace_s", &self.reconnect_grace_s)
             // A push address may carry a credential of its own (its query, its user info).
             .field("push_url", &self.push_url.is_some())
@@ -1354,6 +1365,9 @@ impl Walk {
                     if let Some(marker) = self.text(value, &path, 40) {
                         self.set(&path, &mut tasks.answer_marker, Some(marker));
                     }
+                }
+                "max_parallel" => {
+                    self.number(value, &path, 1..=MAX_PARALLEL_TOP, &mut tasks.max_parallel)
                 }
                 _ => self.unknown(&path),
             }
@@ -4195,6 +4209,30 @@ mod tests {
             let (cfg, warnings) = parse(&raw, &on(), operator);
             assert_eq!(cfg.unwrap().tasks.answer_marker, None);
             assert_eq!(warnings[0].code, "interaction_value_ignored");
+        }
+    }
+
+    #[test]
+    fn only_the_agent_or_the_operator_sets_how_many_agent_tasks_run_at_once() {
+        let operator = ParseCtx {
+            operator: true,
+            bud_mode: true,
+        };
+        assert_eq!(TasksConfig::default().max_parallel, 3);
+        let raw = json!({ "background": { "max_parallel": 5 } });
+        let (cfg, warnings) = parse(&raw, &on(), operator);
+        assert_eq!(cfg.unwrap().tasks.max_parallel, 5);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // A session's own block cannot.
+        let (cfg, warnings) = parse(&raw, &on(), ParseCtx::default());
+        assert_eq!(cfg.unwrap().tasks.max_parallel, 3);
+        assert_eq!(warnings[0].code, "interaction_override_refused");
+        // At least one, and no more than the top.
+        for bad in [json!(0), json!(17), json!("3"), json!(-1)] {
+            let raw = json!({ "background": { "max_parallel": bad } });
+            let (cfg, warnings) = parse(&raw, &on(), operator);
+            assert_eq!(cfg.unwrap().tasks.max_parallel, 3, "{bad}");
+            assert_eq!(warnings[0].code, "interaction_value_ignored", "{bad}");
         }
     }
 

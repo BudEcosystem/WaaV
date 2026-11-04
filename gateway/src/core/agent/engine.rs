@@ -32,7 +32,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-use super::brain::{AgentBrain, AgentEvent, AgentTurnRequest, ClientExtras, Truncate, TurnFailure};
+use super::brain::{
+    AgentBrain, AgentEvent, AgentTurnRequest, ApprovalVote, ClientExtras, Truncate, TurnFailure,
+};
 use super::spoken::{SpeechRate, SpokenLedger};
 use super::text::{
     CodeFenceFilter, SpeakFieldExtractor, SpeechChunker, chunk_separator, transform_for_speech,
@@ -116,7 +118,27 @@ pub trait TurnBackend: Send + Sync + 'static {
         bearer: &str,
         traceparent: Option<&str>,
     ) -> Result<BoxStream<'static, Result<AgentEvent, TurnFailure>>, TurnFailure>;
-    async fn cancel(&self, response_id: &str, prompt_name: &str, bearer: &str);
+    /// `traceparent`: the turn's, so the cancel is part of the turn's trace.
+    async fn cancel(
+        &self,
+        response_id: &str,
+        prompt_name: &str,
+        bearer: &str,
+        traceparent: Option<&str>,
+    );
+    /// The caller's vote on a tool call the turn holds (spec 029 §7.3), with the turn's bearer
+    /// and `traceparent`. A backend that holds no calls takes none.
+    async fn vote(
+        &self,
+        _vote: &ApprovalVote,
+        _prompt_name: &str,
+        _bearer: &str,
+        _traceparent: Option<&str>,
+    ) -> Result<(), TurnFailure> {
+        Err(TurnFailure::BadRequest(
+            "this backend takes no approval votes".to_owned(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -131,8 +153,23 @@ impl TurnBackend for AgentBrain {
             .await
             .map(|s| s.boxed())
     }
-    async fn cancel(&self, response_id: &str, prompt_name: &str, bearer: &str) {
-        AgentBrain::cancel(self, response_id, prompt_name, bearer).await
+    async fn cancel(
+        &self,
+        response_id: &str,
+        prompt_name: &str,
+        bearer: &str,
+        traceparent: Option<&str>,
+    ) {
+        AgentBrain::cancel(self, response_id, prompt_name, bearer, traceparent).await
+    }
+    async fn vote(
+        &self,
+        vote: &ApprovalVote,
+        prompt_name: &str,
+        bearer: &str,
+        traceparent: Option<&str>,
+    ) -> Result<(), TurnFailure> {
+        AgentBrain::vote(self, vote, prompt_name, bearer, traceparent).await
     }
 }
 
@@ -187,12 +224,16 @@ pub enum AgentSignal {
     ResponseCreated { turn: u64, response_id: String },
     /// Text as it is SPOKEN (audio mode) or generated (text mode).
     Transcript { turn: u64, delta: String },
-    /// A server-side tool's progress: `in_progress`, `completed` or `failed`.
+    /// A server-side tool's progress: `in_progress`, `completed` or `failed`. A finished tool
+    /// carries how long it ran (from its start item to its done item) and, when it failed and
+    /// said why, the error text.
     Tool {
         turn: u64,
         item_id: String,
         name: String,
         status: &'static str,
+        duration_ms: Option<u64>,
+        error: Option<String>,
     },
     /// A call to a function the session declared: the client runs it.
     FunctionCall {
@@ -216,6 +257,9 @@ pub enum AgentSignal {
         usage: Option<Value>,
         /// What the caller heard (audio mode) or was shown (text mode).
         transcript: String,
+        /// How long the run took to answer, speak and end. An agent turn's only (`None` for a
+        /// greeting and for a turn the engine did not run).
+        metrics: Option<TurnMetrics>,
     },
     /// The reply was cut: history keeps `spoken` (+ marker) from the next turn on.
     Truncated {
@@ -228,6 +272,28 @@ pub enum AgentSignal {
     Error { code: &'static str, message: String },
     /// The caller was silent for `idle.end_after_silence_ms`: the front-end ends the session.
     Idle,
+}
+
+/// One agent turn's timings, measured from the moment its request started. Each is `None` when
+/// the turn never got that far (no token, no audio): nothing here is estimated.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+pub struct TurnMetrics {
+    /// Request start → the first token of the agent's text.
+    pub ttft_ms: Option<u64>,
+    /// Request start → the first chunk of the answer handed to speech (`None` in text mode).
+    pub ttfa_ms: Option<u64>,
+    /// Request start → the turn's end (its audio drained, or the cut).
+    pub total_ms: u64,
+    /// The server-side tools that finished during the turn, in the order they finished.
+    pub tools: Vec<ToolMetric>,
+}
+
+/// A finished tool of a turn.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ToolMetric {
+    pub name: String,
+    pub duration_ms: u64,
+    pub ok: bool,
 }
 
 // =============================================================================================
@@ -247,6 +313,9 @@ pub struct AgentSessionConfig {
     pub variables: Option<Map<String, Value>>,
     /// GA `output_modalities: ["text"]`: no TTS; text goes to the client as it streams.
     pub text_only: bool,
+    /// The session's `voice.ws_session` span: each turn links to it, as the session's billed records
+    /// do, so Observability shows the turn inside its session.
+    pub session_link: Option<opentelemetry::trace::SpanContext>,
 }
 
 /// Backoff before each retry of a turn whose request never reached the agent.
@@ -391,6 +460,38 @@ struct TurnShared {
     transcript: String,
     /// Set once this turn has been truncated, so a later estimate never overrides an exact one.
     truncated_exact: bool,
+    /// An agent run's timings (`None` for a greeting or a notice).
+    timing: Option<TurnTiming>,
+}
+
+/// What an agent turn measured so far, from the start of its request.
+#[derive(Debug)]
+struct TurnTiming {
+    started: Instant,
+    first_token: Option<Duration>,
+    first_audio: Option<Duration>,
+    tools: Vec<ToolMetric>,
+}
+
+impl TurnTiming {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            first_token: None,
+            first_audio: None,
+            tools: Vec::new(),
+        }
+    }
+
+    fn metrics(&self) -> TurnMetrics {
+        let ms = |d: Duration| d.as_millis() as u64;
+        TurnMetrics {
+            ttft_ms: self.first_token.map(ms),
+            ttfa_ms: self.first_audio.map(ms),
+            total_ms: ms(self.started.elapsed()),
+            tools: self.tools.clone(),
+        }
+    }
 }
 
 impl TurnShared {
@@ -402,6 +503,7 @@ impl TurnShared {
             generated: String::new(),
             transcript: String::new(),
             truncated_exact: false,
+            timing: None,
         }
     }
 }
@@ -436,6 +538,8 @@ pub struct AgentEngine {
     manual_override: Mutex<Option<bool>>,
     /// What the session adds to the agent's runs; its items go with the next run.
     extras: Mutex<ClientExtras>,
+    /// `session.bud_context`: message items for the first run only (see [`Self::set_context`]).
+    context: Mutex<Vec<Value>>,
     /// Segmented sessions: the latest caller turn whose final transcript was handled, so a client
     /// commit waits for the transcript of the turn it sealed instead of a fixed sleep.
     final_turn: tokio::sync::watch::Sender<u64>,
@@ -495,6 +599,7 @@ impl AgentEngine {
             manual_input: Mutex::new(String::new()),
             manual_override: Mutex::new(None),
             extras: Mutex::new(ClientExtras::default()),
+            context: Mutex::new(Vec::new()),
             final_turn: tokio::sync::watch::channel(0).0,
         })
     }
@@ -650,6 +755,22 @@ impl AgentEngine {
     /// GA `session.instructions`, sent with every run from now on.
     pub fn set_instructions(&self, instructions: Option<String>) {
         self.extras.lock().instructions = instructions;
+    }
+
+    /// The conversation so far, from before this voice session (GA `session.bud_context`): message
+    /// items that go ahead of the first run's input, and with it into the voice conversation.
+    /// Refused once a turn ran: the conversation has started without them.
+    pub fn set_context(&self, items: Vec<Value>) -> Result<(), &'static str> {
+        // Checked under the lock the first run takes the context with: a run that started has
+        // either taken it already, or will take this.
+        let mut context = self.context.lock();
+        if self.started.load(Ordering::Acquire) {
+            return Err(
+                "The conversation has started: `bud_context` is taken only before the first turn.",
+            );
+        }
+        *context = items;
+        Ok(())
     }
 
     /// An input item for the next run: a client tool's output, a system note.
@@ -835,7 +956,7 @@ impl AgentEngine {
             let backend = Arc::clone(&self.backend);
             let name = self.cfg.lock().prompt_name.clone();
             let bearer = self.credential.current();
-            tokio::spawn(async move { backend.cancel(&rid, &name, &bearer).await });
+            tokio::spawn(async move { backend.cancel(&rid, &name, &bearer, None).await });
         }
         if still_live && !self.is_closed() {
             let text_only = self.cfg.lock().text_only;
@@ -1009,14 +1130,20 @@ impl AgentEngine {
             let c = self.cfg.lock();
             (c.clone(), c.text_only)
         };
-        let span = agent_turn_span(&cfg, id, &input, None);
+        let span = agent_turn_span(&cfg, id, &input, None, AgentSpan::Run);
         let _end = EndSpanOnDrop(span.clone());
+        shared.lock().timing = Some(TurnTiming::new(started));
+        // The conversation before the session goes first, once: a run that fails before it
+        // reaches the agent puts it back with the session's items.
+        let context = std::mem::take(&mut *self.context.lock());
         let extras = {
             let mut session = self.extras.lock();
+            let mut items = context;
+            items.append(&mut session.items);
             ClientExtras {
                 tools: session.tools.clone(),
                 instructions: instructions.or_else(|| session.instructions.clone()),
-                items: std::mem::take(&mut session.items),
+                items,
             }
         };
         // The functions the client runs, by name.
@@ -1046,6 +1173,7 @@ impl AgentEngine {
             session_id: cfg.session_id.clone(),
             turn_index: id,
             extras,
+            answer_marker: None,
         };
         let bearer = self.credential.current();
         let epoch = self.speech.clear_epoch();
@@ -1147,6 +1275,9 @@ impl AgentEngine {
                     Some(Ok(AgentEvent::TextDelta { delta, .. })) => {
                         if pump.first_token_at.is_none() {
                             pump.first_token_at = Some(started.elapsed());
+                            if let Some(t) = shared.lock().timing.as_mut() {
+                                t.first_token = pump.first_token_at;
+                            }
                         }
                         if !self.on_delta(id, &shared, &mut pump, &delta, epoch, text_only, &token).await {
                             status = TurnStatus::Cancelled;
@@ -1174,25 +1305,31 @@ impl AgentEngine {
                                 t.spoke(mark);
                             }
                         }
-                        self.signal(AgentSignal::Tool { turn: id, item_id: item_id.clone(), name: name.clone(), status: "in_progress" });
+                        self.signal(AgentSignal::Tool { turn: id, item_id: item_id.clone(), name: name.clone(), status: "in_progress", duration_ms: None, error: None });
                         if work.is_none() {
                             work = Some(ToolWork { since: Instant::now(), tool: name.clone(), phrased: false, spoken: pump.spoken });
                         }
                         tools.insert(item_id, (name, Instant::now(), false));
                     }
-                    Some(Ok(
-                        AgentEvent::ToolFinished { item_id, name, ok }
-                        | AgentEvent::FunctionCall { item_id, name, ok, .. },
-                    )) => {
-                        tools.remove(&item_id);
-                        self.signal(AgentSignal::Tool { turn: id, item_id, name, status: if ok { "completed" } else { "failed" } });
+                    Some(Ok(AgentEvent::ToolFinished { item_id, name, ok, error })) => {
+                        let since = tools.remove(&item_id).map(|(_, since, _)| since);
+                        self.tool_finished(id, &shared, since, item_id, name, ok, error);
+                    }
+                    Some(Ok(AgentEvent::FunctionCall { item_id, name, ok, .. })) => {
+                        let since = tools.remove(&item_id).map(|(_, since, _)| since);
+                        self.tool_finished(id, &shared, since, item_id, name, ok, None);
                     }
                     Some(Ok(AgentEvent::Completed { usage: u, .. })) => {
                         usage = u;
                         break;
                     }
+                    // A plain voice agent asks no questions: budprompt declines the held call
+                    // when its deadline passes, and the run goes on.
+                    Some(Ok(AgentEvent::ApprovalRequest { id: held, name, .. })) => {
+                        debug!(turn = id, approval = %held, tool = %name, "a held tool call is not asked in plain voice mode");
+                    }
                     Some(Ok(AgentEvent::Failed { code, message })) => {
-                        failure = Some(TurnFailure::Upstream(format!("{code}: {message}")));
+                        failure = Some(TurnFailure::of_run(&code, &message));
                         break;
                     }
                     Some(Ok(AgentEvent::Incomplete { status: s, reason, .. })) => {
@@ -1296,7 +1433,12 @@ impl AgentEngine {
                 let backend = Arc::clone(&self.backend);
                 let name = cfg.prompt_name.clone();
                 let bearer = self.credential.current();
-                tokio::spawn(async move { backend.cancel(&rid, &name, &bearer).await });
+                let traceparent = traceparent_of(&span);
+                tokio::spawn(async move {
+                    backend
+                        .cancel(&rid, &name, &bearer, traceparent.as_deref())
+                        .await
+                });
             }
             span.record(crate::observability::voice_attrs::turn::BARGE_IN, true);
             span.record(
@@ -1463,6 +1605,9 @@ impl AgentEngine {
         }
         if pump.first_audio_at.is_none() {
             pump.first_audio_at = Some(pump.started.elapsed());
+            if let Some(t) = shared.lock().timing.as_mut() {
+                t.first_audio = pump.first_audio_at;
+            }
         }
         pump.spoke_reply = true;
         pump.spoken += 1;
@@ -1589,6 +1734,39 @@ impl AgentEngine {
         self.rate.lock().observe(s.ledger.speech_chars(), emitted);
     }
 
+    /// A server-side tool finished: how long it ran (from its start item, when one came) goes
+    /// with its signal and into the turn's metrics.
+    #[allow(clippy::too_many_arguments)]
+    fn tool_finished(
+        &self,
+        id: u64,
+        shared: &Arc<Mutex<TurnShared>>,
+        since: Option<Instant>,
+        item_id: String,
+        name: String,
+        ok: bool,
+        error: Option<String>,
+    ) {
+        let duration_ms = since.map(|at| at.elapsed().as_millis() as u64);
+        if let Some(duration_ms) = duration_ms
+            && let Some(t) = shared.lock().timing.as_mut()
+        {
+            t.tools.push(ToolMetric {
+                name: name.clone(),
+                duration_ms,
+                ok,
+            });
+        }
+        self.signal(AgentSignal::Tool {
+            turn: id,
+            item_id,
+            name,
+            status: if ok { "completed" } else { "failed" },
+            duration_ms,
+            error,
+        });
+    }
+
     fn finish(
         self: &Arc<Self>,
         id: u64,
@@ -1603,9 +1781,14 @@ impl AgentEngine {
             }
         }
         *self.last.lock() = Some((id, Arc::clone(shared)));
-        let (kind, response_id, transcript) = {
+        let (kind, response_id, transcript, metrics) = {
             let s = shared.lock();
-            (s.kind, s.response_id.clone(), s.transcript.clone())
+            (
+                s.kind,
+                s.response_id.clone(),
+                s.transcript.clone(),
+                s.timing.as_ref().map(TurnTiming::metrics),
+            )
         };
         self.signal(AgentSignal::ResponseDone {
             turn: id,
@@ -1614,6 +1797,7 @@ impl AgentEngine {
             status,
             usage,
             transcript,
+            metrics,
         });
         self.poke_idle();
     }
@@ -1669,13 +1853,23 @@ pub(crate) fn agent_turn_span(
     turn: u64,
     input: &str,
     parent: Option<&tracing::Span>,
+    role: AgentSpan,
 ) -> tracing::Span {
     use crate::observability::voice_attrs::{realtime, turn as attr};
-    let span = crate::voice_turn_span!(
-        parent: parent.and_then(tracing::Span::id),
-        capability = "agent_turn",
-        transport = "websocket"
-    );
+    let parent_id = parent.and_then(tracing::Span::id);
+    let span = match role {
+        AgentSpan::CallerTurn => crate::voice_turn_span!(
+            named "voice.turn",
+            parent: parent_id,
+            capability = "agent_turn",
+            transport = "websocket"
+        ),
+        AgentSpan::Run => crate::voice_turn_span!(
+            parent: parent_id,
+            capability = "agent_turn",
+            transport = "websocket"
+        ),
+    };
     span.record(attr::SESSION_ID, cfg.session_id.as_str());
     span.record(attr::TURN_INDEX, turn);
     span.record(attr::ENDPOINT_NAME, cfg.prompt_name.as_str());
@@ -1683,6 +1877,13 @@ pub(crate) fn agent_turn_span(
         span.record(attr::PROJECT_ID, p);
     }
     span.record(realtime::COMPONENT, "agent");
+    // A root links to the session's `voice.ws_session`, as the session's billed records do, and
+    // Observability folds it under the session. A child belongs to its root's trace already.
+    if parent.is_none()
+        && let Some(link) = cfg.session_link.clone()
+    {
+        tracing_opentelemetry::OpenTelemetrySpanExt::add_link(&span, link);
+    }
     if crate::observability::trace_redact::capture_content() {
         span.record(
             attr::TRANSCRIPT,
@@ -1690,6 +1891,15 @@ pub(crate) fn agent_turn_span(
         );
     }
     span
+}
+
+/// What an agent's span stands for, which its name says (`voice_attrs::span_names`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentSpan {
+    /// The caller's turn whose runs the agent makes (interaction mode): `voice.turn`.
+    CallerTurn,
+    /// The agent's work on a turn: `voice.agent_turn`.
+    Run,
 }
 
 /// A turn's stream of events.
@@ -1773,7 +1983,7 @@ pub(crate) fn record_failure(span: &tracing::Span, f: &TurnFailure) {
 }
 
 /// The W3C `traceparent` of `span`, so budgateway → budprompt continue the agent turn's trace.
-fn traceparent_of(span: &tracing::Span) -> Option<String> {
+pub(crate) fn traceparent_of(span: &tracing::Span) -> Option<String> {
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     let ctx = span.context();

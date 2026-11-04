@@ -119,13 +119,35 @@ impl Turn {
     }
 
     fn text(&self) -> String {
-        [&self.held, &self.finals, &self.interim]
+        let text = [&self.held, &self.finals, &self.interim]
             .into_iter()
             .filter(|part| !part.is_empty())
             .cloned()
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" ");
+        paused_question(&text)
     }
+}
+
+/// A recogniser closes a stretch of speech at a pause, and may punctuate it as a question; the
+/// caller then goes on in lower case. That `?` is a pause, not the question the turn asks. Live
+/// (3 Nov): "While you were checking that? any errors in the Buddev namespace" read to the front
+/// as a question about the running task, and no second task started.
+fn paused_question(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '?' {
+            let mut ahead = chars.clone();
+            let spaced = ahead.next().is_some_and(char::is_whitespace);
+            if spaced && ahead.next().is_some_and(char::is_lowercase) {
+                out.push(',');
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// An onset over agent audio, until it is classified.
@@ -1307,6 +1329,21 @@ fn is_echo(words: &[String], floor: &FloorSnapshot, since: Ms) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_question_mark_at_a_pause_does_not_split_the_request() {
+        assert_eq!(
+            paused_question("While you were checking that? any errors in the Buddev namespace"),
+            "While you were checking that, any errors in the Buddev namespace"
+        );
+        // A question that ends the turn, or one the caller begins a new sentence after, stays.
+        assert_eq!(paused_question("Is it done?"), "Is it done?");
+        assert_eq!(
+            paused_question("Is it done? Then stop."),
+            "Is it done? Then stop."
+        );
+        assert_eq!(paused_question("Rosa's? yes"), "Rosa's, yes");
+    }
     use super::*;
     use DuplexAction::{Classified, Cut, Gate, UserSpeaking};
 
