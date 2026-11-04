@@ -2,6 +2,31 @@
 
 All notable changes to WaaV Gateway will be documented in this file.
 
+## [1.4.0] - 2026-11-04
+
+Everything merged to `main` after 1.3.0 (#64). Upgrade notes: Bud deployments should deploy Bud's budmetrics reader (bud-runtime#3484) before this gateway, since per-turn records are renamed (below). Interaction mode on any deployment, with or without Bud, now starts a second task without asking when a request adds to the running one ("also", "while you're checking that") or names another identifier; asked "change it, or a second one?" before, a caller now gets both. A request containing "instead", "actually" or "make it" is still read as a change (#64).
+
+### Features
+
+- **Approvals by voice** (Bud mode, interaction mode) (#64). A tool budprompt holds inside a voice turn's stream (an `mcp_approval_request` with `bud_expires_at`) is read back to the caller with its values and asked; the answer is posted as an `mcp_approval_response` before the hold's deadline. A yes binds only once the question was heard, and an irreversible tool needs a strong yes. A run held for an approver other than the caller says the agent's `approval_message`. A voice agent entry may list `tool_confirmations`.
+- **Parallel tasks for a Bud agent** (#64): up to `background.max_parallel` of the caller's requests run at once (1-16, default 3; `1` keeps the 1.3.0 one-at-a-time behaviour), each run waiting only for its own task's previous run.
+- **Per-kind turn records** (#64): `voice.speech`, `voice.transcription`, `voice.agent_turn` and `voice.realtime` in place of one `voice.turn`. Session spans are `SpanKind::Server`; a Bud `/ws` session has one `voice.ws_session` span its billed records link to; STT and TTS records carry their vendor exchange as child spans.
+- **Realtime agent sessions** (#64): `bud.tool.started`, `bud.tool.done` and `bud.turn.metrics` events on `/v1/realtime?model=prompt:<agent>` (`WAAV_REALTIME_BUD_SESSION_EVENTS`), `session.bud_context` to seed the first run with an earlier conversation, and client secrets for a voice agent that seal their parent credential (secrets minted before still open). Interaction-mode wire events `tool_started` and `tool_done` report a backend's own tools.
+- **The front server image** (#64): `front/Dockerfile` (llama.cpp b11206 with Qwen3.5-2B Q4_K_M, CPU and CUDA) and `.github/workflows/front-image.yml`, publishing `registry.bud.studio/runtime/waav-front:<build>-<device>` by hand and `nightly-<device>` from `main`.
+
+### Bug Fixes
+
+- **Interaction mode** (#64), on any deployment:
+  - A recogniser's `?` at a pause, followed by more speech in lower case, no longer makes the turn a question.
+  - What a task did is said once: each label once, the shared verb once, at most 3 tools named.
+  - A finished task's answer the caller talked over is kept as an update instead of dropped.
+  - Two answers ready at once are said one after the other; with another request live, an answer opens with "About {task title}:".
+  - Confirmation questions: a yes said over the read-back is asked again as soon as the question was heard; words over a question not yet heard get the question again, not "was that a yes or a no?"; a new request said during an open question is taken as a turn, and the question is asked again after it.
+
+### Documentation
+
+- New `docs/agent-realtime-events.md`; `docs/interaction_mode.md` covers the front image; `docs/openapi.yaml` regenerated (#64).
+
 ## [1.3.0] - 2026-11-04
 
 Everything merged to `main` after 1.2.0 (#56-#60). Upgrade notes: Gnani now calls `api.vachana.ai` for both speech-to-text and text-to-speech, so its key must be a Vachana `X-API-Key-ID` (#57, #58); a Huawei SIS config for Bangkok (`ap-southeast-2`) is refused, since Huawei lists no SIS host there (#56); and a social, question or refuse decision of interaction mode may now take up to `front_model.line_budget_ms` longer when its line is late (set it to `0` for the 1.2.0 single budget) (#60).
