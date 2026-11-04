@@ -482,6 +482,10 @@ mod tests {
     /// The exact bytes budapp's publisher writes (`services/budapp/tests/fixtures/voice_agent_entry.json`
     /// — the same file, byte-identical). budapp's test builds it; this one parses it.
     const FIXTURE: &str = include_str!("../tests/fixtures/voice_agent_entry.json");
+    /// budapp's entry for the same agent with interaction mode on (spec 029 FR-AGT-4): the field is
+    /// published only when on, so every other agent's entry stays byte-identical to `FIXTURE`.
+    const INTERACTION_FIXTURE: &str =
+        include_str!("../tests/fixtures/voice_agent_entry_interaction.json");
 
     #[test]
     fn parses_the_shared_fixture() {
@@ -599,11 +603,12 @@ mod tests {
             block.interaction,
             Some(serde_json::json!({"background": {"answer_marker": "ANSWER:"}, "new": 7}))
         );
-        assert_eq!(
-            parse_voice_agent_blob(FIXTURE).unwrap().interaction,
-            None,
-            "budapp does not publish the field yet"
-        );
+        // budapp's two entries: no field for an agent without the setting, `true` when it is on.
+        assert_eq!(parse_voice_agent_blob(FIXTURE).unwrap().interaction, None);
+        let on = parse_voice_agent_blob(INTERACTION_FIXTURE).expect("budapp's entry parses");
+        assert_eq!(on.interaction, Some(Value::Bool(true)));
+        let off = parse_voice_agent_blob(FIXTURE).unwrap();
+        assert_eq!((on.prompt_id, on.version), (off.prompt_id, off.version));
     }
 
     #[test]

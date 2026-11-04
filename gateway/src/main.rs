@@ -371,6 +371,29 @@ async fn main() -> anyhow::Result<()> {
     {
         warn!("interaction config: {problem}; tasks are kept in this process only");
     }
+    // A front model the gateway does not run is shared with every gateway of the deployment
+    // (spec 029 §5.8): its servers are found, warmed and leased by pair. The leases are in the
+    // task Redis, else the control plane's, so every replica sees the same ones.
+    if let Some(front) = interaction
+        .front_model
+        .as_ref()
+        .filter(|front| interaction.enabled && front.command.is_none())
+    {
+        let redis = interaction.task_redis_url.clone().or_else(|| {
+            std::env::var("WAAV_REDIS_URL")
+                .ok()
+                .filter(|url| !url.is_empty())
+        });
+        let persona = waav_gateway::core::interaction::front_pool::warm_persona(&interaction);
+        match waav_gateway::core::interaction::front_pool::install(front, redis.as_deref(), persona)
+        {
+            Ok(()) if redis.is_some() => {
+                info!("interaction front: slot pairs are leased in the shared Redis")
+            }
+            Ok(()) => info!("interaction front: slot pairs are leased in this process"),
+            Err(problem) => warn!("interaction config: the front pool is not started: {problem}"),
+        }
+    }
     // The front model's llama-server, when the gateway runs it itself.
     if let Some(front) = interaction
         .front_model

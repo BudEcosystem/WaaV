@@ -87,6 +87,8 @@ pub struct Lexicon {
     pub social_intents: Vec<(String, Vec<String>)>,
     pub content_word_stop_list: Vec<String>,
     pub dangling_end_words: Vec<String>,
+    /// The dangling end words that also end a finished sentence ("Where are you from?").
+    pub can_end_sentence: Vec<String>,
     pub strong_accept: Vec<String>,
     pub weak_accept: Vec<String>,
     pub decline: Vec<String>,
@@ -231,6 +233,10 @@ pub(super) struct GuardLexicon {
     pub role_leak: RoleLeak,
     pub inquiry_frames: Phrases,
     pub copy_spans: CopySpans,
+    /// How a spoken task update is cut to its length (`guard::fit_narration`). A pack without
+    /// it cuts at any clause.
+    #[serde(default)]
+    pub narration: NarrationRules,
     pub sanitiser: Sanitiser,
     pub language_check: LanguageCheck,
     pub sensitive_categories: SensitiveCategories,
@@ -246,6 +252,19 @@ pub(super) struct Normalisation {
     pub tens: BTreeMap<String, u64>,
     pub scales: BTreeMap<String, u64>,
     pub ordinals: BTreeMap<String, u64>,
+    /// Month names: "second" next to one is an ordinal (`ordinal_second_needs_context`).
+    #[serde(default)]
+    pub months: Vec<String>,
+    /// The words after which "one" is a pronoun, not a number (`one_pronoun_note`).
+    #[serde(default)]
+    pub one_pronoun_after: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct NarrationRules {
+    /// A cut never drops a part that holds one of these words.
+    #[serde(default)]
+    pub cut_never_drops: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +307,9 @@ pub(super) struct CopySpans {
     pub restate_stop_suffixes: Vec<String>,
     pub start_word_stop_list: Vec<String>,
     pub dangling_end_words: Vec<String>,
+    /// A pack without it treats every dangling end word as one that never ends a sentence.
+    #[serde(default)]
+    pub can_end_sentence: Vec<String>,
     pub allowed_word_pattern: String,
 }
 
@@ -814,6 +836,7 @@ fn lexicon(guard: &GuardLexicon, answers: &AnswerLexicon) -> Lexicon {
         social_intents: cues.social_intents.clone().into_iter().collect(),
         content_word_stop_list: cues.content_word_stop_list.clone(),
         dangling_end_words: guard.copy_spans.dangling_end_words.clone(),
+        can_end_sentence: guard.copy_spans.can_end_sentence.clone(),
         strong_accept: answers.strong_accept.clone(),
         weak_accept: answers.weak_accept.clone(),
         decline: answers.decline.clone(),

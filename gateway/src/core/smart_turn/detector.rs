@@ -274,6 +274,70 @@ pub struct SmartTurnResult {
 
     /// Number of mel frames processed.
     pub frames_processed: usize,
+
+    /// The model gave no verdict: its inference ran past `inference_timeout_ms`. `probability`
+    /// is then 0 and `is_turn_complete` false, and a caller treats the result as no verdict at
+    /// all (it never carries an earlier prediction's probability).
+    pub timed_out: bool,
+}
+
+/// What the detector carries from one prediction to the next: the hysteresis count and the
+/// last probability the model gave.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Hysteresis {
+    /// Consecutive high-probability predictions (decayed by one on a low one).
+    high_prob_frames: u32,
+    /// The model's last probability (never a timed-out prediction's).
+    last_probability: f32,
+}
+
+impl Hysteresis {
+    /// One prediction's outcome: the model's probability, or `None` when its inference timed
+    /// out. A timeout is no verdict: it leaves the hysteresis as it was and reports probability
+    /// 0, not complete, `timed_out`. It used to report the last probability, so a mid-sentence
+    /// pause on a loaded host could inherit an earlier turn's "finished".
+    fn settle(
+        &mut self,
+        config: &SmartTurnDetectorConfig,
+        outcome: Option<f32>,
+        frames: usize,
+        inference_time_us: u64,
+    ) -> SmartTurnResult {
+        let Some(probability) = outcome else {
+            return SmartTurnResult {
+                probability: 0.0,
+                is_turn_complete: false,
+                inference_time_us,
+                frames_processed: frames,
+                timed_out: true,
+            };
+        };
+        // Decay instead of a hard reset: one dip below the threshold does not undo the count.
+        if probability > config.threshold {
+            self.high_prob_frames += 1;
+        } else if self.high_prob_frames > 0 {
+            self.high_prob_frames -= 1;
+        }
+        // Enough audio first (each mel frame is 10 ms), then enough consecutive high frames.
+        let min_frames_for_speech = (config.min_speech_ms as usize).div_ceil(10);
+        let is_turn_complete = frames >= min_frames_for_speech && self.is_turn_predicted(config);
+        self.last_probability = probability;
+        SmartTurnResult {
+            probability,
+            is_turn_complete,
+            inference_time_us,
+            frames_processed: frames,
+            timed_out: false,
+        }
+    }
+
+    fn is_turn_predicted(&self, config: &SmartTurnDetectorConfig) -> bool {
+        self.high_prob_frames >= config.hysteresis_frames
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Smart Turn detector using ONNX Runtime.
@@ -299,17 +363,14 @@ pub struct SmartTurnDetector {
     /// Size: max_frames * n_mels
     transpose_buffer: Vec<f32>,
 
-    /// Consecutive high-probability frames (for hysteresis).
-    high_prob_frames: u32,
+    /// The hysteresis count and the last probability.
+    state: Hysteresis,
 
     /// Total frames processed.
     total_frames: u64,
 
     /// Total inference time in microseconds.
     total_inference_time_us: u64,
-
-    /// Last prediction probability.
-    last_probability: f32,
 }
 
 impl SmartTurnDetector {
@@ -373,10 +434,9 @@ impl SmartTurnDetector {
             input_name,
             output_name,
             transpose_buffer,
-            high_prob_frames: 0,
+            state: Hysteresis::default(),
             total_frames: 0,
             total_inference_time_us: 0,
-            last_probability: 0.0,
         })
     }
 
@@ -551,61 +611,30 @@ impl SmartTurnDetector {
                 is_turn_complete: false,
                 inference_time_us: 0,
                 frames_processed: 0,
+                timed_out: false,
             });
         }
 
         // Prepare input tensor (pad or truncate to max_frames)
         let input_data = self.prepare_input(mel_frames);
-
-        // Run inference with optional timeout
-        let probability = if self.config.inference_timeout_ms > 0 {
-            let timeout_duration =
-                std::time::Duration::from_millis(self.config.inference_timeout_ms);
-            match tokio::time::timeout(timeout_duration, self.run_inference(&input_data)).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    warn!(
-                        "SmartTurn inference timed out after {}ms",
-                        self.config.inference_timeout_ms
-                    );
-                    // Return last known probability on timeout to avoid blocking
-                    self.last_probability
-                }
-            }
-        } else {
-            self.run_inference(&input_data).await?
-        };
+        let outcome = self.infer(&input_data, "predict").await?;
         let inference_time_us = start.elapsed().as_micros() as u64;
-
-        // Update hysteresis state with decay instead of hard reset
-        // This makes the detector more robust to occasional dips below threshold
-        if probability > self.config.threshold {
-            self.high_prob_frames += 1;
-        } else if self.high_prob_frames > 0 {
-            // Decay by 1 instead of hard reset to 0
-            // This prevents a single low-probability frame from resetting the counter
-            self.high_prob_frames -= 1;
-        }
-
-        // Determine if turn is complete:
-        // 1. Check min_speech_ms - enough audio must have been processed first
-        // 2. Check hysteresis - enough consecutive high-probability frames
-        //
-        // Each mel frame represents 10ms (hop_length=160 at 16kHz)
-        let min_frames_for_speech = (self.config.min_speech_ms as usize).div_ceil(10);
-        let has_enough_speech = frames_count >= min_frames_for_speech;
-        let is_turn_complete =
-            has_enough_speech && self.high_prob_frames >= self.config.hysteresis_frames;
+        let result = self
+            .state
+            .settle(&self.config, outcome, frames_count, inference_time_us);
 
         // Update statistics
         self.total_frames += 1;
         self.total_inference_time_us += inference_time_us;
-        self.last_probability = probability;
 
         if self.config.debug_logging {
             trace!(
-                "SmartTurn prediction: prob={:.4}, high_prob_frames={}, is_complete={}, inference={}us",
-                probability, self.high_prob_frames, is_turn_complete, inference_time_us
+                "SmartTurn prediction: prob={:.4}, timed_out={}, high_prob_frames={}, is_complete={}, inference={}us",
+                result.probability,
+                result.timed_out,
+                self.state.high_prob_frames,
+                result.is_turn_complete,
+                inference_time_us
             );
         }
 
@@ -616,12 +645,26 @@ impl SmartTurnDetector {
             );
         }
 
-        Ok(SmartTurnResult {
-            probability,
-            is_turn_complete,
-            inference_time_us,
-            frames_processed: frames_count,
-        })
+        Ok(result)
+    }
+
+    /// The model's probability for `input`, or `None` when inference runs past
+    /// `inference_timeout_ms` (0: no limit). `path` names the caller in the timeout warning.
+    async fn infer(&mut self, input: &[f32], path: &str) -> Result<Option<f32>> {
+        if self.config.inference_timeout_ms == 0 {
+            return Ok(Some(self.run_inference(input).await?));
+        }
+        let limit = std::time::Duration::from_millis(self.config.inference_timeout_ms);
+        match tokio::time::timeout(limit, self.run_inference(input)).await {
+            Ok(result) => Ok(Some(result?)),
+            Err(_) => {
+                warn!(
+                    "SmartTurn inference timed out after {}ms ({path}): no verdict",
+                    self.config.inference_timeout_ms
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Prepares input tensor from mel frames (pad/truncate to max_frames).
@@ -767,6 +810,7 @@ impl SmartTurnDetector {
                 is_turn_complete: false,
                 inference_time_us: 0,
                 frames_processed: 0,
+                timed_out: false,
             });
         }
 
@@ -793,71 +837,35 @@ impl SmartTurnDetector {
             input[padding_values..padding_values + copy_len].copy_from_slice(&mel_flat[..copy_len]);
         }
 
-        // Run inference with optional timeout
-        let probability = if self.config.inference_timeout_ms > 0 {
-            let timeout_duration =
-                std::time::Duration::from_millis(self.config.inference_timeout_ms);
-            match tokio::time::timeout(timeout_duration, self.run_inference(&input)).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    warn!(
-                        "SmartTurn inference timed out after {}ms (predict_flat)",
-                        self.config.inference_timeout_ms
-                    );
-                    // Return last known probability on timeout to avoid blocking
-                    self.last_probability
-                }
-            }
-        } else {
-            self.run_inference(&input).await?
-        };
+        let outcome = self.infer(&input, "predict_flat").await?;
         let inference_time_us = start.elapsed().as_micros() as u64;
-
-        // Update hysteresis state with decay instead of hard reset
-        if probability > self.config.threshold {
-            self.high_prob_frames += 1;
-        } else if self.high_prob_frames > 0 {
-            // Decay by 1 instead of hard reset to 0
-            self.high_prob_frames -= 1;
-        }
-
-        // Determine if turn is complete:
-        // 1. Check min_speech_ms - enough audio must have been processed first
-        // 2. Check hysteresis - enough consecutive high-probability frames
-        let min_frames_for_speech = (self.config.min_speech_ms as usize).div_ceil(10);
-        let has_enough_speech = num_frames >= min_frames_for_speech;
-        let is_turn_complete =
-            has_enough_speech && self.high_prob_frames >= self.config.hysteresis_frames;
+        let result = self
+            .state
+            .settle(&self.config, outcome, num_frames, inference_time_us);
 
         // Update statistics
         self.total_frames += 1;
         self.total_inference_time_us += inference_time_us;
-        self.last_probability = probability;
 
-        Ok(SmartTurnResult {
-            probability,
-            is_turn_complete,
-            inference_time_us,
-            frames_processed: num_frames,
-        })
+        Ok(result)
     }
 
-    /// Returns the current turn completion probability without running inference.
+    /// Returns the model's last turn completion probability without running inference (a
+    /// timed-out prediction leaves it as it was).
     #[inline]
     pub fn current_probability(&self) -> f32 {
-        self.last_probability
+        self.state.last_probability
     }
 
     /// Returns whether currently predicting turn completion (with hysteresis).
     #[inline]
     pub fn is_turn_predicted(&self) -> bool {
-        self.high_prob_frames >= self.config.hysteresis_frames
+        self.state.is_turn_predicted(&self.config)
     }
 
     /// Resets the detector state.
     pub fn reset(&mut self) {
-        self.high_prob_frames = 0;
-        self.last_probability = 0.0;
+        self.state.reset();
 
         if self.config.debug_logging {
             debug!("SmartTurnDetector state reset");
@@ -1202,6 +1210,59 @@ mod tests {
     // Result struct tests
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // Spec 029 W-1: a timed-out inference is no verdict
+    // -------------------------------------------------------------------------
+
+    /// Enough audio for a verdict (`min_speech_ms` 300 = 30 frames of 10 ms).
+    const SPEECH_FRAMES: usize = 100;
+
+    #[test]
+    fn a_model_probability_moves_the_hysteresis() {
+        let config = SmartTurnDetectorConfig::default();
+        let mut state = Hysteresis::default();
+        for _ in 0..config.hysteresis_frames {
+            let r = state.settle(&config, Some(0.95), SPEECH_FRAMES, 1_000);
+            assert!(!r.timed_out);
+            assert_eq!(r.probability, 0.95);
+        }
+        assert!(state.is_turn_predicted(&config));
+        let r = state.settle(&config, Some(0.1), SPEECH_FRAMES, 1_000);
+        // One low frame decays the count by one, it does not reset it.
+        assert_eq!(state.high_prob_frames, config.hysteresis_frames - 1);
+        assert!(!r.is_turn_complete);
+        assert_eq!(state.last_probability, 0.1);
+    }
+
+    #[test]
+    fn a_timed_out_inference_is_no_verdict() {
+        let config = SmartTurnDetectorConfig::default();
+        let mut state = Hysteresis::default();
+        for _ in 0..config.hysteresis_frames {
+            state.settle(&config, Some(0.97), SPEECH_FRAMES, 1_000);
+        }
+        let before = state.clone();
+        let r = state.settle(&config, None, SPEECH_FRAMES, 50_000);
+        assert!(r.timed_out, "the result says the model gave no verdict");
+        assert!(!r.is_turn_complete, "a timeout never completes a turn");
+        // An earlier prediction's probability is never reported as this one's.
+        assert_eq!(r.probability, 0.0);
+        // The hysteresis and the last real probability are left as they were.
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn a_timeout_after_a_finished_turn_does_not_finish_the_next() {
+        // The stale verdict of spec 029 W-1: the last turn ended at p 0.97, the next turn's first
+        // question times out on a loaded host. It must not inherit "finished".
+        let config = SmartTurnDetectorConfig::default();
+        let mut state = Hysteresis::default();
+        state.settle(&config, Some(0.97), SPEECH_FRAMES, 1_000);
+        state.reset();
+        let r = state.settle(&config, None, SPEECH_FRAMES, 50_000);
+        assert!(r.timed_out && !r.is_turn_complete && r.probability == 0.0);
+    }
+
     #[test]
     fn test_result_struct() {
         let result = SmartTurnResult {
@@ -1209,6 +1270,7 @@ mod tests {
             is_turn_complete: true,
             inference_time_us: 5000,
             frames_processed: 100,
+            timed_out: false,
         };
 
         assert_eq!(result.probability, 0.85);

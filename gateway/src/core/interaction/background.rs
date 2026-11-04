@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug};
 
 use crate::core::agent::text::transform_for_speech;
-use crate::core::conversation::{TurnAttribution, turn_span};
+use crate::core::conversation::{TurnAttribution, turn_span_under};
 use crate::core::llm::functions::execute_batch;
 use crate::core::llm::{
     ChatMessage, FunctionCallParams, FunctionHandler, FunctionRegistry, FunctionResult, LlmClient,
@@ -57,6 +57,7 @@ use super::actor::Msg;
 use super::config::{ASK_CALLER, ToolSpec};
 use super::controls::{Control, ControlKind, ControlSource, same_language};
 use super::guard;
+use super::turn_record::TurnTrace;
 use super::types::{
     GateDecision, GuardOutcome, HitlKind, OpId, Outcome, RunEvent, RunId, TaskId, TaskState,
 };
@@ -100,6 +101,9 @@ pub struct Job {
     /// The conversation state (chapter 9): `metadata.waav_state` on the webhook and A2A
     /// wires, `_meta["io.waav/state"]` on MCP. `None` on a surface that has none.
     pub state: Option<Value>,
+    /// The caller turn the run belongs to: its span is a child of the turn's `voice.turn`, in
+    /// the turn's trace (spec 029 D-9). `None`: the run is a trace of its own.
+    pub turn: Option<TurnTrace>,
 }
 
 tokio::task_local! {
@@ -157,6 +161,20 @@ pub trait Backend: Send + Sync {
     fn max_concurrent(&self) -> Option<usize> {
         None
     }
+    /// The root `voice.turn` of a caller turn whose runs this backend makes (spec 029 D-9),
+    /// with what its runs' spans say of the session, so the turn's row names it whether or not
+    /// a run starts. A run's own span is its child (`Job::turn`).
+    fn turn_span(&self, session_id: &str, turn: u64, input: &str) -> tracing::Span {
+        use crate::observability::{trace_redact, voice_attrs};
+        let span = crate::voice_turn_span!(parent: None, capability = "conversation", transport = "websocket");
+        span.record(voice_attrs::turn::SESSION_ID, session_id);
+        span.record(voice_attrs::turn::TURN_INDEX, turn);
+        if trace_redact::capture_content() {
+            let transcript = trace_redact::sanitize_body(input);
+            span.record(voice_attrs::turn::TRANSCRIPT, transcript.as_str());
+        }
+        span
+    }
     /// The caller heard `text` of a run's answer so far; `cut`: they will not hear the rest.
     fn heard(&self, _run: RunId, _text: &str, _cut: bool) {}
     /// The model the gateway prompts for the session, when it has one (the LLM tier): after
@@ -194,6 +212,13 @@ impl Backend for LlmTier {
         Some(Arc::clone(&self.llm))
     }
 
+    /// What `spawn_run` records of a run: the session, the words and, in Bud mode, the caller.
+    fn turn_span(&self, _session_id: &str, turn: u64, input: &str) -> tracing::Span {
+        let span = turn_span_under(None, &self.session_id, input, self.attribution.as_ref());
+        span.record(voice_attrs::turn::TURN_INDEX, turn);
+        span
+    }
+
     fn start(
         self: Arc<Self>,
         job: Job,
@@ -227,6 +252,7 @@ impl Backend for LlmTier {
             trace_id: job.trace_id,
             reply_in: reply_in(job.state.as_ref()),
             state: job.state,
+            turn: job.turn,
         };
         spawn_run(spec, tx, cancel)
     }
@@ -307,6 +333,8 @@ pub struct RunSpec {
     pub attribution: Option<TurnAttribution>,
     /// The task's trace, for the `traceparent` of its requests.
     pub trace_id: String,
+    /// The caller turn the run belongs to (`Job::turn`).
+    pub turn: Option<TurnTrace>,
     /// The language the caller switched to (a `language` control), by name: the request says
     /// so, last, where a model that answered the call so far in another language reads it.
     pub reply_in: Option<String>,
@@ -393,8 +421,16 @@ pub fn spawn_run(
         let (run, llm, key) = (spec.run, Arc::clone(&spec.llm), spec.history_key.clone());
         // The run is the turn budmetrics records: its LLM calls are made inside this span.
         let request = request_text(&spec.words);
-        let span = turn_span(&spec.session_id, &request, spec.attribution.as_ref());
-        span.record(voice_attrs::turn::TURN_INDEX, run.0);
+        // A child of its caller turn's span, in the turn's trace (spec 029 D-9).
+        let parent = spec.turn.as_ref().and_then(|turn| turn.span.id());
+        let span = turn_span_under(
+            parent,
+            &spec.session_id,
+            &request,
+            spec.attribution.as_ref(),
+        );
+        let index = spec.turn.as_ref().map_or(run.0, |turn| turn.index);
+        span.record(voice_attrs::turn::TURN_INDEX, index);
         span.record(voice_attrs::leg::LLM_MODEL, llm.config().model.as_str());
         let trace_id = spec.trace_id.clone();
         let driven = traced(trace_id, drive(spec, &tx, &cancel));
@@ -2662,6 +2698,7 @@ mod tests {
             trace_id: String::new(),
             reply_in: None,
             state: None,
+            turn: None,
         };
         let (tx, mut rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();

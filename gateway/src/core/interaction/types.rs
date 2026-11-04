@@ -98,6 +98,12 @@ impl Act {
     pub fn from_first_char(c: char) -> Option<Act> {
         Act::ALL.into_iter().find(|act| act.as_str().starts_with(c))
     }
+
+    /// The acts whose reply is the front model's own line (the policy's `speak_front`). Every
+    /// other act's reply is the gateway's: an acknowledgement, a status, a repeat, a template.
+    pub fn speaks_its_line(self) -> bool {
+        matches!(self, Act::Social | Act::Question | Act::Refuse)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -513,6 +519,12 @@ pub enum DuplexAction {
     /// `upload: false` discards the buffer.
     FinalizeStt {
         upload: bool,
+    },
+    /// A turn is held on words that may be finished ("Where are you from?"): the text
+    /// end-of-turn model is asked to read them (`Duplex::on_words`).
+    JudgeWords {
+        turn: TurnId,
+        text: String,
     },
     EndOfTurn(EndOfTurn),
 }

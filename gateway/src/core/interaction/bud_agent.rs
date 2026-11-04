@@ -35,6 +35,7 @@ use crate::observability::voice_attrs::realtime;
 
 use super::actor::Msg;
 use super::background::{AnswerGate, Backend, Job, Relay, caller_words, request_text};
+use super::turn_record::TurnTrace;
 use super::types::{RunEvent, RunId};
 
 /// The agent of one session and what its runs share.
@@ -104,6 +105,8 @@ pub struct AgentRun {
     pub words: Vec<String>,
     /// Everything the caller said, for the outbound speech policy.
     pub caller: String,
+    /// The caller turn the run belongs to (`Job::turn`).
+    pub turn: Option<TurnTrace>,
 }
 
 /// Start a run. It reports through `Msg::Run(spec.run, ..)` like an LLM-tier run and stops
@@ -125,7 +128,10 @@ pub fn spawn_agent_run(
             None => RunEvent::Cancelled,
             Some(_) => {
                 let input = request_text(&spec.words);
-                let span = agent_turn_span(&agent.session, run.0, &input);
+                // A child of its caller turn's span, in the turn's trace (spec 029 D-9).
+                let parent = spec.turn.as_ref().map(|turn| &turn.span);
+                let index = spec.turn.as_ref().map_or(run.0, |turn| turn.index);
+                let span = agent_turn_span(&agent.session, index, &input, parent);
                 let driven = drive(spec, input, &span, &tx, &cancel);
                 driven.instrument(span.clone()).await
             }
@@ -152,6 +158,11 @@ impl Backend for AgentBackground {
         Some(self.side_effects())
     }
 
+    /// What a run of the agent records: the agent, its project and the caller's words.
+    fn turn_span(&self, _session_id: &str, turn: u64, input: &str) -> tracing::Span {
+        agent_turn_span(&self.session, turn, input, None)
+    }
+
     /// budprompt runs one response of a conversation at a time, and every task of the session
     /// continues its one conversation.
     fn max_concurrent(&self) -> Option<usize> {
@@ -169,6 +180,7 @@ impl Backend for AgentBackground {
             agent: self,
             caller: caller_words(&job.history, &job.words),
             words: job.words,
+            turn: job.turn,
         };
         spawn_agent_run(spec, tx, cancel)
     }
@@ -258,6 +270,10 @@ async fn drive(
             Some(Ok(AgentEvent::Created { response_id, .. })) => {
                 span.record(realtime::RESPONSE_ID, response_id.as_str());
                 agent.responses.lock().insert(run, response_id);
+                // budprompt works on it: the health watcher's first-token deadline is met, as a
+                // remote backend's is when it accepts the request (spec 029 W-9). The run may list
+                // its tools and reason for seconds before it writes; that is no stall.
+                relay.alive().await;
             }
             Some(Ok(AgentEvent::TextDelta { delta, .. })) => {
                 let text = match spoken_field.as_mut() {
@@ -440,9 +456,20 @@ mod tests {
             agent: Arc::clone(agent),
             words: vec![request.to_owned()],
             caller: request.to_owned(),
+            turn: None,
         };
         spawn_agent_run(spec, tx, cancel.clone());
         (rx, cancel)
+    }
+
+    /// The run's next report, past the health watcher's sign of life (`Msg::RunAlive`).
+    async fn next_report(rx: &mut mpsc::Receiver<Msg>) -> Option<Msg> {
+        loop {
+            match rx.recv().await {
+                Some(Msg::RunAlive(_)) => continue,
+                other => return other,
+            }
+        }
     }
 
     /// The run's reports up to its last one, as text.
@@ -542,7 +569,7 @@ mod tests {
         let (mut rx, cancel) = start(&agent, 1, "refund my order");
         let mut seen = Vec::new();
         while seen.len() < 3 {
-            let Some(Msg::Run(_, event)) = rx.recv().await else {
+            let Some(Msg::Run(_, event)) = next_report(&mut rx).await else {
                 panic!("the run ended early: {seen:?}");
             };
             seen.push(format!("{event:?}"));
@@ -624,6 +651,42 @@ mod tests {
         );
     }
 
+    /// Spec 029 W-9: a run budprompt has started is alive, as a remote backend that accepted its
+    /// request is (`remote.rs`): budprompt lists its tools and reasons before it writes (its first
+    /// text came 3 s or more after `response.created` on 2026-10-29), and a working run is no
+    /// stall.
+    #[tokio::test]
+    async fn a_started_run_is_alive_before_it_writes() {
+        let backend = Arc::new(Scripted::default());
+        // Only the start: the run goes on reasoning, and nothing is written yet.
+        backend
+            .replies
+            .lock()
+            .push_back(Ok(vec![created("resp_1")]));
+        let agent = agent(&backend, None);
+        let (mut rx, _cancel) = start(&agent, 1, "what are your weekend hours");
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        assert!(
+            matches!(first, Ok(Some(Msg::RunAlive(RunId(1))))),
+            "a started run reports itself alive at once: {first:?}"
+        );
+    }
+
+    /// Spec 029 W-9's other half: a backend that answers nothing gives no sign of life, so the
+    /// health watcher's first-token deadline still catches it.
+    #[tokio::test]
+    async fn a_run_that_never_starts_gives_no_sign_of_life() {
+        let backend = Arc::new(Scripted::default());
+        backend.replies.lock().push_back(Ok(Vec::new()));
+        let agent = agent(&backend, None);
+        let (mut rx, _cancel) = start(&agent, 1, "what are your weekend hours");
+        let first = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            first.is_err(),
+            "nothing from a run that never started: {first:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_run_held_for_approval_fails_under_the_approval_code() {
         let backend = Arc::new(Scripted::default());
@@ -647,7 +710,7 @@ mod tests {
         let agent = agent(&backend, None);
         let (mut first, cancel) = start(&agent, 1, "refund my order");
         assert!(matches!(
-            first.recv().await,
+            next_report(&mut first).await,
             Some(Msg::Run(_, RunEvent::ToolStarted { .. }))
         ));
         // The revised request: it is not sent while the first run holds the conversation.

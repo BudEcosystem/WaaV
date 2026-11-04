@@ -1009,7 +1009,7 @@ impl AgentEngine {
             let c = self.cfg.lock();
             (c.clone(), c.text_only)
         };
-        let span = agent_turn_span(&cfg, id, &input);
+        let span = agent_turn_span(&cfg, id, &input, None);
         let _end = EndSpanOnDrop(span.clone());
         let extras = {
             let mut session = self.extras.lock();
@@ -1661,11 +1661,21 @@ impl AgentEngine {
 
 /// The `voice.turn` span of one agent turn: who was asked what, in which session.
 ///
-/// D-19: an agent turn is the ROOT of its own trace; budgateway and budprompt continue it.
-pub(crate) fn agent_turn_span(cfg: &AgentSessionConfig, turn: u64, input: &str) -> tracing::Span {
+/// D-19: an agent turn is the ROOT of its own trace; budgateway and budprompt continue it. In
+/// interaction mode a task run's span is a child of its caller turn's (`parent`), in that
+/// turn's trace (spec 029 D-9).
+pub(crate) fn agent_turn_span(
+    cfg: &AgentSessionConfig,
+    turn: u64,
+    input: &str,
+    parent: Option<&tracing::Span>,
+) -> tracing::Span {
     use crate::observability::voice_attrs::{realtime, turn as attr};
-    let span =
-        crate::voice_turn_span!(parent: None, capability = "agent_turn", transport = "websocket");
+    let span = crate::voice_turn_span!(
+        parent: parent.and_then(tracing::Span::id),
+        capability = "agent_turn",
+        transport = "websocket"
+    );
     span.record(attr::SESSION_ID, cfg.session_id.as_str());
     span.record(attr::TURN_INDEX, turn);
     span.record(attr::ENDPOINT_NAME, cfg.prompt_name.as_str());

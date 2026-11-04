@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::core::audio::{PumpControl, StreamResampler};
 use crate::core::silero_vad::{SileroVAD, SileroVADConfig};
 use crate::core::smart_turn::{
-    MelStream, SMART_TURN_MAX_FRAMES, SmartTurnDetector, SmartTurnDetectorConfig,
+    MelStream, SMART_TURN_MAX_FRAMES, SmartTurnDetector, SmartTurnDetectorConfig, SmartTurnResult,
 };
 use crate::utils::simd_ops::pcm_to_float_simd;
 
@@ -219,13 +219,14 @@ impl TurnModel {
                     return;
                 };
                 detector = back;
-                match p {
-                    Ok(result) => {
-                        let p = model_probability(result.probability);
+                match p.map(|result| verdict(&result)) {
+                    Ok(Some(p)) => {
                         if answer.send((tag, p)).await.is_err() {
                             return;
                         }
                     }
+                    // No verdict: the turn ends on its hold, or a later question's answer.
+                    Ok(None) => debug!("interaction analyser: smart turn timed out, no verdict"),
                     Err(error) => debug!(%error, "interaction analyser: smart turn failed"),
                 }
             }
@@ -544,6 +545,13 @@ fn model_probability(reported: f32) -> f32 {
     (reported / (1.0 - reported)).ln().clamp(0.0, 1.0)
 }
 
+/// The turn-end probability a Smart Turn result gives, or none when its inference timed out
+/// (spec 029 W-1: it used to carry the last probability, an earlier turn's "finished" on a
+/// loaded host).
+fn verdict(result: &SmartTurnResult) -> Option<f32> {
+    (!result.timed_out).then(|| model_probability(result.probability))
+}
+
 /// What one chunk changed, before it gets a time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Edge {
@@ -813,6 +821,24 @@ mod tests {
         // What the detector reports with no audio, and anything outside its range.
         assert_eq!(model_probability(0.0), 0.0);
         assert_eq!(model_probability(0.9), 1.0);
+    }
+
+    /// Spec 029 W-1: a Smart Turn inference that timed out is no verdict. The turn waits for its
+    /// hold to run out (or a later verdict), never for a fabricated probability.
+    #[test]
+    fn a_timed_out_inference_gives_the_duplex_machine_no_verdict() {
+        let result = |probability: f32, timed_out: bool| SmartTurnResult {
+            probability,
+            is_turn_complete: false,
+            inference_time_us: 50_000,
+            frames_processed: 100,
+            timed_out,
+        };
+        let reported = 1.0 / (1.0 + (-0.8f32).exp());
+        let sure = verdict(&result(reported, false)).expect("a model verdict");
+        assert!((sure - 0.8).abs() < 1e-4);
+        assert_eq!(verdict(&result(0.0, true)), None);
+        assert_eq!(verdict(&result(reported, true)), None);
     }
 
     #[test]

@@ -2457,6 +2457,10 @@ impl fmt::Debug for BackendSpec {
 #[serde(deny_unknown_fields)]
 pub struct FrontModelServer {
     pub url: String,
+    /// More servers (spec 029 SF-3): every gateway shares them with `url`. A hostname with
+    /// several addresses is one server per address, in either.
+    #[serde(default)]
+    pub urls: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -2468,6 +2472,23 @@ pub struct FrontModelServer {
     /// `lfm_open_eligible` or `liquid_commercial`: the operator may run LFM weights.
     #[serde(default)]
     pub licence: Option<String>,
+    /// How long a decision's line may take once its act is known, in milliseconds (default
+    /// [`LINE_BUDGET_MS`], at most [`MAX_LINE_BUDGET_MS`]). The act settles the turn and the
+    /// caller waits for its line: a slow server's line is late, not lost.
+    #[serde(default)]
+    pub line_budget_ms: Option<u32>,
+}
+
+/// A decision's line's time after its act, unless the operator sets another.
+pub const LINE_BUDGET_MS: u32 = 1_500;
+/// The longest an operator may give a line.
+pub const MAX_LINE_BUDGET_MS: u32 = 10_000;
+
+impl FrontModelServer {
+    /// How long a decision's line may take once its act is known.
+    pub fn line_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.line_budget_ms.unwrap_or(LINE_BUDGET_MS).into())
+    }
 }
 
 // Secrets stay out of logs.
@@ -2504,10 +2525,12 @@ impl fmt::Debug for FrontModelServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrontModelServer")
             .field("url", &self.url)
+            .field("urls", &self.urls)
             .field("model", &self.model)
             .field("api_key", &self.api_key.is_some())
             .field("command", &self.command)
             .field("licence", &self.licence)
+            .field("line_budget_ms", &self.line_budget_ms)
             .finish()
     }
 }
@@ -2582,15 +2605,37 @@ impl ServerInteraction {
                 Some(_) => problems.push(format!("{key} must be JSON: true or an object")),
             }
         }
-        if let Some(url) = get("WAAV_INTERACTION_FRONT_URL") {
+        // One URL, or several separated by commas: the servers every gateway shares.
+        if let Some(urls) = get("WAAV_INTERACTION_FRONT_URL") {
+            let mut urls = urls
+                .split(',')
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_owned);
+            let url = urls.next().unwrap_or_default();
+            let more: Vec<String> = urls.collect();
             match &mut self.front_model {
-                Some(front) => front.url = url,
+                Some(front) => {
+                    front.url = url;
+                    front.urls = more;
+                }
                 None => {
                     self.front_model = Some(FrontModelServer {
                         url,
+                        urls: more,
                         ..FrontModelServer::default()
                     })
                 }
+            }
+        }
+        // The front's key from the environment (spec 029 SF-6): a key in the config file
+        // would sit in a ConfigMap.
+        if let Some(key) = get("WAAV_INTERACTION_FRONT_API_KEY").filter(|key| !key.is_empty()) {
+            match &mut self.front_model {
+                Some(front) => front.api_key = Some(key),
+                None => problems.push(
+                    "WAAV_INTERACTION_FRONT_API_KEY is set but no front model URL is".to_owned(),
+                ),
             }
         }
         for (key, is_command) in [
@@ -2618,6 +2663,31 @@ impl ServerInteraction {
                 "interaction.front_model.licence must be lfm_open_eligible or liquid_commercial"
                     .to_owned(),
             );
+        }
+        if let Some(value) = get("WAAV_INTERACTION_FRONT_LINE_BUDGET_MS") {
+            match (&mut self.front_model, value.trim().parse::<u32>()) {
+                (Some(front), Ok(ms)) if ms <= MAX_LINE_BUDGET_MS => {
+                    front.line_budget_ms = Some(ms)
+                }
+                (Some(_), _) => problems.push(format!(
+                    "WAAV_INTERACTION_FRONT_LINE_BUDGET_MS must be 0 to {MAX_LINE_BUDGET_MS} \
+                     milliseconds"
+                )),
+                (None, _) => problems.push(
+                    "WAAV_INTERACTION_FRONT_LINE_BUDGET_MS is set but no front model URL is"
+                        .to_owned(),
+                ),
+            }
+        }
+        if let Some(front) = &mut self.front_model
+            && front
+                .line_budget_ms
+                .take_if(|ms| *ms > MAX_LINE_BUDGET_MS)
+                .is_some()
+        {
+            problems.push(format!(
+                "interaction.front_model.line_budget_ms must be at most {MAX_LINE_BUDGET_MS}"
+            ));
         }
         if let Some(model) = get("WAAV_INTERACTION_FRONT_MODEL") {
             match &mut self.front_model {
@@ -2836,10 +2906,12 @@ mod tests {
         ServerInteraction {
             front_model: Some(FrontModelServer {
                 url: "http://127.0.0.1:18741".to_owned(),
+                urls: Vec::new(),
                 model: None,
                 api_key: None,
                 command: None,
                 licence: None,
+                line_budget_ms: None,
             }),
             ..on()
         }
@@ -4911,10 +4983,12 @@ mod tests {
                 agent_default: None,
                 front_model: Some(FrontModelServer {
                     url: "http://127.0.0.1:18741".to_owned(),
+                    urls: Vec::new(),
                     model: Some("qwen1.5b".to_owned()),
                     api_key: None,
                     command: None,
                     licence: None,
+                    line_budget_ms: None,
                 }),
                 tool_secret: Some("s3cret".to_owned()),
                 allow_client_tools: true,
@@ -4936,6 +5010,92 @@ mod tests {
             ("WAAV_INTERACTION_TOOL_SECRET", "  "),
         ]));
         assert_eq!(server, ServerInteraction::default());
+    }
+
+    /// Spec 029 SF-3 and SF-6: several front servers, and the front's key from the
+    /// environment, where a config file's would sit in a ConfigMap. It is never shown.
+    #[test]
+    fn the_front_urls_and_its_key_come_from_the_environment() {
+        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
+            ServerInteraction::from_lookup(move |key: &str| {
+                let found = pairs.iter().find(|(name, _)| *name == key);
+                found.map(|(_, value)| (*value).to_owned())
+            })
+        };
+        let server = lookup(&[
+            (
+                "WAAV_INTERACTION_FRONT_URL",
+                "http://front-a:8080, http://front-b:8080,",
+            ),
+            ("WAAV_INTERACTION_FRONT_API_KEY", "front-k3y"),
+        ]);
+        let front = server.front_model.as_ref().expect("a front");
+        assert_eq!(front.url, "http://front-a:8080");
+        assert_eq!(front.urls, ["http://front-b:8080"]);
+        assert_eq!(front.api_key.as_deref(), Some("front-k3y"));
+        let shown = format!("{server:?}");
+        assert!(!shown.contains("front-k3y"), "{shown}");
+        // A key with no front configures nothing.
+        let mut alone = ServerInteraction::default();
+        let problems = alone.apply_lookup(|key| {
+            (key == "WAAV_INTERACTION_FRONT_API_KEY").then(|| "front-k3y".to_owned())
+        });
+        assert!(alone.front_model.is_none());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        // The YAML file's key gives way to the environment's.
+        let yaml =
+            "interaction:\n  front_model:\n    url: http://front:8080\n    api_key: file-key\n";
+        let mut server = server_from_yaml(yaml).unwrap();
+        server.apply_lookup(|key| {
+            (key == "WAAV_INTERACTION_FRONT_API_KEY").then(|| "env-key".to_owned())
+        });
+        let front = server.front_model.expect("a front");
+        assert_eq!(front.api_key.as_deref(), Some("env-key"));
+    }
+
+    /// Once a decision's act is known, its line has the front server's own deadline (a slow CPU
+    /// front's line ran past the decision's budget and was never said): 1.5 s by default, the
+    /// operator's `line_budget_ms` from the file or `WAAV_INTERACTION_FRONT_LINE_BUDGET_MS`
+    /// (the environment's wins), at most 10 s.
+    #[test]
+    fn the_front_lines_deadline_is_the_operators() {
+        use std::time::Duration;
+        let budget =
+            |server: &ServerInteraction| server.front_model.as_ref().unwrap().line_budget();
+        let env = |value: &'static str| {
+            move |key: &str| {
+                (key == "WAAV_INTERACTION_FRONT_LINE_BUDGET_MS").then(|| value.to_owned())
+            }
+        };
+        assert_eq!(
+            FrontModelServer::default().line_budget(),
+            Duration::from_millis(1_500)
+        );
+        let yaml =
+            "interaction:\n  front_model:\n    url: http://front:8080\n    line_budget_ms: 2500\n";
+        let mut server = server_from_yaml(yaml).unwrap();
+        assert!(server.apply_lookup(|_| None).is_empty());
+        assert_eq!(budget(&server), Duration::from_millis(2_500));
+        assert!(server.apply_lookup(env("4000")).is_empty());
+        assert_eq!(budget(&server), Duration::from_millis(4_000));
+        // A value that is no number of milliseconds, or more than 10 s, is a problem and
+        // changes nothing.
+        for bad in ["soon", "10001", "-1"] {
+            let mut server = server_from_yaml(yaml).unwrap();
+            let problems = server.apply_lookup(env(bad));
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert_eq!(budget(&server), Duration::from_millis(2_500), "{bad}");
+        }
+        // Too long in the file: the default, and a problem.
+        let long =
+            "interaction:\n  front_model:\n    url: http://front:8080\n    line_budget_ms: 60000\n";
+        let mut server = server_from_yaml(long).unwrap();
+        assert_eq!(server.apply_lookup(|_| None).len(), 1);
+        assert_eq!(budget(&server), Duration::from_millis(1_500));
+        // No front, no deadline to set.
+        let mut alone = ServerInteraction::default();
+        assert_eq!(alone.apply_lookup(env("2000")).len(), 1);
+        assert!(alone.front_model.is_none());
     }
 
     #[test]

@@ -509,6 +509,34 @@
       "roles": [
         "leg"
       ]
+    },
+    {
+      "column": "interaction_act",
+      "attribute": "bud.voice.interaction.act",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "interaction_task_ref",
+      "attribute": "bud.voice.interaction.task_ref",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "ack_latency_ms",
+      "attribute": "bud.voice.interaction.ack_latency_ms",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "answer_latency_ms",
+      "attribute": "bud.voice.interaction.answer_latency_ms",
+      "roles": [
+        "turn"
+      ]
     }
   ]
 }

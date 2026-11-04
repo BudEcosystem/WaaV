@@ -26,7 +26,7 @@ use crate::core::interaction::config::{
 };
 use crate::core::interaction::persona::Persona;
 use crate::core::interaction::types::PumpEvent;
-use crate::core::interaction::{analyser, front_model, speech, tasks, tenant};
+use crate::core::interaction::{analyser, front_model, front_pool, speech, tasks, tenant};
 use crate::core::stt::STTResult;
 use crate::core::voice_manager::VoiceManager;
 use crate::livekit::CallerTap;
@@ -151,6 +151,8 @@ pub(super) struct Prepared {
     /// A LiveKit session on a server with a SIP leg: a `human` control may refer a SIP caller
     /// (`controls.human.transfer_to`).
     sip: Option<Arc<AppState>>,
+    /// The session's pair on a front server the gateways share (spec 029 §5.8).
+    placement: Option<front_pool::Placement>,
 }
 
 impl Prepared {
@@ -255,7 +257,7 @@ async fn unavailable(
     warn!(reason, "interaction mode asked for and not available");
     let code = match reason {
         "no_background" => "interaction_needs_background",
-        "front_unavailable" => "interaction_refused",
+        "front_unavailable" | "front_busy" => "interaction_refused",
         "dag_audio_output" => "interaction_dag_audio_output",
         "dag_no_text_output" => "interaction_dag_no_text_output",
         _ => "interaction_surface_unavailable",
@@ -406,7 +408,25 @@ pub(super) async fn prepare(
         unavailable(asked, message_tx, "front_unavailable", &why).await;
         return None;
     }
+    // A front the gateway does not run itself is shared with every gateway of the deployment:
+    // the session holds a pair of one server's slots for its life (spec 029 §5.8), or runs
+    // without the mode when none is free (`front_busy`) or no server is ready.
+    let pool = (server.front_model.as_ref())
+        .filter(|front| front.command.is_none())
+        .and(front_pool::get());
+    let placement = match pool {
+        Some(pool) => match pool.place(stream_id).await {
+            Ok(placement) => Some(placement),
+            Err(refusal) => {
+                let why = format!("its front model has no slot pair for it: {}", refusal.why());
+                unavailable(asked, message_tx, refusal.reason(), &why).await;
+                return None;
+            }
+        },
+        None => None,
+    };
     let front_ready = match &server.front_model {
+        Some(_) if placement.is_some() => true,
         Some(front) => front_model::ready(front).await,
         None => false,
     };
@@ -562,6 +582,7 @@ pub(super) async fn prepare(
         greeting,
         sip: (surface.livekit && app_state.livekit_sip_handler.is_some())
             .then(|| app_state.clone()),
+        placement,
     })
 }
 
@@ -731,6 +752,7 @@ pub(super) async fn start(
         plain_path,
         greeting: _,
         sip,
+        placement,
     } = prepared;
     let (owner, tracker) = {
         let guard = state.read().await;
@@ -765,6 +787,7 @@ pub(super) async fn start(
         warm: vm.tts_has_cache().await,
         plain_path,
         room,
+        placement,
     });
     // The room's SIP caller may be referred to a person: the SIP leg's own transfer, which
     // reports a failure to the client as `sip_transfer_error`.

@@ -179,6 +179,22 @@ pub mod leg {
     pub const STT_NOISE_SUPPRESSION: &str = "bud.voice.stt.noise_suppression";
 }
 
+/// Attributes of a caller turn in interaction mode (spec 029 D-9): one `voice.turn` per
+/// caller turn, whether the front answered it alone or a task run did. The turn's
+/// `turn::RESPONSE_LATENCY_MS` is still the end of the turn to the first agent audio, which is
+/// now most often the acknowledgement.
+pub mod interaction {
+    /// What the front decided for the turn: `delegate`, `wait`, `control`, `social`, `update`,
+    /// `abort`, `progress`, `refuse` …
+    pub const ACT: &str = "bud.voice.interaction.act";
+    /// The task the turn started or named (`t1`, `t2` …).
+    pub const TASK_REF: &str = "bud.voice.interaction.task_ref";
+    /// End of the caller's turn to the first agent line that replies to it.
+    pub const ACK_LATENCY_MS: &str = "bud.voice.interaction.ack_latency_ms";
+    /// End of the caller's turn to the first sentence of the answer.
+    pub const ANSWER_LATENCY_MS: &str = "bud.voice.interaction.answer_latency_ms";
+}
+
 /// Every attribute this crate emits, for the contract test.
 pub const ALL: &[&str] = &[
     turn::PROJECT_ID,
@@ -194,6 +210,10 @@ pub const ALL: &[&str] = &[
     turn::AUDIO_SECONDS,
     turn::COST,
     turn::RESPONSE_LATENCY_MS,
+    interaction::ACT,
+    interaction::TASK_REF,
+    interaction::ACK_LATENCY_MS,
+    interaction::ANSWER_LATENCY_MS,
     turn::BARGE_IN,
     turn::TURN_DETECTOR,
     turn::LANGUAGE,
@@ -345,6 +365,10 @@ macro_rules! __voice_turn_span_fields {
                 { $crate::observability::voice_attrs::turn::AUDIO_SECONDS } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::turn::COST } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::turn::RESPONSE_LATENCY_MS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::interaction::ACT } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::interaction::TASK_REF } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::interaction::ACK_LATENCY_MS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::interaction::ANSWER_LATENCY_MS } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::turn::BARGE_IN } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::turn::TURN_DETECTOR } = ::tracing::field::Empty,
                 { $crate::observability::voice_attrs::turn::LANGUAGE } = ::tracing::field::Empty,

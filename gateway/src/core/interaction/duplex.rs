@@ -88,6 +88,14 @@ struct Turn {
     speaking: bool,
     /// Its first words came with no onset while the analyser heard the agent's echo.
     echo: bool,
+    /// Its onset came while the agent was audible.
+    over_agent: bool,
+    /// The text end-of-turn model's latest reading: the words it read, and whether they are
+    /// finished.
+    judged: Option<(Vec<String>, bool)>,
+    /// The hold is only for words that may be finished (`Ending::Either`): the text model
+    /// reading them as finished ends it.
+    held_on_words: bool,
     /// The words the front was last asked about over the agent.
     asked: String,
     /// The caller's voiced audio in this turn.
@@ -173,6 +181,8 @@ pub struct Duplex {
     unworded: Option<(Ms, Option<f32>, Ms)>,
     /// The caller's answer to a question is expected (the latest input said so).
     answer_expected: bool,
+    /// The text end-of-turn model can read held words (`DuplexAction::JudgeWords`).
+    words_judge: bool,
 }
 
 impl Duplex {
@@ -200,7 +210,40 @@ impl Duplex {
             unanswered: None,
             unworded: None,
             answer_expected: false,
+            words_judge: false,
         }
+    }
+
+    /// A gateway with a text end-of-turn model: see [`Self::on_words`].
+    pub fn with_words_judge(mut self, on: bool) -> Self {
+        self.words_judge = on;
+        self
+    }
+
+    /// The text end-of-turn model's reading of words a turn was held on
+    /// (`DuplexAction::JudgeWords`).
+    pub fn on_words(
+        &mut self,
+        now: Ms,
+        text: &str,
+        finished: bool,
+        floor: &FloorSnapshot,
+        answer_expected: bool,
+    ) -> Vec<DuplexAction> {
+        self.answer_expected = answer_expected;
+        let mut out = Vec::new();
+        let Some(turn) = &mut self.turn else {
+            return out;
+        };
+        let words = word_list(text);
+        turn.judged = Some((words.clone(), finished));
+        // Words the caller has since gone on from (the hold was lifted) end nothing.
+        let held = turn.hold_until.is_some() && word_list(&turn.held) == words;
+        if finished && held && turn.held_on_words {
+            turn.hold_until = Some(now);
+            self.advance(now, floor, &mut out);
+        }
+        out
     }
 
     /// A speech-to-text that finishes its words when the segment is claimed, with its
@@ -448,7 +491,8 @@ impl Duplex {
                     // A turn held for want of a verdict: a sure one ends it now, and so does
                     // one that does not hold it (not a thinking pause, no dangling word).
                     // A dangling word holds whatever the verdict (see `speech_final`).
-                    let holds = p < THINKING_P || dangles(lexicon, &turn.held);
+                    let holds =
+                        p < THINKING_P || leaves_open(lexicon, turn, &turn.held, answer_expected);
                     if !holds && let Some(until) = &mut turn.hold_until {
                         *until = (*until).min(now);
                     }
@@ -547,6 +591,9 @@ impl Duplex {
                 class: None,
                 speaking: false,
                 echo: false,
+                over_agent: false,
+                judged: None,
+                held_on_words: false,
                 asked: String::new(),
                 voiced_ms: 0,
             }
@@ -558,6 +605,18 @@ impl Duplex {
     fn echoing(&self, now: Ms) -> bool {
         self.echo_at
             .is_some_and(|at| now.saturating_sub(at) <= Ms::from(self.cfg.echo.tail_ms))
+    }
+
+    /// Whether the turn's words can be the agent's own by their sound: the analyser gave no
+    /// onset for them (there is none, or it heard nothing), the turn began over the agent's
+    /// audio, or the analyser heard the agent's echo within `duplex.echo.tail_ms` of the
+    /// onset. An onset of the caller's after the agent's line, with no echo near it, is the
+    /// caller's voice, and repeating the line's words does not make it the agent's (spec 029 W-5).
+    fn echo_possible(&self, turn: &Turn, since: Ms) -> bool {
+        let tail = Ms::from(self.cfg.echo.tail_ms);
+        turn.onset.and_then(|(_, level)| level).is_none()
+            || turn.over_agent
+            || self.echo_at.is_some_and(|at| at + tail >= since)
     }
 
     /// The words of the turn so far that a barge-in is judged on. While the analyser hears
@@ -603,6 +662,7 @@ impl Duplex {
         let turn = self.open_turn(at);
         if turn.onset.is_none() && heard {
             turn.onset = Some((at, level_db));
+            turn.over_agent = floor.agent_audible;
         }
         // New speech merges into a held turn, and Smart Turn has to judge it again: its next
         // pause may be held too.
@@ -907,8 +967,9 @@ impl Duplex {
         let ceiling = self.silence_ms >= SILENCE_CEILING_MS;
         // Words that dangle are not claimed early: the caller is mid-phrase whatever Smart
         // Turn heard (the silence ceiling still claims them).
-        let dangling =
-            (self.turn.as_ref()).is_some_and(|turn| dangles(&self.lexicon, &turn.text()));
+        let dangling = (self.turn.as_ref()).is_some_and(|turn| {
+            leaves_open(&self.lexicon, turn, &turn.text(), self.answer_expected)
+        });
         let early = self.silence_ms >= SILENCE_SHORT_MS && sure && !dangling;
         let source = if ceiling {
             EotSource::SilenceCeiling
@@ -995,7 +1056,7 @@ impl Duplex {
             return self.endpoint_step(now, floor, out);
         }
         let unsure = turn.p.is_some_and(|p| p < TURN_END_P);
-        let dangling = dangles(&self.lexicon, &text);
+        let dangling = leaves_open(&self.lexicon, turn, &text, answer_expected);
         // A thinking pause: Smart Turn is sure the caller has not finished, or its verdict is
         // not in (the final came first, or the caller went on before it). A speech-to-text with
         // its own turn model (Flux) has judged the pause itself. Only in a turn the caller
@@ -1023,6 +1084,16 @@ impl Duplex {
         if !turn.hold_used && (dangling || thinking || story) {
             turn.hold_used = true;
             turn.hold_until = Some(now + HOLD_MS);
+            // A word that may end the sentence: the text model, where there is one, reads
+            // the words and ends the hold when they are finished ("Where are you from?").
+            turn.held_on_words =
+                !thinking && !story && ending(&self.lexicon, &text) == Ending::Either;
+            if turn.held_on_words && self.words_judge {
+                out.push(DuplexAction::JudgeWords {
+                    turn: turn.id,
+                    text: text.clone(),
+                });
+            }
             turn.held = text;
             turn.finals.clear();
             turn.claimed = false;
@@ -1083,11 +1154,12 @@ impl Duplex {
         };
         let since = turn.onset.map_or(turn.opened_at, |(at, _)| at);
         let suspected_echo = turn.echo_only()
-            || is_echo(
-                &word_list(&text),
-                floor,
-                since.saturating_sub(ECHO_WINDOW_MS),
-            );
+            || (self.echo_possible(&turn, since)
+                && is_echo(
+                    &word_list(&text),
+                    floor,
+                    since.saturating_sub(ECHO_WINDOW_MS),
+                ));
         let level = turn.onset.and_then(|(_, level)| level);
         let near = match (level, self.caller_db) {
             (Some(level), Some(caller)) => caller - level < BACKGROUND_DB,
@@ -1147,11 +1219,42 @@ impl Duplex {
     }
 }
 
-/// The words end on one that leaves the sentence open ("and", "to", "the").
-fn dangles(lexicon: &Lexicon, text: &str) -> bool {
-    word_list(text)
-        .last()
-        .is_some_and(|last| lexicon.dangling_end_words.contains(last))
+/// How the words of a pause end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// On a word that leaves the sentence open ("and", "to", "the").
+    Open,
+    /// On one that may leave it open or end it ("my booking from", "Where are you from?").
+    Either,
+    Finished,
+}
+
+fn ending(lexicon: &Lexicon, text: &str) -> Ending {
+    match word_list(text).last() {
+        Some(last) if !lexicon.dangling_end_words.contains(last) => Ending::Finished,
+        Some(last) if lexicon.can_end_sentence.contains(last) => Ending::Either,
+        Some(_) => Ending::Open,
+        None => Ending::Finished,
+    }
+}
+
+/// Whether `text`, the words of `turn` at a pause, leave its sentence open: they end on a word that
+/// always does, or on one that may (`Ending::Either`) in a turn the caller began in the quiet while
+/// no answer is expected, and the text model has not read them as finished. An answer to the
+/// agent's question and an interruption want their answer now (spec 029 W-4: "Where are you from?"
+/// waited 800 ms everywhere).
+fn leaves_open(lexicon: &Lexicon, turn: &Turn, text: &str, answer_expected: bool) -> bool {
+    let finished = || {
+        let words = word_list(text);
+        (turn.judged.as_ref()).is_some_and(|(judged, finished)| *finished && *judged == words)
+    };
+    match ending(lexicon, text) {
+        Ending::Open => true,
+        Ending::Either => {
+            !answer_expected && !turn.over_agent && turn.class.is_none() && !finished()
+        }
+        Ending::Finished => false,
+    }
 }
 
 /// Whether an eager end of turn may be guessed for `turn` (whose words are `text`) now:
@@ -1219,7 +1322,8 @@ mod tests {
             stop_talking_cues: list(&["stop", "hold on"]),
             side_talk_cues: list(&["honey", "not you"]),
             content_word_stop_list: list(&["the", "a", "to", "i", "you", "it", "is", "and", "um"]),
-            dangling_end_words: list(&["and", "to", "the"]),
+            dangling_end_words: list(&["and", "to", "the", "from"]),
+            can_end_sentence: list(&["from"]),
             strong_accept: list(&["yes", "go ahead"]),
             weak_accept: list(&["okay"]),
             decline: list(&["no"]),
@@ -2074,6 +2178,8 @@ mod tests {
             ..quiet()
         };
         let mut duplex = uploading();
+        // The analyser heard the agent's echo just before: the backstop applies (spec 029 W-5).
+        duplex.on_event(9_000, DuplexEvent::Echo { at: 9_000 }, &quiet(), false);
         duplex.on_event(10_000, onset(10_000), &quiet(), false);
         // The line ended 4 s before the onset: inside the window.
         let actions = duplex.on_stt(
@@ -2117,6 +2223,43 @@ mod tests {
         duplex.on_event(40_000, onset(40_000), &quiet(), false);
         let actions = duplex.on_stt(42_000, "two flights", true, true, &said(41_000), false);
         assert!(!end_of_turn(&actions).suspected_echo);
+    }
+
+    /// Spec 029 W-5: a reply in the caller's own voice, after the agent's line and with no echo
+    /// heard, is the caller's however many of the line's words it repeats. "Aisle seat, please."
+    /// after "window or an aisle seat?" shares 2 of its 3 words, and was dropped as the agent's
+    /// echo.
+    #[test]
+    fn a_reply_that_repeats_the_agents_words_is_the_callers_when_no_echo_is_heard() {
+        let question = "Would you like a window or an aisle seat?";
+        let asked = FloorSnapshot {
+            recent_agent_lines: vec![(9_600, question.to_owned())],
+            ..quiet()
+        };
+        let mut duplex = uploading();
+        duplex.on_event(10_000, onset(10_000), &asked, true);
+        let actions = duplex.on_stt(11_200, "Aisle seat, please.", true, true, &asked, true);
+        let turn = end_of_turn(&actions);
+        assert!(!turn.suspected_echo, "the caller's answer: {turn:?}");
+        assert_ne!(turn.class, Class::Echo);
+
+        // The same words just after the analyser heard the agent's echo: the backstop holds.
+        let mut duplex = uploading();
+        duplex.on_event(9_700, DuplexEvent::Echo { at: 9_700 }, &asked, true);
+        duplex.on_event(10_000, onset(10_000), &asked, true);
+        let actions = duplex.on_stt(11_200, "Aisle seat, please.", true, true, &asked, true);
+        assert!(end_of_turn(&actions).suspected_echo);
+
+        // Words that began over the agent's audio keep the lexical check too.
+        let mut duplex = uploading();
+        let playing = FloorSnapshot {
+            agent_audible: true,
+            recent_agent_lines: vec![(10_500, question.to_owned())],
+            ..quiet()
+        };
+        duplex.on_event(10_000, onset(10_000), &playing, true);
+        let actions = duplex.on_stt(11_200, "window or an aisle seat", true, true, &asked, true);
+        assert!(end_of_turn(&actions).suspected_echo);
     }
 
     /// Words, an offset, 200 ms of silence and a sure Smart Turn: the eager end of turn.
@@ -2434,6 +2577,102 @@ mod tests {
             eot.text.contains("warm") && eot.text.contains("beach"),
             "{}",
             eot.text
+        );
+    }
+
+    /// A final after a sure Smart Turn, in a turn the caller began at 0 (over the agent when
+    /// `floor` says so), and what the machine did.
+    fn final_after_sure(
+        duplex: &mut Duplex,
+        floor: &FloorSnapshot,
+        text: &str,
+        answer_expected: bool,
+    ) -> Vec<DuplexAction> {
+        duplex.on_event(0, onset(0), floor, answer_expected);
+        let offset = DuplexEvent::Offset {
+            at: 900,
+            voiced_ms: 900,
+        };
+        duplex.on_event(900, offset, floor, answer_expected);
+        let verdict = DuplexEvent::SmartTurn { at: 1_120, p: 0.9 };
+        duplex.on_event(1_120, verdict, floor, answer_expected);
+        duplex.on_stt(1_500, text, true, true, floor, answer_expected)
+    }
+
+    /// Spec 029 W-4: a word that may end a sentence ("from") holds only a turn the caller began in
+    /// the quiet while no answer is expected. "Where are you from?" waited 800 ms everywhere, the
+    /// answer to the agent's question included.
+    #[test]
+    fn an_end_word_that_may_finish_a_sentence_holds_only_a_free_turn_in_the_quiet() {
+        let asked = "Where are you from?";
+        // Free, in the quiet: held, as "I need to change my booking from" must be.
+        let mut duplex = streaming();
+        assert_eq!(
+            final_after_sure(&mut duplex, &quiet(), asked, false),
+            vec![]
+        );
+        let actions = duplex.tick(2_300, &quiet(), false);
+        assert_eq!(end_of_turn(&actions).text, asked);
+        // An answer is expected: it ends at once.
+        let mut duplex = streaming();
+        let actions = final_after_sure(&mut duplex, &quiet(), asked, true);
+        assert_eq!(end_of_turn(&actions).text, asked);
+        // A word that never ends a sentence still holds an answer ("the fifteenth and").
+        let mut duplex = streaming();
+        let open = "the fifteenth and";
+        assert_eq!(final_after_sure(&mut duplex, &quiet(), open, true), vec![]);
+        // Over the agent: the caller wants the answer now.
+        let mut duplex = streaming();
+        let floor = agent_speaking(0);
+        let actions = final_after_sure(&mut duplex, &floor, asked, false);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, DuplexAction::EndOfTurn(_))),
+            "{actions:?}"
+        );
+    }
+
+    /// Spec 029 W-4: with a text end-of-turn model the held words are read, and words it reads as
+    /// finished end the hold at once. It only shortens a hold: unfinished words wait the
+    /// hold out, and a word that never ends a sentence is not asked about.
+    #[test]
+    fn the_text_model_ends_a_hold_on_words_it_reads_as_finished() {
+        let asked = "Where are you from?";
+        let mut duplex = streaming().with_words_judge(true);
+        let held = final_after_sure(&mut duplex, &quiet(), asked, false);
+        assert_eq!(
+            held,
+            vec![DuplexAction::JudgeWords {
+                turn: TurnId(1),
+                text: asked.to_owned()
+            }]
+        );
+        let actions = duplex.on_words(1_530, asked, true, &quiet(), false);
+        assert_eq!(end_of_turn(&actions).text, asked);
+
+        // Unfinished words: the hold runs out as before.
+        let open = "I need to change my booking from";
+        let mut duplex = streaming().with_words_judge(true);
+        assert_eq!(
+            final_after_sure(&mut duplex, &quiet(), open, false).len(),
+            1
+        );
+        assert_eq!(duplex.on_words(1_530, open, false, &quiet(), false), vec![]);
+        assert_eq!(duplex.tick(2_299, &quiet(), false), vec![]);
+        assert_eq!(end_of_turn(&duplex.tick(2_300, &quiet(), false)).text, open);
+
+        // A reading of words the caller has since gone on from ends nothing.
+        let mut duplex = streaming().with_words_judge(true);
+        final_after_sure(&mut duplex, &quiet(), asked, false);
+        duplex.on_event(1_600, onset_alone(1_600), &quiet(), false);
+        assert_eq!(duplex.on_words(1_620, asked, true, &quiet(), false), vec![]);
+
+        // A word that never ends a sentence is not asked about.
+        let mut duplex = streaming().with_words_judge(true);
+        assert_eq!(
+            final_after_sure(&mut duplex, &quiet(), "book a table for two and", false),
+            vec![]
         );
     }
 

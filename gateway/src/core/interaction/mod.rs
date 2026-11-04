@@ -18,6 +18,7 @@ pub mod events;
 pub mod executor;
 pub mod floor;
 pub mod front_model;
+pub mod front_pool;
 pub mod front_supervisor;
 pub mod guard;
 pub mod health;
@@ -33,6 +34,7 @@ pub mod speech;
 pub mod store;
 pub mod tasks;
 pub mod tenant;
+pub mod turn_record;
 pub mod types;
 
 pub use actor::Msg;
