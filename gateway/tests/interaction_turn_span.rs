@@ -20,12 +20,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::layer::SubscriberExt;
 
 use ix_mocks::{LlmDouble, Round};
@@ -39,6 +40,7 @@ use waav_gateway::core::interaction::background::{Backend, RunSpec, spawn_run};
 use waav_gateway::core::interaction::bud_agent::{AgentBackground, AgentRun, spawn_agent_run};
 use waav_gateway::core::interaction::turn_record::TurnRecord;
 use waav_gateway::core::interaction::types::{Act, RunEvent, RunId, TurnId};
+use waav_gateway::observability::voice_attrs::span_names;
 
 #[derive(Debug, Clone, Default)]
 struct Collect(Arc<Mutex<Vec<SpanData>>>);
@@ -83,7 +85,49 @@ impl TurnBackend for Answering {
         Ok(stream::iter(events.map(Ok)).boxed())
     }
 
-    async fn cancel(&self, _response_id: &str, _prompt_name: &str, _bearer: &str) {}
+    async fn cancel(
+        &self,
+        _response_id: &str,
+        _prompt_name: &str,
+        _bearer: &str,
+        _traceparent: Option<&str>,
+    ) {
+    }
+}
+
+/// A Bud gateway whose agent starts a run and never ends it: the traceparent the run was opened
+/// with, and the one its cancel carried.
+#[derive(Default)]
+struct Hanging {
+    opened: Mutex<Option<String>>,
+    cancelled: Mutex<Option<Option<String>>>,
+}
+
+#[async_trait]
+impl TurnBackend for Hanging {
+    async fn open(
+        &self,
+        _request: &AgentTurnRequest,
+        _bearer: &str,
+        traceparent: Option<&str>,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, TurnFailure>>, TurnFailure> {
+        *self.opened.lock().unwrap() = traceparent.map(str::to_owned);
+        let created = AgentEvent::Created {
+            response_id: "resp_hang".to_owned(),
+            conversation_id: None,
+        };
+        Ok(stream::iter([Ok(created)]).chain(stream::pending()).boxed())
+    }
+
+    async fn cancel(
+        &self,
+        _response_id: &str,
+        _prompt_name: &str,
+        _bearer: &str,
+        traceparent: Option<&str>,
+    ) {
+        *self.cancelled.lock().unwrap() = Some(traceparent.map(str::to_owned));
+    }
 }
 
 /// Waits for the run's last report; the test fails unless it finished.
@@ -106,11 +150,11 @@ fn attributes(span: &SpanData) -> HashMap<String, String> {
         .collect()
 }
 
-/// The exported `voice.turn` spans of a session.
+/// The exported record spans of a session, of every kind (`voice_attrs::span_names`).
 fn session_turns<'a>(spans: &'a [SpanData], session: &str) -> Vec<&'a SpanData> {
     spans
         .iter()
-        .filter(|span| span.name == "voice.turn")
+        .filter(|span| span_names::ALL.contains(&&*span.name))
         .filter(|span| {
             attributes(span)
                 .get("bud.voice.session_id")
@@ -150,6 +194,11 @@ fn a_background_run_is_recorded_as_the_turn_of_its_plain_path() {
         .build()
         .unwrap();
     let backend = Arc::new(Answering::default());
+    let hanging = Arc::new(Hanging::default());
+    // The Bud session's `voice.ws_session` span, as `LegMeter` opens it.
+    let ws_session = tracing::info_span!(parent: None, "voice.ws_session");
+    let session_ctx = ws_session.context().span().span_context().clone();
+    assert!(session_ctx.is_valid());
     let sent_2 = runtime.block_on(async {
         // 1. An LLM-tier run of a Bud-mode conversation session.
         let llm = LlmDouble::start().await;
@@ -205,6 +254,7 @@ fn a_background_run_is_recorded_as_the_turn_of_its_plain_path() {
             conversation_id: "conv_voice_session-2".to_owned(),
             variables: None,
             text_only: false,
+            session_link: None,
         };
         let credential = SessionCredential::new("bud-caller-key");
         let brain = Arc::clone(&backend) as Arc<dyn TurnBackend>;
@@ -216,6 +266,7 @@ fn a_background_run_is_recorded_as_the_turn_of_its_plain_path() {
             words: vec!["where is my order".to_owned()],
             caller: "where is my order".to_owned(),
             turn: None,
+            after: None,
         };
         spawn_agent_run(spec, tx, CancellationToken::new());
         finished(&mut rx).await;
@@ -240,6 +291,7 @@ fn a_background_run_is_recorded_as_the_turn_of_its_plain_path() {
             conversation_id: "conv_voice_session-3".to_owned(),
             variables: None,
             text_only: false,
+            session_link: Some(session_ctx.clone()),
         };
         let credential = SessionCredential::new("bud-caller-key");
         let brain = Arc::clone(&backend) as Arc<dyn TurnBackend>;
@@ -255,6 +307,7 @@ fn a_background_run_is_recorded_as_the_turn_of_its_plain_path() {
             words: vec!["where is my order".to_owned()],
             caller: "where is my order".to_owned(),
             turn: Some(turn.trace()),
+            after: None,
         };
         spawn_agent_run(spec, tx, CancellationToken::new());
         finished(&mut rx).await;
@@ -264,6 +317,50 @@ fn a_background_run_is_recorded_as_the_turn_of_its_plain_path() {
         let thanks = TurnRecord::open(agent.turn_span("session-3", 8, "thanks"), TurnId(8), 50_000);
         thanks.settled(Act::Social);
         drop(thanks);
+
+        // 4. Interaction mode: a run the caller's barge-in cancels. Its cancel is part of the
+        // run's trace, not a trace of its own.
+        let session = AgentSessionConfig {
+            session_id: "session-3".to_owned(),
+            prompt_name: "support".to_owned(),
+            version: 2,
+            entry: Arc::new(
+                bud_auth::parse_voice_agent_blob(
+                    &json!({
+                        "prompt_id": "c0de", "version": 2, "project_id": "proj-agent",
+                        "stt": {"endpoint_id": "s"}, "tts": {"endpoint_id": "t"},
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+            ),
+            conversation_id: "conv_voice_session-3".to_owned(),
+            variables: None,
+            text_only: false,
+            session_link: Some(session_ctx.clone()),
+        };
+        let brain = Arc::clone(&hanging) as Arc<dyn TurnBackend>;
+        let credential = SessionCredential::new("bud-caller-key");
+        let stopped = AgentBackground::new(brain, session, credential, None);
+        let span = stopped.turn_span("session-3", 9, "book a table");
+        let turn = TurnRecord::open(span, TurnId(9), 60_000);
+        turn.settled(Act::Delegate);
+        let (tx, mut rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let spec = AgentRun {
+            run: RunId(11),
+            agent: Arc::clone(&stopped),
+            words: vec!["book a table".to_owned()],
+            caller: "book a table".to_owned(),
+            turn: Some(turn.trace()),
+            after: None,
+        };
+        let task = spawn_agent_run(spec, tx, cancel.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+        while rx.recv().await.is_some() {}
+        task.await.unwrap();
+        drop(turn);
         // Each run drops its span right after its last report.
         tokio::time::sleep(Duration::from_millis(200)).await;
         sent_2
@@ -316,7 +413,8 @@ fn a_background_run_is_recorded_as_the_turn_of_its_plain_path() {
     // Interaction mode: turn 7's record is the root of its trace and its run a child in it;
     // turn 8 is a trace of its own with no run. Two traces, two rows.
     let turns = session_turns(&spans, "session-3");
-    assert_eq!(turns.len(), 3, "{turns:?}");
+    // Turn 7's record and run, turn 8's record, and turn 9's (step 4) record and run.
+    assert_eq!(turns.len(), 5, "{turns:?}");
     let index = |span: &SpanData| attributes(span).get("bud.voice.turn_index").cloned();
     let seventh: Vec<&SpanData> = turns
         .iter()
@@ -356,4 +454,42 @@ fn a_background_run_is_recorded_as_the_turn_of_its_plain_path() {
     assert_ne!(eighth.span_context.trace_id(), root.span_context.trace_id());
     has(&attributes(eighth), "bud.voice.interaction.act", "social");
     assert!(!attributes(eighth).contains_key("bud.voice.interaction.task_ref"));
+
+    // Interaction mode in a Bud session: each caller turn's record (the root of its trace)
+    // links to the session's `voice.ws_session` span, as a plain agent turn does, so budmetrics
+    // folds it under the session row (members are `voice.turn` roots whose first link is the
+    // session's). A run is a child in its turn's trace and carries no link of its own.
+    let links_session = |span: &SpanData| {
+        span.links.iter().any(|l| {
+            l.span_context.span_id() == session_ctx.span_id()
+                && l.span_context.trace_id() == session_ctx.trace_id()
+        })
+    };
+    assert!(
+        links_session(root),
+        "turn 7's record links to its session: {:?}",
+        root.links
+    );
+    assert!(
+        links_session(eighth),
+        "the front's turn links to its session: {:?}",
+        eighth.links
+    );
+    assert_ne!(root.span_context.trace_id(), session_ctx.trace_id());
+    assert!(!links_session(run), "the run is folded through its turn");
+
+    // The cancelled run's cancel continues the run's trace.
+    let opened = hanging
+        .opened
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the run opened");
+    let cancelled = hanging.cancelled.lock().unwrap().clone();
+    assert_eq!(
+        cancelled,
+        Some(Some(opened)),
+        "the cancel carries the run's traceparent"
+    );
+    drop(ws_session);
 }

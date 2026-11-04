@@ -1749,3 +1749,222 @@ async fn a_compressed_output_carries_no_generated_sound() {
         "made at 8 kHz though the session names no rate"
     );
 }
+
+/// A Bud session traces its STT connection as a vendor call beneath the session span: the URL it
+/// opened, open while the connection is, and failed with the vendor's error when it would not
+/// connect.
+mod stt_vendor_trace {
+    use super::*;
+    use crate::core::stt::{BaseSTT, STTError, STTErrorCallback, STTResultCallback};
+    use crate::observability::vendor_span::{VendorScope, operation};
+    use bytes::Bytes;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+
+    const URL: &str =
+        "wss://api.deepgram.com/v1/listen?model=nova-3&language=en-US&encoding=linear16";
+
+    struct FakeStt {
+        config: STTConfig,
+        refuse: Option<STTError>,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSTT for FakeStt {
+        fn new(config: STTConfig) -> Result<Self, STTError> {
+            Ok(Self {
+                config,
+                refuse: None,
+            })
+        }
+        async fn connect(&mut self) -> Result<(), STTError> {
+            self.refuse.take().map_or(Ok(()), Err)
+        }
+        async fn disconnect(&mut self) -> Result<(), STTError> {
+            Ok(())
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        async fn send_audio(&mut self, _audio: Bytes) -> Result<(), STTError> {
+            Ok(())
+        }
+        async fn on_result(&mut self, _callback: STTResultCallback) -> Result<(), STTError> {
+            Ok(())
+        }
+        async fn on_error(&mut self, _callback: STTErrorCallback) -> Result<(), STTError> {
+            Ok(())
+        }
+        fn get_config(&self) -> Option<&STTConfig> {
+            Some(&self.config)
+        }
+        async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError> {
+            self.config = config;
+            Ok(())
+        }
+        fn vendor_url(&self) -> Option<String> {
+            Some(URL.to_string())
+        }
+        fn get_provider_info(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// (id, parent id, fields incl. `<closed>`) per span.
+    #[derive(Clone, Default)]
+    struct Spans(Arc<Mutex<Vec<(u64, Option<u64>, HashMap<String, String>)>>>);
+
+    struct V<'a>(&'a mut HashMap<String, String>);
+    impl Visit for V<'_> {
+        fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+            self.0.insert(f.name().to_string(), format!("{v:?}"));
+        }
+        fn record_str(&mut self, f: &Field, v: &str) {
+            self.0.insert(f.name().to_string(), v.to_string());
+        }
+    }
+
+    struct Capture(Spans);
+    impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+            let mut fields = HashMap::new();
+            fields.insert("<name>".into(), attrs.metadata().name().to_string());
+            attrs.record(&mut V(&mut fields));
+            let parent = attrs
+                .parent()
+                .cloned()
+                .or_else(|| ctx.current_span().id().cloned())
+                .map(|p| p.into_u64());
+            self.0
+                .0
+                .lock()
+                .unwrap()
+                .push((id.into_u64(), parent, fields));
+        }
+        fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+            let mut all = self.0.0.lock().unwrap();
+            if let Some((_, _, f)) = all.iter_mut().rev().find(|(i, _, _)| *i == id.into_u64()) {
+                values.record(&mut V(f));
+            }
+        }
+        fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
+            let mut all = self.0.0.lock().unwrap();
+            if let Some((_, _, f)) = all.iter_mut().rev().find(|(i, _, _)| *i == id.into_u64()) {
+                f.insert("<closed>".into(), "true".into());
+            }
+        }
+    }
+
+    fn vendor_calls(spans: &Spans) -> Vec<(Option<u64>, HashMap<String, String>)> {
+        spans
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, f)| f["<name>"] == "voice.vendor_call")
+            .map(|(_, p, f)| (*p, f.clone()))
+            .collect()
+    }
+
+    fn fake(refuse: Option<STTError>) -> FakeStt {
+        FakeStt {
+            config: STTConfig {
+                provider: "deepgram".into(),
+                model: "nova-3".into(),
+                api_key: "dg-secret".into(),
+                ..Default::default()
+            },
+            refuse,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_connection_is_one_vendor_call_under_the_session_open_until_stop() {
+        let spans = Spans::default();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(spans.clone())),
+        );
+        let session = tracing::info_span!(parent: None, "voice.ws_session");
+        let session_id = session.id().unwrap().into_u64();
+        let vm = ag6_voice_manager();
+        vm.set_stt_vendor_scope(VendorScope::new(session.clone(), operation::TRANSCRIPTION));
+        drop(session);
+
+        let mut stt = fake(None);
+        vm.connect_stt(&mut stt).await.unwrap();
+        let calls = vendor_calls(&spans);
+        assert_eq!(calls.len(), 1);
+        let (parent, call) = &calls[0];
+        assert_eq!(*parent, Some(session_id), "beneath the session span");
+        assert_eq!(call["otel.name"], "transcription nova-3");
+        assert_eq!(
+            call["url.full"], URL,
+            "exactly what was opened, query string included"
+        );
+        assert_eq!(call["http.response.status_code"], "101");
+        assert!(
+            !call.contains_key("<closed>"),
+            "open while the connection is"
+        );
+        assert!(!call.values().any(|v| v.contains("dg-secret")));
+
+        vm.stop().await.unwrap();
+        let (_, call) = &vendor_calls(&spans)[0];
+        assert_eq!(
+            call.get("<closed>").map(String::as_str),
+            Some("true"),
+            "ended by stop()"
+        );
+        let session_closed = spans
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(i, _, f)| *i == session_id && f.contains_key("<closed>"));
+        assert!(
+            session_closed,
+            "and nothing in the manager holds the session span open"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_a_failed_vendor_call() {
+        let spans = Spans::default();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(spans.clone())),
+        );
+        let session = tracing::info_span!(parent: None, "voice.ws_session");
+        let vm = ag6_voice_manager();
+        vm.set_stt_vendor_scope(VendorScope::new(session.clone(), operation::TRANSCRIPTION));
+
+        let refused = STTError::VendorStatus {
+            status: 400,
+            error: Box::new(STTError::ConnectionFailed(
+                "HTTP error: 400 Bad Request".into(),
+            )),
+        };
+        let mut stt = fake(Some(refused));
+        assert!(vm.connect_stt(&mut stt).await.is_err());
+        let (_, call) = &vendor_calls(&spans)[0];
+        assert_eq!(call["url.full"], URL, "what was sent, to debug the refusal");
+        assert_eq!(call["http.response.status_code"], "400");
+        assert_eq!(call["otel.status_code"], "ERROR");
+        assert!(call["otel.status_message"].contains("400 Bad Request"));
+        assert_eq!(call.get("<closed>").map(String::as_str), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn without_a_scope_nothing_is_traced() {
+        let spans = Spans::default();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(spans.clone())),
+        );
+        let vm = ag6_voice_manager();
+        vm.connect_stt(&mut fake(None)).await.unwrap();
+        assert!(vendor_calls(&spans).is_empty());
+    }
+}

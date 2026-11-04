@@ -72,11 +72,15 @@ pub fn agent_signal_message(signal: &AgentSignal) -> Option<OutgoingMessage> {
             item_id,
             name,
             status,
+            duration_ms,
+            error,
         } => OutgoingMessage::AgentTool {
             turn_index: turn,
             item_id,
             name,
             status: status.into(),
+            duration_ms,
+            error,
         },
         AgentSignal::FunctionCall {
             turn,
@@ -107,6 +111,7 @@ pub fn agent_signal_message(signal: &AgentSignal) -> Option<OutgoingMessage> {
             status,
             usage,
             transcript,
+            metrics,
         } => OutgoingMessage::AgentResponseDone {
             turn_index: turn,
             kind: kind_str(kind).into(),
@@ -114,6 +119,7 @@ pub fn agent_signal_message(signal: &AgentSignal) -> Option<OutgoingMessage> {
             status: status.as_str().into(),
             usage,
             transcript,
+            metrics: metrics.and_then(|m| serde_json::to_value(m).ok()),
         },
         AgentSignal::Truncated {
             turn,
@@ -138,15 +144,20 @@ pub fn agent_signal_message(signal: &AgentSignal) -> Option<OutgoingMessage> {
 const CLOSE_NORMAL: u16 = 1000;
 
 /// Send a turn's signals to the client as `/ws` messages, in order, until the sender is dropped.
-/// Shared by voice-agent and conversation sessions. `Idle` (agents only) ends the session.
+/// Shared by voice-agent and conversation sessions. `Idle` (agents only) ends the session, and
+/// `meter` (an agent's Bud session) records that as the session's end reason.
 pub(super) fn spawn_signal_forwarder(
     mut signal_rx: mpsc::UnboundedReceiver<AgentSignal>,
     tx: mpsc::Sender<MessageRoute>,
     tracker: &crate::core::observability::SessionTaskTracker,
+    meter: Option<Arc<super::bud_legs::LegMeter>>,
 ) {
     let handle = tokio::spawn(async move {
         while let Some(signal) = signal_rx.recv().await {
             if matches!(signal, AgentSignal::Idle) {
+                if let Some(meter) = &meter {
+                    meter.set_end_reason("idle");
+                }
                 let _ = send_with_policy(
                     &tx,
                     MessageRoute::Outgoing(OutgoingMessage::AgentError {
@@ -202,6 +213,12 @@ pub(super) async fn initialize_agent_loop(
         .ok_or_else(|| "a voice agent needs your Bud API key or token".to_string())?;
 
     let entry = Arc::clone(&agent.entry);
+    let session_link = state
+        .read()
+        .await
+        .leg_meter
+        .as_ref()
+        .and_then(|m| m.session_link());
     let (signal_tx, signal_rx) = mpsc::unbounded_channel::<AgentSignal>();
     let engine = AgentEngine::new(
         AgentSessionConfig {
@@ -212,6 +229,7 @@ pub(super) async fn initialize_agent_loop(
             conversation_id: conversation_id_for(stream_id),
             variables: cfg.variables.clone(),
             text_only: cfg.text_only.unwrap_or(false),
+            session_link,
         },
         Arc::new(AgentBrain::new(base_url)) as Arc<dyn TurnBackend>,
         Arc::clone(vm) as Arc<dyn SpeechOut>,
@@ -239,7 +257,8 @@ pub(super) async fn initialize_agent_loop(
     // Engine signals -> /ws messages.
     {
         let tracker = state.read().await.task_tracker.clone();
-        spawn_signal_forwarder(signal_rx, message_tx.clone(), &tracker);
+        let meter = state.read().await.leg_meter.clone();
+        spawn_signal_forwarder(signal_rx, message_tx.clone(), &tracker, meter);
     }
 
     limit_session(&entry, Some(&engine), state, message_tx, app_state).await;
@@ -458,8 +477,12 @@ pub(super) async fn limit_session(
     let tx = message_tx.clone();
     let weak = engine.map(Arc::downgrade);
     let tracker = state.read().await.task_tracker.clone();
+    let meter = state.read().await.leg_meter.clone();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(limit).await;
+        if let Some(meter) = &meter {
+            meter.set_end_reason("max_duration");
+        }
         if let Some(engine) = weak.and_then(|weak| weak.upgrade()) {
             engine.shutdown().await;
         }
@@ -687,6 +710,8 @@ mod tests {
                     item_id: "mcp_1".into(),
                     name: "lookup".into(),
                     status: "in_progress",
+                    duration_ms: None,
+                    error: None,
                 },
                 json!({"type": "agent_tool", "turn_index": 1, "item_id": "mcp_1", "name": "lookup", "status": "in_progress"}),
             ),
@@ -698,6 +723,7 @@ mod tests {
                     status: TurnStatus::Cancelled,
                     usage: None,
                     transcript: "Hel".into(),
+                    metrics: None,
                 },
                 json!({"type": "agent_response_done", "turn_index": 1, "kind": "agent", "response_id": "resp_1", "status": "cancelled", "transcript": "Hel"}),
             ),

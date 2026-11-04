@@ -302,6 +302,7 @@ impl Rig {
                     conversation_id: "conv_voice_s".to_owned(),
                     variables: None,
                     text_only: false,
+                    session_link: None,
                 };
                 let brain = Arc::new(AgentBrain::new(base));
                 let credential = SessionCredential::new("bud-caller-key");
@@ -320,7 +321,7 @@ impl Rig {
             vm: vm.clone(),
             ctl: ctl.clone(),
             pump_rx,
-            speech: speech::spawn(vm.clone(), ctl.clone(), pump_tx),
+            speech: speech::spawn(vm.clone(), ctl.clone(), pump_tx, Default::default()),
             out,
             background,
             system_prompt: Some("You answer callers of the Larkspur shop.".to_owned()),
@@ -2927,7 +2928,7 @@ async fn a_sentence_that_repeats_the_backgrounds_prompt_is_never_spoken() {
 
 // ---- the session's background is a Bud agent
 
-use budgateway::{completed, created, delta, tool};
+use budgateway::{completed, created, delta, hold, tool};
 
 /// A voice-agent session: the entry's `interaction` block and the rest of the entry.
 fn agent_session(interaction: Option<Value>, entry: Value) -> Opts {
@@ -3116,7 +3117,7 @@ async fn a_declared_marker_streams_an_agents_answer_and_a_cut_is_told_to_its_nex
 
 #[tokio::test(start_paused = true)]
 #[serial]
-async fn a_second_request_waits_for_the_agents_first_run() {
+async fn a_second_request_runs_beside_the_agents_first_run() {
     let rig = Rig::start(agent_session(None, json!({}))).await;
     rig.agent_run(vec![
         (100, created("resp_1")),
@@ -3133,31 +3134,29 @@ async fn a_second_request_waits_for_the_agents_first_run() {
     rig.until_event("task_created", 1).await;
     rig.run(1_500).await;
 
-    // budprompt takes one run of a conversation at a time: the second task is queued.
+    // budprompt chains the conversation's turns: the second task starts at once.
     let typed = "what time does the store open on sunday".to_owned();
     rig.send(Msg::TypedTurn(typed.clone())).await;
     rig.until_event("task_created", 2).await;
-    let queued = &rig.events("task_created")[1];
-    assert_eq!(queued["state"], "submitted", "{}", rig.timeline());
+    let second = &rig.events("task_created")[1];
+    assert_eq!(second["state"], "working", "{}", rig.timeline());
     rig.run(500).await;
-    assert_eq!(
-        rig.bud().bodies.lock().len(),
-        1,
-        "one run on the conversation"
-    );
-
-    rig.until_event("task_result", 2).await;
-    rig.until_heard("The store opens at nine.").await;
     let bodies = rig.bud().bodies.lock().clone();
-    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies.len(), 2, "two runs on the conversation");
     assert_eq!(bodies[1]["input"], typed);
-    let first_done = rig.time_of("the first result", |event| event["type"] == "task_result");
-    let second_started = rig.time_of("the second task starts", |event| {
-        event["type"] == "task_progress"
-            && event["task_id"] == queued["task_id"]
-            && event["state"] == "working"
-    });
-    assert!(second_started >= first_done, "{}", rig.timeline());
+    assert_eq!(bodies[0]["conversation"], bodies[1]["conversation"]);
+
+    // The second answer comes first, while the first task still runs: it says which request
+    // it answers.
+    rig.until_heard("The store opens at nine.").await;
+    assert!(
+        rig.said().iter().any(|line| line.starts_with("About your")),
+        "{:?}\n{}",
+        rig.said(),
+        rig.timeline()
+    );
+    rig.until_event("task_result", 2).await;
+    rig.until_heard("Your order shipped on Monday.").await;
     assert!(rig.heard_in_full("Your order shipped on Monday."));
     assert!(rig.bud().cancels.lock().is_empty());
 }
@@ -3200,7 +3199,10 @@ async fn a_cancel_while_an_agents_tool_runs_says_what_it_had_started() {
 #[tokio::test(start_paused = true)]
 #[serial]
 async fn an_agent_run_held_for_approval_is_said_so() {
-    let rig = Rig::start(agent_session(None, json!({}))).await;
+    // FR-APR-1 (spec 029 WP-IM3.5): the agent's own `approval_message` is said, not the
+    // persona's `approval_needed` line.
+    let entry = json!({"approval_message": "A supervisor has to sign off on refunds."});
+    let rig = Rig::start(agent_session(None, entry)).await;
     let held = json!({"error": {
         "code": "approval_required_foreground",
         "message": "a manager must approve refunds",
@@ -3216,13 +3218,254 @@ async fn an_agent_run_held_for_approval_is_said_so() {
         "approval_required: a manager must approve refunds"
     );
     assert_eq!(result["effects"], "none_committed");
-    rig.until_heard("That needs someone's approval first, so I haven't done it.")
+    rig.until_heard("A supervisor has to sign off on refunds.")
         .await;
     assert!(
         !rig.said().iter().any(|line| line.contains("couldn't")),
         "{}",
         rig.timeline()
     );
+}
+
+/// Spec 029 §7.3: budprompt holds a call for the caller's approval. The caller hears it read
+/// back in the author's words (`tool_confirmations`); a "yes" votes it through on the same
+/// turn and the answer is heard; a "no" declines it, and nothing was done.
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn a_call_the_agent_holds_is_read_back_and_the_callers_answer_is_its_vote() {
+    for (answer, approve) in [("yes", true), ("no", false)] {
+        let entry = json!({"tool_confirmations": {"refund_order": {
+            "phrase": "refund your order", "template": "refund order {order_id}"}}});
+        let rig = Rig::start(agent_session(None, entry)).await;
+        rig.bud().replies.lock().push_back(Reply::Held {
+            before: vec![
+                (200, created("resp_1")),
+                (
+                    100,
+                    hold("esc_1", "refund_order", json!({"order_id": "4417"}), 30),
+                ),
+            ],
+            approved: vec![
+                (0, tool("mcp_1", "refund_order", false)),
+                (300, tool("mcp_1", "refund_order", true)),
+                (100, delta("Your refund is on its way.")),
+                (0, completed()),
+            ],
+            declined: vec![
+                (100, delta("Okay, I have not refunded it.")),
+                (0, completed()),
+            ],
+        });
+        rig.ready().await;
+        rig.turn("please refund order 4417").await;
+        rig.until_event("task_question", 1).await;
+        let question = rig.events("task_question")[0].clone();
+        assert_eq!(question["kind"], "confirm", "{question}");
+        assert_eq!(question["irreversible"], true, "{question}");
+        assert_eq!(
+            question["prompt"],
+            "To confirm: Refund order 4417. Do you want me to do that?"
+        );
+        assert!(
+            rig.bud().votes.lock().is_empty(),
+            "no vote before the answer"
+        );
+
+        rig.until_heard("Do you want me to do that?").await;
+        rig.run(300).await;
+        rig.turn(answer).await;
+        let (said, effects) = if approve {
+            ("Your refund is on its way.", json!(["used refund order"]))
+        } else {
+            ("Okay, I have not refunded it.", json!("none_committed"))
+        };
+        rig.until_event("task_result", 1).await;
+        rig.until_heard(said).await;
+        let result = &rig.events("task_result")[0];
+        assert_eq!(result["effects"], effects, "{answer}: {}", rig.timeline());
+
+        // The vote went with the turn's own bearer, continuing the turn's response.
+        let votes = rig.bud().votes.lock().clone();
+        let mut want = json!({"prompt": {"id": "support"}, "previous_response_id": "resp_1", "stream": false,
+            "input": [{"type": "mcp_approval_response", "approval_request_id": "esc_1",
+                       "approve": approve}]});
+        if !approve {
+            want["input"][0]["reason"] = json!("declined");
+        }
+        let bearer = rig.bud().auth.lock()[0].clone();
+        assert_eq!(votes, [(want, bearer)], "{answer}");
+        assert_eq!(rig.bud().bodies.lock().len(), 1, "one turn");
+    }
+}
+
+/// Live (IM3, 3 Nov, call im3-running-1): the caller asked for something else over the
+/// read-back of a held call. That was taken as an unclear answer ("Sorry, was that a yes or a
+/// no?"), the "Yes, go ahead" that followed was lost because the read-back was still unheard,
+/// and the hold timed out. The new request runs beside the held call, the question is asked
+/// again in full, and the yes after it is the vote.
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn a_request_over_the_read_back_runs_beside_the_held_call_and_the_yes_after_is_its_vote() {
+    let entry = json!({"tool_confirmations": {"refund_order": {
+        "phrase": "refund your order", "template": "refund order {order_id}"}}});
+    let rig = Rig::start(agent_session(None, entry)).await;
+    rig.bud().replies.lock().push_back(Reply::Held {
+        before: vec![
+            (200, created("resp_1")),
+            (
+                100,
+                hold("esc_1", "refund_order", json!({"order_id": "4417"}), 30),
+            ),
+        ],
+        approved: vec![
+            (0, tool("mcp_1", "refund_order", false)),
+            (300, tool("mcp_1", "refund_order", true)),
+            (100, delta("Your refund is on its way.")),
+            (0, completed()),
+        ],
+        declined: vec![
+            (100, delta("Okay, I have not refunded it.")),
+            (0, completed()),
+        ],
+    });
+    // The other request's answer takes longer than the test.
+    rig.agent_run(vec![
+        (200, created("resp_2")),
+        (60_000, delta("The cluster has four nodes.")),
+        (0, completed()),
+    ]);
+    rig.ready().await;
+    rig.turn("please refund order 4417").await;
+    rig.until_event("task_question", 1).await;
+
+    // The caller asks for something else while the read-back plays: it stops at the first word.
+    rig.until("the read-back plays", 10_000, |rig| {
+        rig.said().contains(&"Refund order 4417.".to_owned())
+    })
+    .await;
+    rig.run(300).await;
+    rig.onset().await;
+    rig.stt.interim("also").await;
+    rig.until_event("agent_audio_stopped", 1).await;
+    rig.run(700).await;
+    rig.offset(700).await;
+    rig.stt
+        .speech_final("Also, how many nodes does the cluster have?")
+        .await;
+
+    // A task of its own, and the question asked again in full and heard.
+    rig.until_event("task_created", 2).await;
+    let asked_again = |rig: &Rig| {
+        let lines = rig.lines();
+        let question = |line: &&Value| line["delta"] == "Do you want me to do that?";
+        let last = lines.iter().rev().find(question);
+        let readbacks = lines
+            .iter()
+            .filter(|line| line["delta"] == "Refund order 4417.");
+        readbacks.count() >= 2
+            && last.is_some_and(|line| rig.heard(&line["utterance_id"]) == "full")
+    };
+    rig.until("the question is asked again", 15_000, asked_again)
+        .await;
+    assert!(
+        !rig.said()
+            .contains(&"Sorry, was that a yes or a no?".to_owned()),
+        "{}",
+        rig.timeline()
+    );
+    assert!(rig.bud().votes.lock().is_empty(), "no vote yet");
+
+    rig.run(300).await;
+    rig.turn("Yes, go ahead").await;
+    rig.until("the vote", 10_000, |rig| !rig.bud().votes.lock().is_empty())
+        .await;
+    let votes = rig.bud().votes.lock().clone();
+    assert_eq!(
+        votes[0].0["input"][0]["approve"],
+        true,
+        "{votes:?}\n{}",
+        rig.timeline()
+    );
+    let answered = rig.events("task_answer_received");
+    assert_eq!(answered.len(), 1, "{}", rig.timeline());
+    assert_eq!(
+        (&answered[0]["outcome"], &answered[0]["by"]),
+        (&json!("accept"), &json!("voice"))
+    );
+    rig.until_heard("Your refund is on its way.").await;
+    assert_eq!(
+        rig.bud().bodies.lock().len(),
+        2,
+        "two turns: the refund, the nodes"
+    );
+}
+
+/// Live (IM3, 3 Nov, call im3b-early_yes-1): a short "Yes." over the read-back is taken as a
+/// backchannel by its sound, and the read-back plays on. The yes was not heard, so it did not
+/// bind, and nothing followed the question: the caller, who had answered, waited 9 s for the
+/// silence re-ask, and the hold timed out. The question is asked again with its values as
+/// soon as it was heard, and the yes after that is the vote.
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn a_yes_over_the_read_back_of_a_held_call_is_asked_again_at_once_and_then_voted() {
+    let entry = json!({"tool_confirmations": {"refund_order": {
+        "phrase": "refund your order", "template": "refund order {order_id}"}}});
+    let rig = Rig::start(agent_session(None, entry)).await;
+    rig.bud().replies.lock().push_back(Reply::Held {
+        before: vec![
+            (200, created("resp_1")),
+            (
+                100,
+                hold("esc_1", "refund_order", json!({"order_id": "4417"}), 30),
+            ),
+        ],
+        approved: vec![
+            (0, tool("mcp_1", "refund_order", false)),
+            (300, tool("mcp_1", "refund_order", true)),
+            (100, delta("Your refund is on its way.")),
+            (0, completed()),
+        ],
+        declined: vec![
+            (100, delta("Okay, I have not refunded it.")),
+            (0, completed()),
+        ],
+    });
+    rig.ready().await;
+    rig.turn("please refund order 4417").await;
+    rig.until_event("task_question", 1).await;
+    rig.until("the read-back plays", 10_000, |rig| {
+        rig.said().contains(&"Refund order 4417.".to_owned())
+    })
+    .await;
+
+    // A short sound with no words yet: a backchannel, and the read-back goes on.
+    rig.run(200).await;
+    rig.speech(300).await;
+    rig.stt.speech_final("Yes.").await;
+    rig.run(200).await;
+    assert!(
+        rig.events("agent_audio_stopped").is_empty(),
+        "not cut: {}",
+        rig.timeline()
+    );
+    let reask = "Okay, that's 4417. Do you want me to do that?";
+    rig.until("the question is asked again", 8_000, |rig| {
+        rig.heard_in_full(reask)
+    })
+    .await;
+    assert!(
+        rig.bud().votes.lock().is_empty(),
+        "the early yes is no vote"
+    );
+
+    // The re-ask is the read-back: the caller answers once it reached their ear.
+    rig.run(800).await;
+    rig.turn("Yes, go ahead").await;
+    rig.until("the vote", 10_000, |rig| !rig.bud().votes.lock().is_empty())
+        .await;
+    let votes = rig.bud().votes.lock().clone();
+    assert_eq!(votes[0].0["input"][0]["approve"], true, "{votes:?}");
+    rig.until_heard("Your refund is on its way.").await;
 }
 
 // ---------------------------------------------------------------------------------------------

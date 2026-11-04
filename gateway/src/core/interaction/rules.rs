@@ -276,6 +276,87 @@ pub fn near_duplicate(text: &str, title: &str, lexicon: &Lexicon) -> bool {
     shared >= 2 && shared * 4 >= new.len().min(old.len()) * 3
 }
 
+/// Words with which a caller adds a request to the one that runs ("can you also check",
+/// "while you're checking that", "and another thing").
+const ADDING: [&str; 14] = [
+    "also",
+    "as well",
+    "another",
+    "in addition",
+    "additionally",
+    "on top of that",
+    "at the same time",
+    "meanwhile",
+    "one more thing",
+    "one more",
+    // "while you're / are / were / check ...": live (3 Nov) the recogniser heard "While you
+    // were checking that, check any errors in the bud-dev namespace".
+    "while you",
+    "while that",
+    "while it's",
+    "besides",
+];
+/// Words with which a caller changes the request that runs ("actually, Denver instead").
+const CHANGING: [&str; 11] = [
+    "instead",
+    "rather",
+    "actually",
+    "change",
+    "make it",
+    "switch",
+    "correction",
+    "scratch that",
+    "i meant",
+    "i mean",
+    "not that",
+];
+
+/// Whether a request is plainly a second one beside the running task titled `title`, not a
+/// repeat or a change of it: it adds itself with words such as "also", "as well", "too" or
+/// "while you're checking that", or names another target (an identifier such as a namespace,
+/// a host or a code, `pde-ditto` beside `bud-dev`), and it says nothing that changes the task
+/// ("instead", "actually", "make it"). A request with neither is still read against the task:
+/// "a table for four" beside "a table for two" may be either.
+///
+/// Live (pde-ditto, 3 Nov): with "Check the pods in the bud-dev namespace" running, "While
+/// you're checking that, can you also check the pods in the pde-ditto namespace?" was read as
+/// a repeat of it and the caller was asked "Do you want me to change it, or is this a second
+/// one?"; no second task started.
+pub fn adds_request(text: &str, title: &str) -> bool {
+    let norm = norm_phrase(text);
+    let says = |phrases: &[&str]| phrases.iter().any(|phrase| has_phrase(&norm, phrase));
+    if says(&CHANGING) {
+        return false;
+    }
+    // "... the other namespace too": "too" adds only as the request's last word.
+    let words = word_list(text);
+    let too = words.last().is_some_and(|word| word == "too");
+    if says(&ADDING) || too {
+        return true;
+    }
+    let (new, old) = (identifiers(text), identifiers(title));
+    new.difference(&old).next().is_some() && old.difference(&new).next().is_some()
+}
+
+/// The identifiers of a text: words that join letters with a `-`, `_`, `.`, `/` or `:`, or
+/// letters with digits (`pde-ditto`, `us-east-1`, `v2`), lowercased.
+fn identifiers(text: &str) -> BTreeSet<String> {
+    let edge = |c: char| !c.is_alphanumeric();
+    persona::straighten(text)
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || ",;?!\"()[]{}".contains(c))
+        .map(|word| word.trim_matches(edge))
+        .map(|word| word.strip_suffix("'s").unwrap_or(word))
+        .filter(|word| {
+            let letters = word.chars().any(char::is_alphabetic);
+            let joined = word.chars().any(|c| "-_./:".contains(c));
+            let digits = word.chars().any(|c| c.is_ascii_digit());
+            letters && (joined || digits)
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The shortest description word that can name an agent ("downloads", "announcements"):
 /// shorter ones ("check", "notes", "pages") are said of any agent's work.
 const AGENT_WORD_MIN_CHARS: usize = 6;
@@ -648,6 +729,57 @@ mod tests {
             ("Yes please", table, false),
         ] {
             assert_eq!(near_duplicate(text, title, lexicon), repeats, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_request_that_adds_to_a_running_task_or_names_another_target_is_a_second_one() {
+        let pods = "Check the pods in the bud-dev namespace and tell me which are not running";
+        let table = "Book a table for two at Rosa's on Saturday";
+        for (text, title, adds) in [
+            // Live (pde-ditto, 3 Nov).
+            (
+                "While you're checking that, can you also check the pods in the pde-ditto namespace?",
+                pods,
+                true,
+            ),
+            (
+                "Check the pods in the pde-ditto namespace as well.",
+                pods,
+                true,
+            ),
+            ("And the pde-ditto namespace too", pods, true),
+            (
+                "While you were checking that check any errors in the buddev namespace",
+                "check the list of namespaces in the cluster",
+                true,
+            ),
+            // Another target, said plainly.
+            ("Check the pods in the pde-ditto namespace", pods, true),
+            // A change of the task stays the caller's to say.
+            (
+                "Actually, check the pde-ditto namespace instead",
+                pods,
+                false,
+            ),
+            ("Make it pde-ditto", pods, false),
+            ("Also, actually make it four people", table, false),
+            // A true near-duplicate: the same request again, or the same one for four.
+            (pods, pods, false),
+            ("Book a table for four at Rosa's on Saturday", table, false),
+            (
+                "check flights to Denver on Saturday",
+                "Can you check flights to Denver on Friday",
+                false,
+            ),
+            // "too" adds only at the end of the request.
+            (
+                "Is it too late to book a table for two at Rosa's",
+                table,
+                false,
+            ),
+        ] {
+            assert_eq!(adds_request(text, title), adds, "{text:?}");
         }
     }
 

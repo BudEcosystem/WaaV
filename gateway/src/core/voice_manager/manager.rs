@@ -16,12 +16,13 @@ use crate::core::observability::ObserverRegistry;
 use crate::core::{
     create_stt_provider, create_tts_provider,
     stt::{
-        BaseSTT, STTError, STTErrorCallback as ProviderSTTErrorCallback, STTResult,
+        BaseSTT, STTConfig, STTError, STTErrorCallback as ProviderSTTErrorCallback, STTResult,
         STTResultCallback,
     },
     tts::{AudioData, BaseTTS, TTSError},
     turn_detect::TurnDetector,
 };
+use crate::observability::vendor_span::{VendorCall, VendorScope};
 
 #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
 use crate::core::smart_turn::{SmartTurnProcessResult, SmartTurnProcessor};
@@ -62,11 +63,47 @@ fn uninterruptible_playback_from_env() -> VoiceManagerResult<bool> {
     }
 }
 
-/// See [`VoiceManager::set_speak_observer`].
-pub type SpeakObserver = Arc<dyn Fn(&str) + Send + Sync>;
+/// See [`VoiceManager::set_speak_observer`]. Returns the scope to trace the synthesis's vendor
+/// request in (the record it was billed as), if any.
+pub type SpeakObserver = Arc<dyn Fn(&str) -> Option<VendorScope> + Send + Sync>;
 
-/// See [`VoiceManager::set_stt_final_observer`].
-pub type SttFinalObserver = Arc<dyn Fn(&str) + Send + Sync>;
+/// See [`VoiceManager::set_stt_final_observer`]. Returns the scope to trace the vendor's answer
+/// in (the record the transcript was billed as), if any.
+pub type SttFinalObserver = Arc<dyn Fn(&str) -> Option<VendorScope> + Send + Sync>;
+
+/// Run `fut` in `scope` when there is one: a TTS provider takes the scope current where the
+/// synthesis is queued, and traces its vendor request beneath the record.
+async fn in_vendor_scope<F: Future>(scope: Option<VendorScope>, fut: F) -> F::Output {
+    match scope {
+        Some(scope) => scope.run(fut).await,
+        None => fut.await,
+    }
+}
+
+/// What WaaV asked the STT vendor for, as a trace shows it: never the credential.
+fn stt_request_description(config: &STTConfig) -> String {
+    serde_json::json!({
+        "provider": config.provider,
+        "model": config.model,
+        "language": config.language,
+        "sample_rate": config.sample_rate,
+        "channels": config.channels,
+        "encoding": config.encoding,
+        "punctuation": config.punctuation,
+    })
+    .to_string()
+}
+
+/// A final result as the vendor returned it, for its record's vendor span.
+fn stt_result_description(result: &STTResult) -> String {
+    serde_json::json!({
+        "transcript": result.transcript,
+        "is_final": result.is_final,
+        "is_speech_final": result.is_speech_final,
+        "confidence": result.confidence,
+    })
+    .to_string()
+}
 
 /// See [`VoiceManager::set_audio_tap`]. Returns whether the tap's owner sends the frame (or
 /// what it makes of it) to the speech-to-text itself; `false`: [`VoiceManager::receive_audio`]
@@ -145,6 +182,11 @@ pub struct VoiceManager {
     /// is metered per utterance. Separate from the result callback, which the voice agent
     /// replaces; read per result, so it holds across every `on_stt_result` registration.
     stt_final_observer: Arc<SyncRwLock<Option<SttFinalObserver>>>,
+    /// A Bud session traces its STT connection as a vendor call beneath the session span (set
+    /// before `start`): the scope, the live connection's call, and the URL it opened.
+    stt_vendor_scope: SyncRwLock<Option<VendorScope>>,
+    stt_call: Arc<parking_lot::Mutex<Option<VendorCall>>>,
+    stt_url: Arc<SyncRwLock<String>>,
 
     /// A-G6: when uninterruptible playback is enabled, TTS chunks are metered to
     /// the transport through this pump's queue so a barge-in can selectively
@@ -340,6 +382,9 @@ impl VoiceManager {
             observers: Arc::new(SyncRwLock::new(None)),
             speak_observer: Arc::new(SyncRwLock::new(None)),
             stt_final_observer: Arc::new(SyncRwLock::new(None)),
+            stt_vendor_scope: SyncRwLock::new(None),
+            stt_call: Arc::new(parking_lot::Mutex::new(None)),
+            stt_url: Arc::new(SyncRwLock::new(String::new())),
             playback_pump: Arc::new(SyncRwLock::new(None)),
             uninterruptible_playback: AtomicBool::new(uninterruptible_playback),
             metered_playback: SyncRwLock::new(None),
@@ -625,7 +670,9 @@ impl VoiceManager {
         // Connect STT provider
         {
             let mut stt = self.stt.write().await;
-            stt.connect().await.map_err(VoiceManagerError::STTError)?;
+            self.connect_stt(&mut **stt)
+                .await
+                .map_err(VoiceManagerError::STTError)?;
         }
 
         // Connect TTS provider
@@ -734,13 +781,19 @@ impl VoiceManager {
             }
         }
 
+        // The STT connection's vendor call ends with it, and the scope lets go of the session span
+        // (a span's children keep it open), whatever the disconnect below returns.
+        let stt_call = self.stt_call.lock().take();
+        *self.stt_vendor_scope.write() = None;
         // Disconnect STT provider
-        {
+        let disconnected = {
             let mut stt = self.stt.write().await;
-            stt.disconnect()
-                .await
-                .map_err(VoiceManagerError::STTError)?;
+            stt.disconnect().await
+        };
+        if let Some(call) = stt_call {
+            call.finish();
         }
+        disconnected.map_err(VoiceManagerError::STTError)?;
 
         // Disconnect TTS provider
         {
@@ -989,8 +1042,8 @@ impl VoiceManager {
         // D-G9 (review wf_d43814c3): count chars on THIS path too — the
         // orchestrator speaks via speak_if_epoch, not speak(), so the
         // counter was never incremented on the production conversation path.
-        self.note_speak(text);
-        tts.speak(text, flush)
+        let scope = self.note_speak(text);
+        in_vendor_scope(scope, tts.speak(text, flush))
             .await
             .map_err(VoiceManagerError::TTSError)?;
         Ok(true)
@@ -1050,15 +1103,15 @@ impl VoiceManager {
         true
     }
 
-    /// Every synthesis request passes here: the D-G9 cost proxy and the RT6 speak observer.
-    fn note_speak(&self, text: &str) {
+    /// Every synthesis request passes here: the D-G9 cost proxy and the RT6 speak observer, which
+    /// returns the scope the synthesis's vendor request is traced in.
+    fn note_speak(&self, text: &str) -> Option<VendorScope> {
         crate::core::metrics::bridge::count_tts_chars(
             &self.config.tts_config.provider,
             text.chars().count(),
         );
-        if let Some(observer) = self.speak_observer.read().clone() {
-            observer(text);
-        }
+        let observer = self.speak_observer.read().clone();
+        observer.and_then(|observer| observer(text))
     }
 
     /// Observe the text of every synthesis request (FRD-023 RT6 TTS-leg metering).
@@ -1071,6 +1124,54 @@ impl VoiceManager {
         *self.stt_final_observer.write() = Some(observer);
     }
 
+    /// Trace this session's STT connections as vendor calls in `scope` — what URL WaaV opened,
+    /// what it asked for, and how the vendor answered. Set before [`VoiceManager::start`].
+    pub fn set_stt_vendor_scope(&self, scope: VendorScope) {
+        *self.stt_vendor_scope.write() = Some(scope);
+    }
+
+    /// Connect the STT provider, as one vendor call when a scope is set: open until the
+    /// connection closes, failed with the vendor's error if it would not connect.
+    pub(crate) async fn connect_stt(&self, stt: &mut dyn BaseSTT) -> Result<(), STTError> {
+        if let Some(previous) = self.stt_call.lock().take() {
+            previous.finish();
+        }
+        let Some(scope) = self.stt_vendor_scope.read().clone() else {
+            return stt.connect().await;
+        };
+        let config = stt
+            .get_config()
+            .cloned()
+            .unwrap_or_else(|| self.config.stt_config.clone());
+        let url = stt.vendor_url().unwrap_or_default();
+        let call = VendorCall::open(
+            Some(&scope),
+            &config.provider,
+            &config.model,
+            "GET",
+            &url,
+            &config.api_key,
+        );
+        call.request_body(&stt_request_description(&config));
+        *self.stt_url.write() = url;
+        match stt.connect().await {
+            Ok(()) => {
+                call.status(101);
+                *self.stt_call.lock() = Some(call);
+                Ok(())
+            }
+            Err(e) => {
+                let (class, status) = crate::core::voice_error::classify_stt_error(&e);
+                if let Some(status) = status {
+                    call.status(status);
+                }
+                call.response_body(&e.to_string());
+                call.fail(class.as_str(), &e.to_string());
+                Err(e)
+            }
+        }
+    }
+
     pub async fn speak(&self, text: &str, flush: bool) -> VoiceManagerResult<()> {
         // Per-turn profiling anchor: TTS synthesis requested (first-of-turn
         // dedup happens inside the profiler).
@@ -1078,11 +1179,11 @@ impl VoiceManager {
             obs.notify_tts_request(crate::core::observability::now_monotonic_ns());
         }
         // D-G9: synthesis cost proxy.
-        self.note_speak(text);
+        let scope = self.note_speak(text);
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
-            tts.speak(text, flush)
+            in_vendor_scope(scope, tts.speak(text, flush))
                 .await
                 .map_err(VoiceManagerError::TTSError)?;
         }
@@ -1139,11 +1240,11 @@ impl VoiceManager {
 
         // D-G9: synthesis cost proxy (covers the non-interruptible /
         // speak_if_epoch-delegated path).
-        self.note_speak(text);
+        let scope = self.note_speak(text);
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
-            tts.speak(text, flush)
+            in_vendor_scope(scope, tts.speak(text, flush))
                 .await
                 .map_err(VoiceManagerError::TTSError)?;
         }
@@ -1359,6 +1460,12 @@ impl VoiceManager {
         let observers_clone = self.observers.clone();
         let stt_final_observer_clone = self.stt_final_observer.clone();
         let stt_muted = self.stt_muted.clone();
+        let stt_url = self.stt_url.clone();
+        let stt_vendor = (
+            self.config.stt_config.provider.clone(),
+            self.config.stt_config.model.clone(),
+            self.config.stt_config.api_key.clone(),
+        );
 
         // Create STT processor with configured timeouts from VoiceManagerConfig,
         // plus the provider's measured TTFS p99 (A-G2/D-G8: a slow provider's
@@ -1397,8 +1504,13 @@ impl VoiceManager {
             // not the session acts on the result.
             if result.is_final
                 && let Some(observer) = stt_final_observer_clone.read().clone()
+                && let Some(scope) = observer(&result.transcript)
             {
-                observer(&result.transcript);
+                // The record's child: where the audio went, and what the vendor answered.
+                let (vendor, model, key) = &stt_vendor;
+                let call = VendorCall::open(Some(&scope), vendor, model, "", &stt_url.read(), key);
+                call.response_body(&stt_result_description(&result));
+                call.finish();
             }
 
             Box::pin(async move {
@@ -1492,7 +1604,14 @@ impl VoiceManager {
         }
 
         // Create wrapper callback for the provider
+        let stt_call = self.stt_call.clone();
         let wrapper_callback: ProviderSTTErrorCallback = Arc::new(move |error| {
+            // The vendor errored on the open connection: its vendor call says so.
+            if let Some(call) = stt_call.lock().as_ref() {
+                let (class, _) = crate::core::voice_error::classify_stt_error(&error);
+                call.response_body(&error.to_string());
+                call.failed(class.as_str(), &error.to_string());
+            }
             let callback = callback.clone();
             Box::pin(async move {
                 callback(error).await;
@@ -2060,7 +2179,9 @@ impl VoiceManager {
         // buffering clients drop their callbacks in `disconnect`, so they are registered again.
         {
             let mut stt = self.stt.write().await;
-            stt.connect().await.map_err(VoiceManagerError::STTError)?;
+            self.connect_stt(&mut **stt)
+                .await
+                .map_err(VoiceManagerError::STTError)?;
             let result_cb = self.provider_result_callback.read().clone();
             if let Some(cb) = result_cb {
                 stt.on_result(cb)

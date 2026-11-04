@@ -104,6 +104,9 @@ pub struct Job {
     /// The caller turn the run belongs to: its span is a child of the turn's `voice.turn`, in
     /// the turn's trace (spec 029 D-9). `None`: the run is a trace of its own.
     pub turn: Option<TurnTrace>,
+    /// The task's run before this one (the one it revises, already told to stop): a backend
+    /// that runs tasks side by side on one conversation waits for it to end first.
+    pub after: Option<RunId>,
 }
 
 tokio::task_local! {
@@ -180,6 +183,17 @@ pub trait Backend: Send + Sync {
     /// The model the gateway prompts for the session, when it has one (the LLM tier): after
     /// the call it writes what is worth remembering about the caller ([`caller_facts`]).
     fn llm(&self) -> Option<Arc<LlmClient>> {
+        None
+    }
+    /// How the caller is asked before a tool of the backend's own runs (a Bud agent's
+    /// `tool_confirmations`, spec 029 §7.3): the question of a gate it raises for one of them
+    /// is worded from these. Empty: the gate's defaults.
+    fn confirmations(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+    /// What the caller hears when a run is held for an approval they cannot give (a Bud
+    /// agent's `approval_message`, FR-APR-1). `None`: the persona's own line.
+    fn approval_message(&self) -> Option<String> {
         None
     }
 }
@@ -1744,7 +1758,7 @@ pub(super) fn child_update(outcome: &Outcome) -> String {
 }
 
 /// The line a model with tools writes before its final answer.
-const ANSWER_MARKER: &str = "ANSWER:";
+pub(crate) const ANSWER_MARKER: &str = "ANSWER:";
 /// Appended to the system prompt when tools are configured: how to ask the caller (the tool
 /// exists only then), and the answer marker. While a round streams the gateway cannot see
 /// whether it will end in a tool call, so only text after the marker is spoken early.

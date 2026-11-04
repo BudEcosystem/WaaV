@@ -41,8 +41,9 @@ const TEMPLATE_FAMILIES: [&str; 8] = [
     "followup.",
     "control.",
 ];
-const TEMPLATE_IDS: [&str; 19] = [
+const TEMPLATE_IDS: [&str; 20] = [
     "offer.result",
+    "bridge.about",
     "sensitive.dtmf",
     "choose",
     "value",

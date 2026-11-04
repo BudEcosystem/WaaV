@@ -308,8 +308,16 @@ struct Asking {
     asked_at: Option<Ms>,
     reask_at: Option<Ms>,
     deadline: Ms,
-    /// One re-ask each: after silence, a weak yes, an early yes, an unclear answer.
+    /// One re-ask each: after silence, a weak yes, an unclear answer. An early yes has
+    /// [`NOT_HEARD_REASKS`] (`not_heard`).
     reasked: [bool; 4],
+    /// The re-asks for answers given before the question was heard.
+    not_heard: u8,
+    /// An answer came while the read-back still played: the question is asked again as soon
+    /// as it was heard.
+    early: bool,
+    /// When the line that asks the question was heard in full.
+    ask_heard_at: Option<Ms>,
     /// The caller cut the question before hearing it.
     reoffer: bool,
     /// A question with a deadline that could not wait for a slot: it takes the floor
@@ -336,6 +344,10 @@ const REASK_SILENCE: usize = 0;
 const REASK_WEAK: usize = 1;
 const REASK_NOT_HEARD: usize = 2;
 const REASK_UNCLEAR: usize = 3;
+/// How often an answer given before the question was heard is asked again: the early yes
+/// over the read-back, then a yes over that re-ask (live, IM3 3 Nov). One more gives the
+/// question up.
+const NOT_HEARD_REASKS: u8 = 2;
 
 /// A task's update in the inbox (chapter 8): what an orchestrator's child came to.
 #[derive(Debug, Clone)]
@@ -468,6 +480,8 @@ pub struct Policy {
     single_calls: Vec<String>,
     /// What each agent of the session does (its name, its own description).
     agent_topics: Vec<(String, String)>,
+    /// The Bud agent's `approval_message` ([`Policy::set_approval_message`]).
+    approval_message: Option<String>,
     /// Stepped down: every turn goes to the background, and only its answer is spoken.
     plain: bool,
     /// The task whose caller was last told that a value is never taken by voice.
@@ -518,6 +532,13 @@ pub struct Policy {
     said: Vec<(Ms, String)>,
     /// The results of finished tasks, for follow-ups.
     results: VecDeque<(TaskId, String)>,
+    /// Answers of finished tasks still waiting to be heard, by their relay: one the floor gives
+    /// back unheard (the caller took the floor while it waited behind another answer) is an
+    /// update in the inbox, not lost. Live (parallel tasks, 3 Nov): the bud-dev check finished
+    /// while the namespace list was being said; the caller cut the list, and the floor dropped
+    /// the waiting answer with the rest of the queue. It was never said, and "what's the status
+    /// of the bud-dev check?" started the check again.
+    unheard: Vec<(ItemId, Update)>,
     /// The session has an orchestrator with agents, whose questions may break in.
     orchestrated: bool,
     /// The task whose update the caller heard last, and when.
@@ -552,6 +573,7 @@ impl Policy {
             step_down: false,
             single_calls: Vec::new(),
             agent_topics: Vec::new(),
+            approval_message: None,
             plain: false,
             declined: None,
             closed: VecDeque::new(),
@@ -580,6 +602,7 @@ impl Policy {
             queued: Vec::new(),
             said: Vec::new(),
             results: VecDeque::new(),
+            unheard: Vec::new(),
             orchestrated: cfg.tasks.orchestrator.is_some() && !cfg.tasks.agents.is_empty(),
             last_update: None,
             answering: Vec::new(),
@@ -640,6 +663,12 @@ impl Policy {
     /// against what the agent that did the task does.
     pub fn set_agent_topics(&mut self, topics: Vec<(String, String)>) {
         self.agent_topics = topics;
+    }
+
+    /// The Bud agent's `approval_message` (FR-APR-1): said, in place of the persona's
+    /// `approval_needed` line, when a run is held for an approval the caller cannot give.
+    pub fn set_approval_message(&mut self, message: Option<String>) {
+        self.approval_message = message.filter(|message| !message.trim().is_empty());
     }
 
     /// The session goes on as the plain path: every turn the background's.
@@ -1225,6 +1254,7 @@ impl Policy {
         if self.settled(turn).is_none() {
             return;
         }
+        let read = label.is_some();
         let label = label.as_deref().unwrap_or(OTHER);
         let Some(eot) = eot else {
             if let Some(turn) = &mut self.turn {
@@ -1288,6 +1318,18 @@ impl Policy {
                 YES | NO => self.turn_away(eot.turn, Act::Wait, "screen_question", say, board, out),
                 _ => self.answers(now, eot, stage, board, out),
             },
+            // Words the front read as no answer at all (a new request, a question of the
+            // caller's own) are decided as any other turn: a Bud agent runs the caller's
+            // requests side by side, and the question stays open, asked again in full once
+            // the turn is settled and acknowledged. Live (IM3, 3 Nov): "Also, how many nodes
+            // does the cluster have?" over the read-back was taken as an unclear answer. A
+            // reading that did not come in time is still one.
+            Asked::Open(request) if read && label == OTHER => {
+                if let Some(asking) = self.asking.as_mut() {
+                    asking.reoffer |= asking.request.id == request.id;
+                }
+                self.answers(now, eot, stage, board, out);
+            }
             Asked::Open(request) => {
                 let parsed = answer_of(&request, label, &eot.text);
                 self.answer(now, &eot, &request, parsed, board, out);
@@ -1808,11 +1850,14 @@ impl Policy {
         // A request that may repeat a task is not started beside it without a word: the front
         // reads whether it does, and the caller says whether it changes that one or is a
         // second one.
-        let tasks = if act == Act::Delegate && ask_which {
+        // One that plainly adds a second request ("can you also check ...") or names another
+        // target is not asked about (`rules::adds_request`).
+        let mut tasks = if act == Act::Delegate && ask_which {
             self.repeatable(e, board)
         } else {
             Vec::new()
         };
+        tasks.retain(|(_, title)| !rules::adds_request(&text, title));
         if !tasks.is_empty() {
             let pending = Pending {
                 turn: id,
@@ -1836,6 +1881,7 @@ impl Policy {
             && let Some(view) = board.tasks.iter().find(|view| view.task_ref == started)
             && !view.cancelling
             && (view.state.is_live() || view.state == TaskState::Completed)
+            && !rules::adds_request(&text, &view.title)
         {
             let started = Asked::Started(decision, view.task_ref.clone(), view.title.clone());
             let pending = Pending {
@@ -2147,6 +2193,13 @@ impl Policy {
         let margin = Ms::from(self.cfg.heard_margin_ms);
         let heard =
             eot.source == EotSource::Typed || heard_at.is_some_and(|at| onset >= at + margin);
+        let ask_heard_at = self
+            .asking
+            .as_ref()
+            .filter(|asking| asking.request.id == request.id && asking.screen.is_none())
+            .map(|asking| asking.ask_heard_at);
+        let question_heard = eot.source == EotSource::Typed
+            || ask_heard_at.is_none_or(|at| at.is_some_and(|at| onset >= at));
         let task = board
             .tasks
             .iter()
@@ -2161,6 +2214,12 @@ impl Policy {
                     Binding::WeakYes => (None, Act::Question, None, Some(REASK_WEAK)),
                     Binding::NotHeard => (None, Act::Question, None, Some(REASK_NOT_HEARD)),
                 }
+            }
+            // Words over the question, before it was heard (they cut it, or it played on), are
+            // asked again with the question: hard to hear over it, they need not be unclear
+            // (live, IM3 3 Nov: a yes over the re-ask got "Sorry, was that a yes or a no?").
+            Parsed::Accept { .. } | Parsed::Unclear if !question_heard => {
+                (None, Act::Question, None, Some(REASK_NOT_HEARD))
             }
             Parsed::Accept { .. } | Parsed::Unclear => {
                 (None, Act::Question, None, Some(REASK_UNCLEAR))
@@ -2239,19 +2298,52 @@ impl Policy {
         let Some(asking) = &mut self.asking else {
             return;
         };
-        if std::mem::replace(&mut asking.reasked[which], true) {
+        let spent = if which == REASK_NOT_HEARD {
+            asking.not_heard += 1;
+            asking.not_heard > NOT_HEARD_REASKS
+        } else {
+            std::mem::replace(&mut asking.reasked[which], true)
+        };
+        if spent {
             if which != REASK_SILENCE {
                 self.time_out(out);
             }
             return;
         }
         if which == REASK_NOT_HEARD && asking.readback_heard_at.is_none() {
-            // The read-back is still to come: it plays on, or the caller cut it and the
-            // question is offered again. That is the re-ask. A second one after it, with the
-            // read-back moved to it, made the yes that follows the question unheard again.
+            // The read-back is still to come: the caller cut it and the question is offered
+            // again, or it plays on and the question is asked again as soon as it was heard
+            // (live, IM3 3 Nov: with nothing after it the caller, who had said yes, waited
+            // for the silence re-ask). A re-ask over it, with the read-back moved to it, made
+            // the yes that follows the question unheard again.
+            asking.early |= !asking.reoffer;
             return;
         }
+        if asking.reoffer && asking.readback_heard_at.is_none() {
+            // The caller cut the read-back and it is still to be offered again: this re-ask is
+            // that offer, the question in full. A short one in its place ("Sorry, was that a
+            // yes or a no?") left the read-back unheard and cleared the offer, so the clear
+            // yes that answered it was not heard either, and its own re-ask was skipped as
+            // still to come (live, IM3 3 Nov: the yes was lost and the window closed).
+            self.offer_question(now, out);
+            return;
+        }
+        self.reask_line(now, which, request, out);
+    }
+
+    /// The words of a re-ask, said.
+    fn reask_line(
+        &mut self,
+        now: Ms,
+        which: usize,
+        request: &HitlRequest,
+        out: &mut Vec<PolicyAction>,
+    ) {
+        let Some(asking) = &mut self.asking else {
+            return;
+        };
         asking.reoffer = false;
+        asking.early = false;
         let phrase = ("verb_phrase", request.verb_phrase.clone());
         let values: Vec<String> = request
             .params
@@ -2277,6 +2369,7 @@ impl Policy {
         if let Some(asking) = &mut self.asking {
             asking.items.push(ask.item);
             asking.ask = Some(ask.item);
+            asking.ask_heard_at = None;
             if which == REASK_NOT_HEARD {
                 // This re-ask reads the values back: hearing it is hearing the read-back.
                 asking.readback = Some(ask.item);
@@ -2506,8 +2599,10 @@ impl Policy {
             asking.ask = ask;
             asking.readback_heard_at = None;
             asking.asked_at = None;
+            asking.ask_heard_at = None;
             asking.reask_at = None;
             asking.reoffer = false;
+            asking.early = false;
             // A deadline of the job's own is never moved.
             if !asking.request.firm {
                 asking.deadline = asking
@@ -2579,6 +2674,9 @@ impl Policy {
             asked_at: None,
             reask_at: None,
             reasked: [false; 4],
+            not_heard: 0,
+            early: false,
+            ask_heard_at: None,
             reoffer: false,
             screen,
             keyed: keyed.then(String::new),
@@ -2647,11 +2745,19 @@ impl Policy {
                     self.asked.swap_remove(index);
                     self.answer_window_until = heard_at + Ms::from(self.cfg.answer_window_ms);
                 }
+                let mut early = None;
                 if let Some(asking) = &mut self.asking {
                     if asking.readback == Some(item) {
                         asking.readback_heard_at = Some(heard_at);
                     }
                     if asking.ask == Some(item) {
+                        asking.ask_heard_at = Some(heard_at);
+                        let readback = asking.readback_heard_at.is_some();
+                        // A choice or a value is heard with its question: no re-ask is needed.
+                        let confirm = asking.request.kind == HitlKind::Confirm;
+                        if std::mem::take(&mut asking.early) && readback && confirm {
+                            early = Some(asking.request.clone());
+                        }
                         // A screen question is not asked again by voice.
                         let silence = (!asking.reasked[REASK_SILENCE] && asking.screen.is_none())
                             .then_some(heard_at + Ms::from(self.cfg.hitl_reprompt_after_ms));
@@ -2660,6 +2766,11 @@ impl Policy {
                             asking.deadline = heard_at + Ms::from(self.cfg.hitl_answer_timeout_ms);
                         }
                     }
+                }
+                // The caller answered over the read-back: the question was heard, and is asked
+                // again with its values at once.
+                if let Some(request) = early {
+                    self.reask_line(now, REASK_NOT_HEARD, &request, out);
                 }
             }
             LaneEvent::Dropped {
@@ -2705,6 +2816,7 @@ impl Policy {
 
     /// An update or its offer was heard, or never reached the caller: then it waits again.
     fn update_lane(&mut self, event: &LaneEvent) {
+        self.unheard_lane(event);
         let (item, heard_at) = match event {
             LaneEvent::Heard { item, heard_at } => (*item, Some(*heard_at)),
             LaneEvent::Dropped { item, .. } | LaneEvent::Returned { item } => (*item, None),
@@ -2744,6 +2856,26 @@ impl Policy {
                     ..update
                 });
             }
+        }
+    }
+
+    /// A finished task's answer was heard, or came back with none of it heard: then it waits
+    /// in the inbox as an update.
+    fn unheard_lane(&mut self, event: &LaneEvent) {
+        let (item, lost) = match event {
+            LaneEvent::Heard { item, .. } => (*item, false),
+            LaneEvent::Returned { item } => (*item, true),
+            LaneEvent::Dropped {
+                item, heard_chars, ..
+            } => (*item, *heard_chars == 0),
+            LaneEvent::Started { .. } | LaneEvent::Idle { .. } => return,
+        };
+        let Some(at) = self.unheard.iter().position(|(said, _)| *said == item) else {
+            return;
+        };
+        let (_, update) = self.unheard.swap_remove(at);
+        if lost {
+            self.inbox.push(update);
         }
     }
 
@@ -2850,7 +2982,29 @@ impl Policy {
                     // "Please share it with me now": the same request without its name.
                     return;
                 }
+                // With another of the caller's requests live, an answer says which request it
+                // answers before its first sentence ("About your request to ...:"), in its own
+                // relay, so the floor keeps the two together.
+                let first = !self.relays.iter().any(|relay| relay.task == task);
+                let request = |view: &&TaskView| view.lineage.parent_id.is_none();
+                let mine = board
+                    .tasks
+                    .iter()
+                    .filter(request)
+                    .any(|view| view.id == task);
+                let others = (board.tasks.iter().filter(request))
+                    .any(|view| view.id != task && view.state.is_live());
                 let item = self.relay(&task).item;
+                if first && mine && others && !self.plain {
+                    let title = rules::spoken_title(&self.title_of(&task, board));
+                    let about = Utterance {
+                        item,
+                        say: filled("bridge.about", [("task_title", title)]),
+                        last: false,
+                        ..self.relayed(of_task.clone(), String::new())
+                    };
+                    out.push(PolicyAction::Speak(about));
+                }
                 let sentence = Utterance {
                     item,
                     sentence: Some((attempt, seq)),
@@ -2929,13 +3083,30 @@ impl Policy {
                     }));
                 }
             }
-            TaskEventKind::Completed { .. } => {
+            TaskEventKind::Completed { text, .. } => {
                 self.finished.push_back((task.clone(), now));
                 if self.finished.len() > CLOSED_KEPT {
                     self.finished.pop_front();
                 }
                 let relayed = self.relays.iter().position(|relay| relay.task == task);
-                let item = relayed.map(|index| self.relays.swap_remove(index).item);
+                let relay = relayed.map(|index| self.relays.swap_remove(index));
+                if let Some(relay) = relay.as_ref().filter(|relay| !relay.part_heard) {
+                    let title = self.title_of(&task, board);
+                    let update = Update {
+                        task: task.clone(),
+                        revision,
+                        parent: None,
+                        title,
+                        failure: None,
+                        summary: text,
+                        at: now,
+                        offered: true,
+                        tries: 0,
+                        refused: None,
+                    };
+                    self.unheard.push((relay.item, update));
+                }
+                let item = relay.map(|relay| relay.item);
                 // The answer was relayed sentence by sentence: only its relay closes.
                 let end = self.relayed(of_task, String::new());
                 out.push(PolicyAction::Speak(Utterance {
@@ -2952,12 +3123,16 @@ impl Policy {
                     // A Bud agent's run was held for a person's approval: trying again
                     // would not help, so the caller is told what it waits for.
                     Effects::NoneCommitted if error.starts_with(APPROVAL_REQUIRED) => {
-                        template("approval_needed")
+                        match &self.approval_message {
+                            // The agent author's own words (FR-APR-1).
+                            Some(message) => Say::Verbatim(message.clone()),
+                            None => template("approval_needed"),
+                        }
                     }
                     Effects::NoneCommitted => template("failure.retryable"),
                     Effects::Committed(labels) => filled(
                         "failure.with_effects",
-                        [("effect_labels", labels.join(" and "))],
+                        [("effect_labels", spoken_effects(&labels))],
                     ),
                     Effects::Unknown => filled(
                         "failure.effects_unknown",
@@ -3027,7 +3202,7 @@ impl Policy {
                     Effects::NoneCommitted => template("cancel.confirmed_none_committed"),
                     Effects::Committed(labels) => filled(
                         "cancel.confirmed_committed",
-                        [("effect_labels", labels.join(" and "))],
+                        [("effect_labels", spoken_effects(&labels))],
                     ),
                     Effects::Unknown => filled(
                         "cancel.confirmed_effects_unknown",
@@ -3457,6 +3632,9 @@ impl Policy {
         }
 
         let settled = self.turn.as_ref().is_none_or(|turn| turn.settled);
+        // A request said while a question is open is acknowledged before the question is put
+        // again.
+        let acking = (self.turn.as_ref()).is_some_and(|turn| turn.ack_due.is_some() && !turn.acked);
         let reprompt = Ms::from(self.cfg.hitl_reprompt_after_ms);
         let gap = Ms::from(self.cfg.hitl_key_gap_ms);
         let typed = self.asking.as_mut().and_then(|asking| {
@@ -3481,7 +3659,7 @@ impl Policy {
             } else if reask {
                 let request = asking.request.clone();
                 self.reask(now, REASK_SILENCE, &request, out);
-            } else if asking.reoffer && settled && !self.user_speaking {
+            } else if asking.reoffer && settled && !self.user_speaking && !acking {
                 self.offer_question(now, out);
             }
         }
@@ -3604,6 +3782,48 @@ impl Policy {
             task,
             ..self.utterance(Kind::Relay, RANK_RELAY, Say::Verbatim(words))
         }
+    }
+}
+
+/// Tools named in a line of what a task did before it stopped.
+const EFFECTS_NAMED: usize = 3;
+
+/// What a task did, said once: each label once, in order, the verb they share said once, and at
+/// most [`EFFECTS_NAMED`] named. Live (3 Nov): a Bud agent's 35 tool calls each committed "used
+/// kubectl-get", and the caller heard "it had already used kubectl-get and used kubectl-get and
+/// used kubectl-get ..." 35 times over.
+fn spoken_effects(labels: &[String]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for label in labels {
+        if !seen.contains(&label.as_str()) {
+            seen.push(label);
+        }
+    }
+    let verb = |label: &str| label.split_once(' ').map(|(verb, _)| verb.to_owned());
+    let shared = seen
+        .first()
+        .and_then(|first| verb(first))
+        .filter(|first| seen.iter().all(|label| verb(label).as_ref() == Some(first)));
+    let mut names: Vec<String> = seen
+        .iter()
+        .map(|label| match &shared {
+            Some(verb) => label[verb.len() + 1..].to_owned(),
+            None => (*label).to_owned(),
+        })
+        .collect();
+    if names.len() > EFFECTS_NAMED {
+        let others = names.len() - (EFFECTS_NAMED - 1);
+        names.truncate(EFFECTS_NAMED - 1);
+        names.push(format!("{others} more"));
+    }
+    let list = match names.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    match shared {
+        Some(verb) => format!("{verb} {list}"),
+        None => list,
     }
 }
 
@@ -4202,6 +4422,53 @@ mod tests {
         assert!(spoken(&policy.step(3_000, PolicyInput::Tick, &board)).is_empty());
     }
 
+    /// Two of the caller's requests run at once (a Bud agent's tasks run side by side): the
+    /// answer of one says which request it answers ("About your question, where is your
+    /// order:"); alone, an answer is said as it is.
+    #[test]
+    fn with_another_request_live_an_answer_says_which_request_it_answers() {
+        let both = Board {
+            tasks: vec![
+                view("t1", TaskState::Working, "Where is my order"),
+                view("t2", TaskState::Working, "When does the store open"),
+            ],
+            ..Board::default()
+        };
+        let mut policy = policy();
+        let first = task_event(1_200, sentence(0, "It shipped on Monday.", None));
+        let actions = policy.step(1_200, first, &both);
+        let said = spoken(&actions);
+        assert_eq!(said.len(), 2, "{said:?}");
+        let Say::Template { id, slots } = &said[0].say else {
+            panic!("a lead-in first: {said:?}");
+        };
+        assert_eq!(*id, "bridge.about");
+        assert_eq!(slots[0].0, "task_title");
+        assert!(slots[0].1.contains("order"), "{slots:?}");
+        let line = policy.persona.resolve(&said[0].say, 0).unwrap_or_default();
+        assert!(
+            line.starts_with("About your") && line.ends_with(':'),
+            "{line:?}"
+        );
+        assert_eq!(said[0].kind, Kind::Relay);
+        assert_eq!(
+            said[0].item, said[1].item,
+            "one relay: the floor keeps them together"
+        );
+        assert_eq!(
+            said[1].say,
+            Say::Verbatim("It shipped on Monday.".to_owned())
+        );
+        // Once: the next sentence of the same answer has none.
+        let next = task_event(1_300, sentence(1, "It arrives Friday.", None));
+        assert_eq!(spoken(&policy.step(1_300, next, &both)).len(), 1);
+
+        // Alone, no lead-in.
+        let mut policy = self::policy();
+        let alone = task_event(1_200, sentence(0, "It shipped on Monday.", None));
+        assert_eq!(spoken(&policy.step(1_200, alone, &working())).len(), 1);
+    }
+
     #[test]
     fn a_ready_answer_behind_a_slow_synthesiser_is_acknowledged_at_once() {
         let board = working();
@@ -4650,7 +4917,7 @@ mod tests {
     }
 
     #[test]
-    fn row_2_a_second_yes_during_the_read_back_gives_the_question_up() {
+    fn row_2_a_third_yes_before_the_read_back_was_heard_gives_the_question_up() {
         let mut policy = policy();
         let request = confirm(true);
         let board = asking(request.clone());
@@ -4659,8 +4926,11 @@ mod tests {
             task_event(1_000, TaskEventKind::InputRequired(request)),
             &board,
         );
+        // Two are asked again (`NOT_HEARD_REASKS`: an early yes, then a yes over its re-ask).
         policy.step(1_800, says(1, 1_800, "yes"), &board);
         let actions = policy.step(2_600, says(2, 2_600, "yes"), &board);
+        assert!(commands(&actions).is_empty(), "{actions:?}");
+        let actions = policy.step(3_400, says(3, 3_400, "yes"), &board);
         assert!(matches!(
             commands(&actions)[..],
             [TaskCmd::Answer {
@@ -4858,8 +5128,11 @@ mod tests {
             says(4, 10_000, "what time is it over there"),
             &board,
         );
-        assert!(commands(&actions).is_empty());
-        assert_eq!(words(&actions), ["Sorry, was that a yes or a no?"]);
+        // No answer at all: the front decides the turn as any other.
+        assert!(
+            matches!(actions[..], [PolicyAction::RequestFront { .. }]),
+            "{actions:?}"
+        );
     }
 
     #[test]
@@ -5465,6 +5738,43 @@ mod tests {
         );
     }
 
+    /// FR-APR-1 / spec 029 WP-IM3.5: a Bud agent's run held for an approval the caller cannot
+    /// give speaks the agent's `approval_message`, not the persona's line; without one the
+    /// persona's line stands, and once something was done that is said instead.
+    #[test]
+    fn an_agents_approval_failure_speaks_its_approval_message() {
+        let failed = |effects| TaskEventKind::Failed {
+            error: "approval_required: a manager must approve refunds".to_owned(),
+            effects,
+        };
+        let mut policy = policy();
+        policy.set_approval_message(Some("A supervisor has to sign off on that.".to_owned()));
+        let actions = policy.step(
+            1_500,
+            task_event(1_500, failed(Effects::NoneCommitted)),
+            &Board::default(),
+        );
+        assert_eq!(words(&actions), ["A supervisor has to sign off on that."]);
+        let done = Effects::Committed(vec!["used lookup order".to_owned()]);
+        let actions = policy.step(1_600, task_event(1_600, failed(done)), &Board::default());
+        assert_eq!(
+            words(&actions),
+            ["It didn't finish, but it had already used lookup order."]
+        );
+        // No message of the agent's (an empty one is none): the persona's line.
+        let mut policy = self::policy();
+        policy.set_approval_message(Some("  ".to_owned()));
+        let actions = policy.step(
+            1_500,
+            task_event(1_500, failed(Effects::NoneCommitted)),
+            &Board::default(),
+        );
+        assert_eq!(
+            words(&actions),
+            ["That needs someone's approval first, so I haven't done it."]
+        );
+    }
+
     #[test]
     fn a_call_the_callers_change_came_too_late_for_is_said() {
         let mut policy = policy();
@@ -5750,6 +6060,220 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    /// The confirmation of `request` opens at 1,000 ms and the caller cuts its read-back at
+    /// 1,500 ms; they stop speaking at `quiet_at`.
+    fn read_back_cut(policy: &mut Policy, request: &HitlRequest, quiet_at: Ms) -> Board {
+        let board = asking(request.clone());
+        let required = TaskEventKind::InputRequired(request.clone());
+        let actions = policy.step(1_000, task_event(1_000, required), &board);
+        let cut = LaneEvent::Dropped {
+            item: spoken(&actions)[1].item,
+            heard_chars: 4,
+            cause: CutCause::Interrupt,
+        };
+        policy.step(1_500, PolicyInput::UserSpeaking { on: true }, &board);
+        policy.step(1_500, PolicyInput::Lane(cut), &board);
+        let quiet = PolicyInput::UserSpeaking { on: false };
+        policy.step(quiet_at, quiet, &board);
+        board
+    }
+
+    /// Every line of `actions` heard in full, one a second from `from`: when the last was.
+    fn hear_all(policy: &mut Policy, actions: &[PolicyAction], from: Ms, board: &Board) -> Ms {
+        let mut at = from;
+        for utterance in spoken(actions) {
+            at += 1_000;
+            let heard = LaneEvent::Heard {
+                item: utterance.item,
+                heard_at: at,
+            };
+            policy.step(at, PolicyInput::Lane(heard), board);
+        }
+        at
+    }
+
+    /// Live (IM3, 3 Nov, call im3-running-1): the caller cut the read-back, their words were no
+    /// answer and they were asked "was that a yes or a no?". Their "Yes, go ahead" after that
+    /// was lost: the read-back was still unheard, so the yes was not bound, its re-ask was
+    /// skipped as "still to come" (the unclear re-ask had taken the place of the offer of the
+    /// question again), and nothing was said until the silence re-ask 8 s later, when the
+    /// window had closed. A re-ask of a question whose read-back was not heard reads it back,
+    /// and a clear yes after it binds.
+    #[test]
+    fn a_yes_after_the_re_ask_of_a_cut_read_back_binds() {
+        let mut policy = policy();
+        let request = confirm(true);
+        let board = read_back_cut(&mut policy, &request, 4_000);
+        let unclear = EndOfTurn {
+            unclear: true,
+            ..turn(1, 4_000, "mm the cluster")
+        };
+        let mut actions = policy.step(4_000, PolicyInput::EndOfTurn(unclear), &board);
+        assert!(commands(&actions).is_empty(), "{actions:?}");
+        actions.extend(policy.step(4_000, PolicyInput::Tick, &board));
+        let reask = words(&actions);
+        let heard = hear_all(&mut policy, &actions, 4_000, &board);
+
+        let at = heard + 3_000;
+        let actions = policy.step(at, says(2, at, "yes go ahead"), &board);
+        assert!(
+            matches!(
+                commands(&actions)[..],
+                [TaskCmd::Answer {
+                    outcome: HitlOutcome::Accept { value: None },
+                    by: AnsweredBy::Voice,
+                    ..
+                }]
+            ),
+            "the yes after the re-ask {reask:?}: {actions:?}"
+        );
+        let readback = "book a table at Rosa's, 2, Friday.".to_owned();
+        assert!(reask.contains(&readback), "{reask:?}");
+    }
+
+    /// Live (IM3, 3 Nov, call im3b-early_yes-1): a short "Yes." over the read-back (a
+    /// backchannel by its sound: the read-back played on) is an answer not yet heard. Nothing
+    /// was said after the question, and the caller, who had answered, waited 9 s for the
+    /// silence re-ask. The question is asked again, with its values, as soon as it was heard,
+    /// and the yes after that binds.
+    #[test]
+    fn a_yes_over_the_read_back_is_asked_again_once_the_question_was_heard() {
+        let mut policy = policy();
+        let request = confirm(true);
+        let board = asking(request.clone());
+        let required = TaskEventKind::InputRequired(request);
+        let actions = policy.step(1_000, task_event(1_000, required), &board);
+        let parts: Vec<ItemId> = spoken(&actions).iter().map(|part| part.item).collect();
+        let yes = EndOfTurn {
+            class: Class::Backchannel,
+            ..turn(1, 2_200, "Yes.")
+        };
+        let actions = policy.step(2_200, PolicyInput::EndOfTurn(yes), &board);
+        assert_eq!(settled(&actions).0, Act::Question);
+        assert!(commands(&actions).is_empty() && words(&actions).is_empty());
+
+        // The read-back and the question play on to the end: then the question is put again.
+        let mut asked = Vec::new();
+        for (item, heard_at) in parts.into_iter().zip([2_500, 3_500, 4_500]) {
+            let heard = LaneEvent::Heard { item, heard_at };
+            asked.extend(policy.step(heard_at, PolicyInput::Lane(heard), &board));
+            asked.extend(policy.step(heard_at, PolicyInput::Tick, &board));
+        }
+        assert_eq!(
+            words(&asked),
+            ["Okay, that's 2, Friday. Do you want me to do that?"]
+        );
+        let heard = hear_all(&mut policy, &asked, 4_500, &board);
+        let at = heard + 3_000;
+        let actions = policy.step(at, says(2, at, "yes"), &board);
+        assert!(
+            matches!(
+                commands(&actions)[..],
+                [TaskCmd::Answer {
+                    outcome: HitlOutcome::Accept { value: None },
+                    ..
+                }]
+            ),
+            "{actions:?}"
+        );
+    }
+
+    /// Live (IM3, 3 Nov, call im3b-early_yes-1): a yes over the re-ask, which it cut, was
+    /// hard to hear and got "Sorry, was that a yes or a no?". Words over a question that was
+    /// not yet heard are asked again with the question, not as an unclear answer.
+    #[test]
+    fn a_yes_over_the_re_ask_that_was_hard_to_hear_gets_the_question_again() {
+        let mut policy = policy();
+        let request = confirm(true);
+        asked(&mut policy, &request);
+        let board = asking(request);
+        let actions = policy.step(13_100, PolicyInput::Tick, &board);
+        assert_eq!(spoken(&actions).len(), 1, "the re-ask after 8 s of silence");
+        let cut = LaneEvent::Dropped {
+            item: spoken(&actions)[0].item,
+            heard_chars: 10,
+            cause: CutCause::Interrupt,
+        };
+        policy.step(13_600, PolicyInput::UserSpeaking { on: true }, &board);
+        policy.step(13_600, PolicyInput::Lane(cut), &board);
+        policy.step(14_500, PolicyInput::UserSpeaking { on: false }, &board);
+        let yes = EndOfTurn {
+            unclear: true,
+            onset_at: Some(13_500),
+            ..turn(1, 14_500, "yes")
+        };
+        let mut actions = policy.step(14_500, PolicyInput::EndOfTurn(yes), &board);
+        actions.extend(policy.step(14_500, PolicyInput::Tick, &board));
+        assert!(commands(&actions).is_empty(), "{actions:?}");
+        assert_eq!(
+            words(&actions),
+            ["Okay, that's 2, Friday. Do you want me to do that?"]
+        );
+        let heard = hear_all(&mut policy, &actions, 14_500, &board);
+        let at = heard + 3_000;
+        let actions = policy.step(at, says(2, at, "yes"), &board);
+        assert!(
+            matches!(
+                commands(&actions)[..],
+                [TaskCmd::Answer {
+                    outcome: HitlOutcome::Accept { value: None },
+                    ..
+                }]
+            ),
+            "{actions:?}"
+        );
+    }
+
+    /// A new request said over the read-back is no answer: it goes to the front as any turn
+    /// (the agent runs tasks side by side) and the question stays open, asked again in full
+    /// once the turn is settled. Live (IM3, 3 Nov): "Also, how many nodes does the cluster
+    /// have?" was taken as an unclear answer.
+    #[test]
+    fn a_new_request_while_a_question_is_open_is_delegated_and_the_question_asked_again() {
+        let mut policy = policy();
+        let request = confirm(true);
+        let board = read_back_cut(&mut policy, &request, 4_000);
+        let also = "also how many nodes does the cluster have";
+        let actions = policy.step(4_000, says(1, 4_000, also), &board);
+        assert!(
+            matches!(actions[..], [PolicyAction::RequestFront { .. }]),
+            "the front decides it: {actions:?}"
+        );
+        let mut actions = policy.step(4_000, done(1, Act::Delegate), &board);
+        assert_eq!(settled(&actions).0, Act::Delegate);
+        assert!(
+            matches!(commands(&actions)[..], [TaskCmd::Delegate { .. }]),
+            "{actions:?}"
+        );
+        // It is acknowledged first.
+        assert!(spoken(&policy.step(4_000, PolicyInput::Tick, &board)).is_empty());
+        actions.extend(policy.step(4_300, PolicyInput::Tick, &board));
+        let kinds: Vec<Kind> = spoken(&actions).iter().map(|part| part.kind).collect();
+        assert_eq!(kinds[0], Kind::Ack, "{actions:?}");
+        assert_eq!(
+            words(&actions)[1..],
+            [
+                "To confirm:",
+                "book a table at Rosa's, 2, Friday.",
+                "Do you want me to do that?"
+            ]
+        );
+        let heard = hear_all(&mut policy, &actions, 4_000, &board);
+
+        let at = heard + 3_000;
+        let actions = policy.step(at, says(2, at, "yes go ahead"), &board);
+        assert!(
+            matches!(
+                commands(&actions)[..],
+                [TaskCmd::Answer {
+                    outcome: HitlOutcome::Accept { value: None },
+                    ..
+                }]
+            ),
+            "{actions:?}"
+        );
     }
 
     #[test]
@@ -6244,6 +6768,44 @@ mod tests {
         };
         assert_eq!(text, TABLE_FOR_FOUR);
         assert_eq!(settled(&actions), (Act::Delegate, false));
+    }
+
+    /// Live (pde-ditto, 3 Nov): a second request said with "also" beside a running task that
+    /// may change something was asked "change it, or a second one?" and never started.
+    #[test]
+    fn a_request_added_with_also_or_for_another_target_starts_a_second_task() {
+        const PODS: &str = "Check the pods in the bud-dev namespace";
+        let running = Board {
+            tasks: vec![TaskView {
+                side_effects: true,
+                ..view("t1", TaskState::Working, PODS)
+            }],
+            ..Board::default()
+        };
+        for added in [
+            "While you're checking that, can you also check the pods in the pde-ditto namespace?",
+            "Check the pods in the pde-ditto namespace",
+        ] {
+            let mut policy = policy();
+            policy.step(1_000, says(1, 1_000, added), &running);
+            let actions = policy.step(1_000, done(1, Act::Delegate), &running);
+            assert_eq!(settled(&actions), (Act::Delegate, false), "{added:?}");
+            assert!(
+                matches!(commands(&actions)[..], [TaskCmd::Delegate { .. }]),
+                "{added:?}: {actions:?}"
+            );
+            assert!(
+                !words(&actions).iter().any(|said| said == WHICH),
+                "{added:?}"
+            );
+        }
+        // The same request again is still asked about (a change of it, "instead", is never
+        // taken for a second one: `rules::adds_request`).
+        let mut policy = policy();
+        let again = "Can you check the pods in the bud-dev namespace";
+        policy.step(1_000, says(1, 1_000, again), &running);
+        let actions = policy.step(1_000, done(1, Act::Delegate), &running);
+        assert_eq!(words(&actions), [WHICH]);
     }
 
     #[test]
@@ -7130,6 +7692,77 @@ mod tests {
         let idle = policy.step(8_000, PolicyInput::Tick, &board);
         assert_eq!(narrations(&idle).len(), 2, "{idle:?}");
         assert!(spoken(&idle).is_empty(), "the narrator words them first");
+    }
+
+    #[test]
+    fn what_a_task_did_is_said_once_per_tool() {
+        let labels = |all: &[&str]| all.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>();
+        let gets = labels(&["used kubectl-get"; 34]);
+        let mut many = gets.clone();
+        many.push("used kubectl-generic".to_owned());
+        assert_eq!(
+            spoken_effects(&many),
+            "used kubectl-get and kubectl-generic"
+        );
+        assert_eq!(spoken_effects(&gets), "used kubectl-get");
+        assert_eq!(
+            spoken_effects(&labels(&["used a", "used b", "used c", "used d", "used a"])),
+            "used a, b and 2 more"
+        );
+        assert_eq!(
+            spoken_effects(&labels(&["held the table", "charged the card"])),
+            "held the table and charged the card"
+        );
+    }
+
+    #[test]
+    fn a_finished_answer_the_caller_never_heard_waits_as_an_update() {
+        // Its sentences waited behind another answer, and the caller took the floor: the floor
+        // gave them back unheard. The result is said at the next idle moment, not lost.
+        for heard_first in [false, true] {
+            let mut policy = policy();
+            let board = Board {
+                tasks: vec![view("t1", TaskState::Completed, "the errors in bud-dev")],
+                ..Board::default()
+            };
+            let said = policy.step(
+                1_000,
+                task_event(1_000, sentence(0, "Two pods are failing.", None)),
+                &board,
+            );
+            let item = spoken(&said)[0].item;
+            policy.step(
+                1_100,
+                task_event(1_100, completed("Two pods are failing.")),
+                &board,
+            );
+            if heard_first {
+                let heard = LaneEvent::Heard {
+                    item,
+                    heard_at: 1_200,
+                };
+                policy.step(1_200, PolicyInput::Lane(heard), &board);
+            }
+            policy.step(
+                1_300,
+                PolicyInput::Lane(LaneEvent::Returned { item }),
+                &board,
+            );
+            policy.set_floor(true, false);
+            let idle = policy.step(60_000, PolicyInput::Tick, &board);
+            let told: Vec<&str> = narrations(&idle)
+                .iter()
+                .map(|n| n.summary.as_str())
+                .collect();
+            if heard_first {
+                assert!(
+                    told.is_empty(),
+                    "an answer the caller heard is not said again: {idle:?}"
+                );
+            } else {
+                assert_eq!(told, ["Two pods are failing."], "{idle:?}");
+            }
+        }
     }
 
     #[test]

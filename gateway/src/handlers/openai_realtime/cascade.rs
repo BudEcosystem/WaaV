@@ -17,7 +17,7 @@
 //! function tools of its own and give instructions (for the session, or for one response).
 //! That is what an OpenAI Realtime client expects of a speech-to-speech model.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,18 +105,15 @@ pub async fn prepare(
             "Voice agents are Bud agents; this gateway has no Bud control plane.",
         ));
     }
-    if hs.credential.is_client_secret() {
-        // NG-5: an `ek_bud_` holder has no credential budgateway would accept for the agent's turns.
-        return Err(HandshakeError::new(
-            StatusCode::UNAUTHORIZED,
-            "client_secret_unsupported",
-            "Client secrets are not supported for voice agents yet: connect with your Bud API key or \
-             token (from a backend, or the playground).",
-        ));
-    }
-    let caller = super::session::authenticate(state, &hs.credential).await?;
+    // An agent's `ek_bud_` secret runs the session as the parent credential sealed in it.
+    let (caller, credential) = if hs.credential.is_client_secret() {
+        super::session::open_agent_client_secret(state, hs.credential.expose(), &hs.model).await?
+    } else {
+        let caller = super::session::authenticate(state, &hs.credential).await?;
+        (caller, hs.credential.expose().to_string())
+    };
     let agent = state
-        .resolve_voice_agent(&hs.model, hs.credential.expose())
+        .resolve_voice_agent(&hs.model, &credential)
         .await
         .map_err(|why| match why {
             VoiceAgentRefusal::NotFound => HandshakeError::new(
@@ -142,7 +139,7 @@ pub async fn prepare(
     Ok(PreparedCascade {
         source: CascadeSource::Agent {
             caller,
-            credential: hs.credential.expose().to_string(),
+            credential,
             agent,
         },
         model: hs.model,
@@ -289,6 +286,9 @@ pub enum ClientAct {
     Instructions(Option<String>),
     /// An input item for the next run: a function's output, a system note.
     Item(Value),
+    /// `session.bud_context`: the conversation before this session, as message items for the
+    /// first run.
+    Context(Vec<Value>),
     /// `response.create` that asks for a run of its own: over typed text, staged items, or
     /// instructions for this response only.
     Respond {
@@ -341,6 +341,115 @@ struct Resp {
     metadata: Map<String, Value>,
     /// Interaction mode: the utterance this response is.
     utterance: Option<String>,
+    /// What the gateway timed of this response for `bud.turn.metrics`.
+    timing: RespTiming,
+}
+
+/// A response's gateway-side times: when the caller's speech ended, how long the transcript
+/// took after that, and when the response's first audio went to the client.
+#[derive(Debug, Clone, Default)]
+struct RespTiming {
+    endpoint_at: Option<std::time::Instant>,
+    stt_ms: Option<u64>,
+    first_audio_at: Option<std::time::Instant>,
+}
+
+/// A response ended early because the next one started: its `bud.turn.metrics` waits for the
+/// engine's end of its turn.
+#[derive(Debug, Clone)]
+struct CutResp {
+    turn: u64,
+    id: String,
+    item_id: Option<String>,
+    bud_response_id: Option<String>,
+    timing: RespTiming,
+}
+
+/// `session.bud_context` limits: the newest entries are kept within both.
+const BUD_CONTEXT_MAX_ENTRIES: usize = 40;
+const BUD_CONTEXT_MAX_CHARS: usize = 24_000;
+const BUD_CONTEXT_PARAM: &str = "session.bud_context";
+/// Interaction mode: how many recent caller turns' ends are kept for their lines' metrics.
+const TURN_ENDS_KEPT: usize = 16;
+
+/// `session.bud_context` (`[{role, text}]`, oldest first) as the message items of the first
+/// run, the newest kept within [`BUD_CONTEXT_MAX_ENTRIES`] and [`BUD_CONTEXT_MAX_CHARS`]. `Err`
+/// names what is wrong; nothing of a malformed list is used.
+fn bud_context_items(context: &Value) -> Result<Vec<Value>, String> {
+    let Some(list) = context.as_array() else {
+        return Err("`bud_context` is a list of {\"role\", \"text\"} entries.".into());
+    };
+    let mut entries = Vec::with_capacity(list.len());
+    for (i, entry) in list.iter().enumerate() {
+        let role = entry.get("role").and_then(Value::as_str);
+        let text = entry.get("text").and_then(Value::as_str);
+        match (role, text) {
+            (Some(role @ ("user" | "assistant")), Some(text)) if !text.trim().is_empty() => {
+                entries.push((role, text));
+            }
+            (Some("user" | "assistant"), _) => {
+                return Err(format!("`bud_context[{i}].text` must be non-empty text."));
+            }
+            _ => {
+                return Err(format!(
+                    "`bud_context[{i}].role` must be `user` or `assistant`."
+                ));
+            }
+        }
+    }
+    let newest = &entries[entries.len().saturating_sub(BUD_CONTEXT_MAX_ENTRIES)..];
+    let mut kept: Vec<(&str, String)> = Vec::new();
+    let mut budget = BUD_CONTEXT_MAX_CHARS;
+    for (role, text) in newest.iter().rev() {
+        let chars = text.chars().count();
+        if chars <= budget {
+            kept.push((role, (*text).to_string()));
+            budget -= chars;
+            continue;
+        }
+        // The newest entry alone is over the budget: its newest characters.
+        if kept.is_empty() {
+            kept.push((role, text.chars().skip(chars - budget).collect()));
+        }
+        break;
+    }
+    Ok(kept
+        .into_iter()
+        .rev()
+        .map(|(role, text)| json!({"type": "message", "role": role, "content": text}))
+        .collect())
+}
+
+/// `bud.turn.metrics` for a response. The engine's measures (`metrics`) start at the turn's
+/// request; the gateway's start at the end of the caller's speech. Unmeasured is `null`.
+fn turn_metrics_event(
+    response_id: &str,
+    item_id: Option<&str>,
+    bud_response_id: Option<&str>,
+    timing: &RespTiming,
+    status: &str,
+    metrics: &Value,
+) -> String {
+    let field = |key: &str| metrics.get(key).cloned().unwrap_or(Value::Null);
+    let endpoint_to_audio_ms = timing
+        .endpoint_at
+        .zip(timing.first_audio_at)
+        .map(|(end, audio)| audio.saturating_duration_since(end).as_millis() as u64);
+    bud_event(
+        "bud.turn.metrics",
+        json!({
+            "response_id": response_id,
+            "bud_response_id": bud_response_id,
+            "item_id": item_id,
+            "stt_ms": timing.stt_ms,
+            "ttft_ms": field("ttft_ms"),
+            "ttfa_ms": field("ttfa_ms"),
+            "endpoint_to_audio_ms": endpoint_to_audio_ms,
+            "total_ms": field("total_ms"),
+            "tools": metrics.get("tools").cloned().unwrap_or_else(|| json!([])),
+            "status": status,
+        }),
+    )
 }
 
 /// GA ⇄ `/ws` agent translation for one session.
@@ -397,6 +506,16 @@ pub struct CascadeGa {
     /// `bud.session.stt` and `bud.session.warning` (`WAAV_REALTIME_BUD_SESSION_EVENTS`, default on).
     bud_events: bool,
     stt_announced: bool,
+    /// When the caller's speech last ended (`speech_stopped`), and when its transcript came
+    /// after that (a gateway-endpointed turn's segment text).
+    speech_end_at: Option<std::time::Instant>,
+    transcript_at: Option<std::time::Instant>,
+    /// The response the next one cut, until the engine ends its turn.
+    cut: Option<CutResp>,
+    /// Interaction mode: the end of each recent caller turn (by turn index) and its STT time.
+    turn_ends: VecDeque<(u64, std::time::Instant, Option<u64>)>,
+    /// Interaction mode: the finished tools of each task, until a line of the task reports them.
+    task_tools: HashMap<String, Vec<Value>>,
 }
 
 /// `WAAV_REALTIME_BUD_SESSION_EVENTS`: anything but `off`, `false` or `0` keeps the Bud events on.
@@ -552,6 +671,11 @@ impl CascadeGa {
             stt_mode: None,
             bud_events: bud_session_events_enabled(),
             stt_announced: false,
+            speech_end_at: None,
+            transcript_at: None,
+            cut: None,
+            turn_ends: VecDeque::new(),
+            task_tools: HashMap::new(),
         }
     }
 
@@ -608,6 +732,11 @@ impl CascadeGa {
             stt_mode: None,
             bud_events: bud_session_events_enabled(),
             stt_announced: false,
+            speech_end_at: None,
+            transcript_at: None,
+            cut: None,
+            turn_ends: VecDeque::new(),
+            task_tools: HashMap::new(),
         }
     }
 
@@ -1178,6 +1307,26 @@ impl CascadeGa {
                 }
             }
         }
+        if let Some(context) = s.get("bud_context").filter(|c| !c.is_null()) {
+            if self.turns_ran {
+                out.push(gateway_error(
+                    "bud_context_too_late",
+                    "The conversation has started: `bud_context` is taken only before the first turn.",
+                    Some(BUD_CONTEXT_PARAM),
+                    eid,
+                ));
+            } else {
+                match bud_context_items(context) {
+                    Ok(items) => acts.push(ClientAct::Context(items)),
+                    Err(why) => out.push(gateway_error(
+                        "invalid_value",
+                        &why,
+                        Some(BUD_CONTEXT_PARAM),
+                        eid,
+                    )),
+                }
+            }
+        }
         if !self.started {
             acts.push(ClientAct::Start);
         }
@@ -1355,6 +1504,8 @@ impl CascadeGa {
             return;
         }
         let now = self.clock.elapsed().as_millis() as u64;
+        self.speech_end_at = (!speaking).then(std::time::Instant::now);
+        self.transcript_at = None;
         out.push(if speaking {
             // The item's own start, or now when the caller speaks again in the same item.
             let at = if self.user.text.is_empty() {
@@ -1482,6 +1633,7 @@ impl CascadeGa {
             bud_response_id: None,
             metadata,
             utterance: None,
+            timing: RespTiming::default(),
         });
     }
 
@@ -1600,6 +1752,11 @@ impl CascadeGa {
         if r.greeting {
             response["metadata"]["bud_greeting"] = json!(true);
         }
+        // An interaction-mode line's own metrics (a plain agent turn's come with its end).
+        if r.utterance.is_some() && self.bud_events {
+            let metrics = self.line_metrics(&r, status);
+            out.push(metrics);
+        }
         if let Some(shown) = response["metadata"].as_object_mut() {
             shown.extend(r.metadata);
         }
@@ -1611,7 +1768,14 @@ impl CascadeGa {
         let mut out = Vec::new();
         match msg {
             OutgoingMessage::STTResult { transcript, .. } if self.segmented() => {
+                if self.speech_end_at.is_some() && !transcript.trim().is_empty() {
+                    self.transcript_at = Some(std::time::Instant::now());
+                }
                 self.grow_user(transcript, &mut out);
+                // Interaction mode: a turn answered before its words came completes with them.
+                if self.interaction && self.user.due && !self.user.shown.is_empty() {
+                    self.settle_user(&mut out);
+                }
             }
             OutgoingMessage::STTResult {
                 transcript,
@@ -1650,6 +1814,18 @@ impl CascadeGa {
                 kind,
                 input,
             } => {
+                // The caller's speech this turn answers ended before it started, if it did.
+                let spoken = (kind == "agent" && input.is_some()).then(|| {
+                    let end = self.speech_end_at.take();
+                    let stt_ms = end
+                        .zip(self.transcript_at.take())
+                        .map(|(end, text)| text.saturating_duration_since(end).as_millis() as u64);
+                    RespTiming {
+                        endpoint_at: end,
+                        stt_ms,
+                        first_audio_at: None,
+                    }
+                });
                 if kind == "agent" {
                     self.turns_ran = true;
                     if let Some(text) = input.as_deref() {
@@ -1662,10 +1838,20 @@ impl CascadeGa {
                         }
                     }
                 }
-                if self.response.is_some() {
+                if let Some(r) = self.response.as_ref() {
+                    self.cut = Some(CutResp {
+                        turn: r.turn,
+                        id: r.id.clone(),
+                        item_id: r.item_id.clone(),
+                        bud_response_id: r.bud_response_id.clone(),
+                        timing: r.timing.clone(),
+                    });
                     self.finish_response("cancelled", None, &mut out);
                 }
                 self.start_response(*turn_index, kind == "greeting", &mut out);
+                if let (Some(r), Some(timing)) = (self.response.as_mut(), spoken) {
+                    r.timing = timing;
+                }
             }
             OutgoingMessage::AgentResponseCreated {
                 turn_index,
@@ -1729,7 +1915,10 @@ impl CascadeGa {
                 item_id,
                 name,
                 status,
+                duration_ms,
+                error,
             } => {
+                let bud_events = self.bud_events;
                 let Some(r) = self.response.as_mut().filter(|r| r.turn == *turn_index) else {
                     return out;
                 };
@@ -1747,6 +1936,12 @@ impl CascadeGa {
                         json!({"output_index": idx, "item_id": item_id}),
                     ));
                     r.tools.insert(item_id.clone(), (idx, item));
+                    if bud_events {
+                        out.push(bud_event(
+                            "bud.tool.started",
+                            json!({"response_id": r.id, "item_id": item_id, "name": name}),
+                        ));
+                    }
                 } else if let Some((idx, mut item)) = r.tools.remove(item_id) {
                     let ok = status == "completed";
                     item["status"] = json!(if ok { "completed" } else { "failed" });
@@ -1764,6 +1959,13 @@ impl CascadeGa {
                         json!({"response_id": r.id, "output_index": idx, "item": item}),
                     ));
                     r.output.push(item);
+                    if bud_events {
+                        out.push(bud_event(
+                            "bud.tool.done",
+                            json!({"response_id": r.id, "item_id": item_id, "name": name,
+                                   "duration_ms": duration_ms, "ok": ok, "error": error}),
+                        ));
+                    }
                 }
             }
             OutgoingMessage::AgentOutput {
@@ -1781,14 +1983,39 @@ impl CascadeGa {
                 turn_index,
                 status,
                 usage,
+                metrics,
+                response_id,
                 ..
             } => {
-                if self
-                    .response
-                    .as_ref()
-                    .is_some_and(|r| r.turn == *turn_index)
-                {
+                let measured = metrics.as_ref().filter(|_| self.bud_events);
+                if let Some(r) = self.response.as_ref().filter(|r| r.turn == *turn_index) {
+                    let metrics = measured.map(|m| {
+                        turn_metrics_event(
+                            &r.id,
+                            r.item_id.as_deref(),
+                            r.bud_response_id.as_deref().or(response_id.as_deref()),
+                            &r.timing,
+                            status,
+                            m,
+                        )
+                    });
                     self.finish_response(status, usage.as_ref(), &mut out);
+                    // Just ahead of `response.done`, the last event the response ended with.
+                    if let Some(metrics) = metrics {
+                        let at = out.len().saturating_sub(1);
+                        out.insert(at, metrics);
+                    }
+                } else if let Some(cut) = self.cut.take_if(|c| c.turn == *turn_index)
+                    && let Some(m) = measured
+                {
+                    out.push(turn_metrics_event(
+                        &cut.id,
+                        cut.item_id.as_deref(),
+                        cut.bud_response_id.as_deref().or(response_id.as_deref()),
+                        &cut.timing,
+                        status,
+                        m,
+                    ));
                 }
             }
             OutgoingMessage::AgentTruncated {
@@ -2023,6 +2250,7 @@ impl CascadeGa {
                     self.finish_response("cancelled", None, &mut out);
                 }
             }
+            "tool_started" | "tool_done" => self.interaction_tool(&kind, &body, &mut out),
             // Not sent on this protocol: each line already opens and closes its own response,
             // and a client of it pings the socket itself.
             "audio_segment" | "heartbeat" => {}
@@ -2035,6 +2263,77 @@ impl CascadeGa {
             },
         }
         out
+    }
+
+    /// A tool of the session's Bud agent (interaction mode), as `bud.tool.*`: named by the
+    /// response of a line of its task that plays at the time, else `response_id: null`. A
+    /// finished one is kept for the `bud.turn.metrics` of the task's next line.
+    fn interaction_tool(&mut self, kind: &str, body: &Value, out: &mut Vec<String>) {
+        if !self.bud_events {
+            return;
+        }
+        let field = |key: &str| body.get(key).cloned().unwrap_or(Value::Null);
+        let task = body.get("task_id").and_then(Value::as_str);
+        let response_id = self
+            .response
+            .as_ref()
+            .filter(|r| {
+                task.is_some() && r.metadata.get("bud_task_id").and_then(Value::as_str) == task
+            })
+            .map(|r| r.id.clone());
+        let mut ev = json!({"response_id": response_id, "task_id": field("task_id"),
+                            "item_id": field("item_id"), "name": field("name")});
+        if kind == "tool_done" {
+            ev["duration_ms"] = field("duration_ms");
+            ev["ok"] = field("ok");
+            ev["error"] = field("error");
+            if let (Some(task), Some(ms)) = (task, body.get("duration_ms").and_then(Value::as_u64))
+            {
+                self.task_tools
+                    .entry(task.to_string())
+                    .or_default()
+                    .push(json!({"name": field("name"), "duration_ms": ms, "ok": field("ok")}));
+            }
+            out.push(bud_event("bud.tool.done", ev));
+        } else {
+            out.push(bud_event("bud.tool.started", ev));
+        }
+    }
+
+    /// `bud.turn.metrics` of an interaction-mode line: what the gateway saw of it. Nothing is
+    /// measured from a request start here (the front's and the agent's requests are the actor's).
+    fn line_metrics(&mut self, r: &Resp, status: &str) -> String {
+        let meta = |key: &str| r.metadata.get(key).cloned().unwrap_or(Value::Null);
+        let tools = r
+            .metadata
+            .get("bud_task_id")
+            .and_then(Value::as_str)
+            .and_then(|task| self.task_tools.remove(task))
+            .unwrap_or_default();
+        let since_end = |at: std::time::Instant| {
+            r.timing
+                .endpoint_at
+                .map(|end| at.saturating_duration_since(end).as_millis() as u64)
+        };
+        bud_event(
+            "bud.turn.metrics",
+            json!({
+                "response_id": r.id,
+                "bud_response_id": Value::Null,
+                "item_id": r.item_id,
+                "stt_ms": r.timing.stt_ms,
+                "ttft_ms": Value::Null,
+                "ttfa_ms": Value::Null,
+                "endpoint_to_audio_ms": r.timing.first_audio_at.and_then(since_end),
+                "total_ms": since_end(std::time::Instant::now()),
+                "tools": tools,
+                "status": status,
+                "act": meta("bud_act"),
+                "source": meta("bud_source"),
+                "kind": meta("bud_kind"),
+                "task_id": meta("bud_task_id"),
+            }),
+        )
     }
 
     /// A line of the agent in interaction mode. It arrives with its words when it starts to
@@ -2063,6 +2362,18 @@ impl CascadeGa {
         let turn = line.get("turn_index").and_then(Value::as_u64).unwrap_or(0);
         if turn > self.turn_seen {
             self.turn_seen = turn;
+            // A caller turn was answered: the conversation has started.
+            self.turns_ran = true;
+            if let Some(end) = self.speech_end_at.take() {
+                let stt_ms = self
+                    .transcript_at
+                    .take()
+                    .map(|text| text.saturating_duration_since(end).as_millis() as u64);
+                self.turn_ends.push_back((turn, end, stt_ms));
+                if self.turn_ends.len() > TURN_ENDS_KEPT {
+                    self.turn_ends.pop_front();
+                }
+            }
             self.settle_user(out);
         }
         // A line whose end was not reported (its synthesis failed) is over.
@@ -2082,8 +2393,17 @@ impl CascadeGa {
         .filter_map(|(field, name)| Some((name.to_string(), line.get(field)?.clone())))
         .collect();
         self.open_response(turn, false, metadata, out);
+        let ended = self
+            .turn_ends
+            .iter()
+            .find(|(t, ..)| *t == turn)
+            .map(|(_, end, stt_ms)| (*end, *stt_ms));
         if let Some(r) = self.response.as_mut() {
             r.utterance = utterance.map(str::to_string);
+            if let Some((end, stt_ms)) = ended {
+                r.timing.endpoint_at = Some(end);
+                r.timing.stt_ms = stt_ms;
+            }
         }
         self.say(words, out);
         // Its first audio came ahead of it.
@@ -2098,9 +2418,17 @@ impl CascadeGa {
         if self.user.id.is_none() {
             return;
         }
-        self.user.due = self.user.text.is_empty();
-        if !self.user.due {
-            let text = std::mem::take(&mut self.user.text);
+        // The turn's finals, or a segmented turn's text so far.
+        let text = match std::mem::take(&mut self.user.text) {
+            text if !text.trim().is_empty() => text,
+            _ => self.user.shown.clone(),
+        };
+        self.user.due = text.trim().is_empty();
+        if self.user.due {
+            // The turn has ended though its words have not come: its speech ends now, as on a
+            // plain session, and the transcript completes the item when it comes.
+            self.stop_user(None, out);
+        } else {
             self.close_user(text.trim(), out);
         }
     }
@@ -2122,6 +2450,11 @@ impl CascadeGa {
         let Some((rid, iid, idx)) = self.message_item(&mut out) else {
             return out;
         };
+        if let Some(r) = self.response.as_mut() {
+            r.timing
+                .first_audio_at
+                .get_or_insert_with(std::time::Instant::now);
+        }
         out.push(event(
             "response.output_audio.delta",
             json!({"response_id": rid, "item_id": iid, "output_index": idx, "content_index": 0, "delta": BASE64.encode(pcm)}),
@@ -2196,6 +2529,7 @@ pub async fn run(
                 let mut c = conn.write().await;
                 c.credential = Some(crate::auth::SessionCredential::new(credential.clone()));
                 c.caller_check = Some(caller.check.clone());
+                c.agent_model = Some(p.model.clone());
             }
             conn
         }
@@ -2203,6 +2537,8 @@ pub async fn run(
             Arc::new(RwLock::new(ConnectionState::with_auth(auth.clone())))
         }
     };
+    // The client opened this session on `/v1/realtime`; its trace is titled with that.
+    conn.write().await.route = crate::handlers::ws::state::REALTIME_ROUTE;
     let (core_tx, mut core_rx) = mpsc::channel::<MessageRoute>(CORE_QUEUE);
     let grace = tokio::time::sleep(START_GRACE);
     tokio::pin!(grace);
@@ -2432,6 +2768,25 @@ async fn apply(
             ClientAct::TaskSeen(task_id) => Msg::TaskSeen { task_id },
             ClientAct::Update(patch) => Msg::Update(patch),
             ClientAct::Control(control) => Msg::Control(control),
+            ClientAct::Context(items) => {
+                // The Bud agent's first run takes it; the front model keeps no history to seed.
+                let (code, message) = match actor.agent().map(|agent| agent.set_context(items)) {
+                    Some(Ok(())) => return,
+                    Some(Err(why)) => ("bud_context_too_late", why.to_string()),
+                    None => (
+                        "bud_context_unsupported",
+                        "This session's tasks do not run on a Bud agent: `bud_context` is not taken."
+                            .to_string(),
+                    ),
+                };
+                let _ = core_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::AgentError {
+                        code: code.into(),
+                        message,
+                    }))
+                    .await;
+                return;
+            }
             _ => return,
         };
         actor.send(msg).await;
@@ -2464,6 +2819,27 @@ async fn apply(
         ClientAct::Item(item) => {
             if let Some(engine) = engine {
                 engine.add_input(item);
+            }
+        }
+        ClientAct::Context(items) => {
+            // The GA layer refused it once a turn had started; a turn may still have started
+            // since the client sent it. An alias session has no agent to seed.
+            let refused = match engine.map(|engine| engine.set_context(items)) {
+                Some(Ok(())) => None,
+                Some(Err(why)) => Some(("bud_context_too_late", why.to_string())),
+                None => Some((
+                    "bud_context_unsupported",
+                    "An alias session has no agent conversation: `bud_context` is not taken."
+                        .to_string(),
+                )),
+            };
+            if let Some((code, message)) = refused {
+                let _ = core_tx
+                    .send(MessageRoute::Outgoing(OutgoingMessage::AgentError {
+                        code: code.into(),
+                        message,
+                    }))
+                    .await;
             }
         }
         ClientAct::Respond { text, instructions } => {

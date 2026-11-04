@@ -16,14 +16,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bud_auth::{AliasMetadata, VoiceEndpoint, VoicePricing};
+use opentelemetry::trace::TraceContextExt;
 use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::core::deployment_policy::{Admission, Rejection};
+use crate::core::interaction::types::LineSources;
 use crate::core::voice_cost::voice_cost;
 use crate::handlers::advisories::Advisories;
 use crate::handlers::endpoint_settings;
+use crate::handlers::openai_realtime::handshake::REALTIME_CAPABILITY;
 use crate::handlers::openai_realtime::session::{Caller, CallerCheck};
-use crate::observability::voice_attrs::{leg as leg_attr, resilience, turn};
+use crate::observability::vendor_span::{VendorScope, operation as vendor_op};
+use crate::observability::voice_attrs::{
+    interaction, leg as leg_attr, realtime as rt, resilience, session as sess, turn,
+};
 use crate::state::AppState;
 
 use super::config::{STTWebSocketConfig, TTSWebSocketConfig};
@@ -457,6 +464,15 @@ fn record_text(span: &Span, key: &'static str, value: Option<&str>) {
     }
 }
 
+/// The agent's name in an alias: `prompt:support` and `prompt:support:v3` are `support`.
+fn agent_name(alias: &str) -> &str {
+    let name = alias.strip_prefix("prompt:").unwrap_or(alias);
+    match name.rsplit_once(":v") {
+        Some((base, v)) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => name,
+    }
+}
+
 /// Meters a Bud-mode `/ws` session's STT and TTS legs (FR-WS-5, TC-WS-12).
 pub struct LegMeter {
     session_id: String,
@@ -477,6 +493,17 @@ pub struct LegMeter {
     segmented: std::sync::atomic::AtomicBool,
     /// The STT deployment's fallbacks (Release 5): a unit one of them served is billed on it.
     stt_fallbacks: parking_lot::Mutex<std::collections::HashMap<String, LegBilling>>,
+    /// Interaction mode's speech worker: whose words the line being synthesised is (spec 029
+    /// R-6). Unset outside interaction mode, where a TTS record carries no line source.
+    line_sources: parking_lot::Mutex<Option<Arc<LineSources>>>,
+    /// The session's `voice.ws_session` span (FRD-023 §5.10), the same session grain as the
+    /// `/v1/realtime` relay's `voice.session`: a root of its own trace, opened with the meter and ended by
+    /// [`finish`](Self::finish) with the totals. Each billed record stays its own trace (D-19) and
+    /// links to it, so Observability lists the session as one row and gathers its records.
+    session: parking_lot::Mutex<Option<Span>>,
+    started: std::time::Instant,
+    end_reason: parking_lot::Mutex<&'static str>,
+    route: parking_lot::Mutex<&'static str>,
 }
 
 /// What authorizes a voice-agent session, re-checked every revalidation (spec 025 S-8).
@@ -497,16 +524,42 @@ impl std::fmt::Debug for LegMeter {
 }
 
 impl LegMeter {
+    /// A session's meter, with its `voice.ws_session` span.
     pub fn new(
         session_id: String,
         caller: Caller,
         stt: Option<(&BudLeg, u32, u16)>,
         tts: Option<&BudLeg>,
     ) -> Self {
+        Self::build(session_id, caller, stt, tts, true)
+    }
+
+    /// A DAG node's meter: its records belong to the session it runs in, which already has its
+    /// span, so it opens none of its own.
+    pub fn for_node(session_id: String, caller: Caller, tts: Option<&BudLeg>) -> Self {
+        Self::build(session_id, caller, None, tts, false)
+    }
+
+    fn build(
+        session_id: String,
+        caller: Caller,
+        stt: Option<(&BudLeg, u32, u16)>,
+        tts: Option<&BudLeg>,
+        with_session: bool,
+    ) -> Self {
+        let stt_billing = stt.map(|(leg, _, _)| LegBilling::from_leg(STT_CAPABILITY, leg, &caller));
+        let tts_billing = tts.map(|leg| LegBilling::from_leg(TTS_CAPABILITY, leg, &caller));
+        let session = with_session.then(|| {
+            Self::session_span(
+                &session_id,
+                &caller,
+                stt_billing.as_ref().or(tts_billing.as_ref()),
+            )
+        });
         let meter = Self {
             session_id,
-            stt: stt.map(|(leg, _, _)| LegBilling::from_leg(STT_CAPABILITY, leg, &caller)),
-            tts: tts.map(|leg| LegBilling::from_leg(TTS_CAPABILITY, leg, &caller)),
+            stt: stt_billing,
+            tts: tts_billing,
             caller,
             stt_bytes: AtomicU64::new(0),
             stt_bytes_per_second: AtomicU64::new(0),
@@ -515,11 +568,38 @@ impl LegMeter {
             agent: parking_lot::Mutex::new(None),
             segmented: std::sync::atomic::AtomicBool::new(false),
             stt_fallbacks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            line_sources: parking_lot::Mutex::new(None),
+            session: parking_lot::Mutex::new(session),
+            started: std::time::Instant::now(),
+            end_reason: parking_lot::Mutex::new("client_close"),
+            route: parking_lot::Mutex::new(super::state::WS_ROUTE),
         };
         if let Some((_, rate, channels)) = stt {
             meter.set_stt_format(rate, channels);
         }
         meter
+    }
+
+    fn session_span(session_id: &str, caller: &Caller, leg: Option<&LegBilling>) -> Span {
+        let session = crate::voice_session_span!(
+            name = "voice.ws_session",
+            capability = REALTIME_CAPABILITY,
+            transport = "websocket"
+        );
+        // Each attribute is recorded ONCE: the OTel export keeps every value a field is given,
+        // and a reader of `SpanAttributes[key]` sees the first. What depends on the agent (its
+        // type, its name) waits for `finish`.
+        if let Some(b) = leg {
+            record_text(&session, turn::PROJECT_ID, b.project_id.as_deref());
+            record_text(&session, turn::ENDPOINT_ID, Some(&b.endpoint_id));
+            record_text(&session, turn::MODEL_ID, b.model_id.as_deref());
+        }
+        let p = &caller.principal;
+        record_text(&session, turn::API_KEY_ID, p.api_key_id.as_deref());
+        record_text(&session, turn::USER_ID, p.user_id.as_deref());
+        record_text(&session, turn::API_KEY_PROJECT_ID, p.project_id.as_deref());
+        record_text(&session, turn::SESSION_ID, Some(session_id));
+        session
     }
 
     /// The PCM16 format the STT leg receives, as finally negotiated.
@@ -636,22 +716,34 @@ impl LegMeter {
             turn::TURN_INDEX,
             self.turn_index.fetch_add(1, Ordering::Relaxed),
         );
+        if let Some(link) = self.session_link() {
+            span.add_link(link);
+        }
         span
     }
 
-    /// A final transcript: bill the audio streamed since the previous one.
-    pub fn stt_final(&self, transcript: &str) {
-        let Some(billing) = &self.stt else { return };
+    /// The `voice.ws_session` span's context, for the session's spans to link to; `None` once the
+    /// session has finished, or when no OpenTelemetry layer is installed.
+    pub fn session_link(&self) -> Option<opentelemetry::trace::SpanContext> {
+        let session = self.session.lock();
+        let link = session.as_ref()?.context().span().span_context().clone();
+        link.is_valid().then_some(link)
+    }
+
+    /// A final transcript: bill the audio streamed since the previous one. Returns the scope the
+    /// vendor's answer is traced in, beneath the record.
+    pub fn stt_final(&self, transcript: &str) -> Option<VendorScope> {
+        let billing = self.stt.as_ref()?;
         if self.segmented.load(Ordering::Relaxed) {
-            return;
+            return None;
         }
         let bps = self.stt_bytes_per_second.load(Ordering::Relaxed);
         if bps == 0 {
-            return;
+            return None;
         }
         let bytes = self.stt_bytes.swap(0, Ordering::Relaxed);
         if bytes == 0 {
-            return;
+            return None;
         }
         let seconds = bytes as f64 / bps as f64;
         let span = self.open(billing);
@@ -674,19 +766,30 @@ impl LegMeter {
                 crate::observability::trace_redact::sanitize_body(transcript).as_str(),
             );
         }
+        Some(self.vendor_scope(span, billing, vendor_op::TRANSCRIPTION))
     }
 
-    /// A `speak`: bill its characters.
-    pub fn tts_spoken(&self, text: &str) {
-        let Some(billing) = &self.tts else { return };
+    /// Interaction mode: tag each TTS record with whose words its line is, as `lines` names it.
+    pub fn set_line_sources(&self, lines: Arc<LineSources>) {
+        *self.line_sources.lock() = Some(lines);
+    }
+
+    /// A `speak`: bill its characters. Returns the scope the synthesis's vendor request is traced
+    /// in, beneath the record: the record stays open until that request ends.
+    pub fn tts_spoken(&self, text: &str) -> Option<VendorScope> {
+        let billing = self.tts.as_ref()?;
         let characters = text.chars().count() as u64;
         if characters == 0 {
-            return;
+            return None;
         }
         let span = self.open(billing);
         record_text(&span, leg_attr::TTS_VENDOR, Some(&billing.vendor));
         record_text(&span, leg_attr::TTS_MODEL, billing.vendor_model.as_deref());
         span.record(turn::CHARACTERS, characters);
+        let lines = self.line_sources.lock().clone();
+        if let Some(source) = lines.and_then(|lines| lines.source_of(text)) {
+            span.record(interaction::TTS_LINE_SOURCE, source.as_str());
+        }
         if let Some((cost, unit)) = voice_cost(
             billing.pricing.as_ref(),
             TTS_CAPABILITY,
@@ -697,12 +800,82 @@ impl LegMeter {
             span.record(turn::COST, cost);
             span.record(turn::PRICING_UNIT, unit);
         }
+        Some(self.vendor_scope(span, billing, vendor_op::TEXT_TO_SPEECH))
+    }
+
+    /// A vendor exchange's scope: the children of `parent`, attributed like the leg.
+    fn vendor_scope(
+        &self,
+        parent: Span,
+        billing: &LegBilling,
+        operation: &'static str,
+    ) -> VendorScope {
+        let p = &self.caller.principal;
+        VendorScope::new(parent, operation)
+            .with_id(
+                turn::PROJECT_ID,
+                billing.project_id.as_deref().unwrap_or(""),
+            )
+            .with_id(turn::ENDPOINT_ID, &billing.endpoint_id)
+            .with_id(turn::MODEL_ID, billing.model_id.as_deref().unwrap_or(""))
+            .with_id(turn::API_KEY_ID, p.api_key_id.as_deref().unwrap_or(""))
+            .with_id(turn::USER_ID, p.user_id.as_deref().unwrap_or(""))
+            .with_id(
+                turn::API_KEY_PROJECT_ID,
+                p.project_id.as_deref().unwrap_or(""),
+            )
+    }
+
+    /// The scope the STT connection is traced in: beneath the session span, for as long as the
+    /// connection is open. `None` once the session has finished.
+    pub fn stt_connection_scope(&self) -> Option<VendorScope> {
+        let billing = self.stt.as_ref()?;
+        let session = self.session.lock().as_ref()?.clone();
+        Some(self.vendor_scope(session, billing, vendor_op::TRANSCRIPTION))
+    }
+
+    /// The API the client opened the session on (`/ws`, or `/v1/realtime` for the agent cascade).
+    pub fn set_route(&self, route: &'static str) {
+        *self.route.lock() = route;
     }
 
     /// At close: bill audio streamed after the last final transcript, so nothing streamed goes
-    /// unbilled.
+    /// unbilled, then end the session span with its totals. Idempotent.
     pub fn finish(&self) {
         self.stt_final("");
+        if let Some(session) = self.session.lock().take() {
+            let (session_type, name, prompt_id) = match self.agent.lock().as_ref() {
+                Some(grant) => (
+                    "agent",
+                    Some(agent_name(&grant.alias).to_string()),
+                    Some(grant.prompt_id.clone()),
+                ),
+                None => (
+                    "stream",
+                    self.stt
+                        .as_ref()
+                        .or(self.tts.as_ref())
+                        .map(|b| b.endpoint_name.clone()),
+                    None,
+                ),
+            };
+            record_text(&session, rt::SESSION_TYPE, Some(session_type));
+            record_text(&session, turn::ENDPOINT_NAME, name.as_deref());
+            record_text(&session, sess::PROMPT_ID, prompt_id.as_deref());
+            record_text(&session, sess::HTTP_METHOD, Some("GET"));
+            record_text(&session, sess::HTTP_ROUTE, Some(*self.route.lock()));
+            session.record(
+                sess::DURATION_MS,
+                self.started.elapsed().as_secs_f64() * 1000.0,
+            );
+            session.record(sess::TURNS, self.turn_index.load(Ordering::Relaxed));
+            session.record(sess::END_REASON, *self.end_reason.lock());
+        }
+    }
+
+    /// Why the session is ending, when it is not the client closing it (`idle`, `max_duration`).
+    pub fn set_end_reason(&self, reason: &'static str) {
+        *self.end_reason.lock() = reason;
     }
 
     /// How to re-check this session's caller.
@@ -727,7 +900,8 @@ impl LegMeter {
         self.held.lock().push((endpoint_id, capability));
     }
 
-    /// Mark this as a voice-agent session: revalidation re-checks the agent, not the legs.
+    /// Mark this as a voice-agent session: revalidation re-checks the agent, not the legs, and the
+    /// session span is named for the agent when it ends.
     pub fn set_agent(&self, grant: AgentGrant) {
         *self.agent.lock() = Some(grant);
     }
@@ -1323,10 +1497,9 @@ pub async fn bind_dag(
                 if let Some(obj) = config.as_object_mut() {
                     obj.remove("api_key");
                 }
-                let meter = Arc::new(LegMeter::new(
+                let meter = Arc::new(LegMeter::for_node(
                     session_id.to_string(),
                     session_meter.caller().clone(),
-                    None,
                     Some(&leg),
                 ));
                 session_meter.hold(leg.endpoint_id.clone(), TTS_CAPABILITY);
@@ -1336,7 +1509,9 @@ pub async fn bind_dag(
                     api_base: ep.api_base.clone(),
                     extras: crate::handlers::openai_audio::deployment_extras(ep),
                     session_credential: None,
-                    on_synthesis: Some(Arc::new(move |text: &str| meter.tts_spoken(text))),
+                    on_synthesis: Some(Arc::new(move |text: &str| {
+                        let _ = meter.tts_spoken(text);
+                    })),
                 }));
                 admissions.push(leg.admission);
             }
@@ -1405,6 +1580,7 @@ mod tests {
     //! deployment, which is what these assert; the live streams are the pde-ditto E2E.
 
     use super::*;
+    use crate::observability::voice_attrs::span_names;
     use crate::test_support::{TEST_CREDENTIAL_PLAIN, bud_state_with_credentials, test_credential};
     use serde_json::{Value as Json, json};
     use std::collections::HashMap;
@@ -1882,15 +2058,29 @@ mod tests {
     #[derive(Clone, Default)]
     struct Spans(Arc<Mutex<Vec<(u64, String, HashMap<String, String>)>>>);
 
+    /// Keeps the LAST value of a field, as a reader of these maps expects, and lists under
+    /// [`RERECORDED`] every field given a value twice: the OTel export keeps both, and
+    /// `SpanAttributes[key]` in ClickHouse returns the FIRST.
     struct V<'a>(&'a mut HashMap<String, String>);
-    impl Visit for V<'_> {
-        fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
-            self.0.insert(f.name().to_string(), format!("{v:?}"));
-        }
-        fn record_str(&mut self, f: &Field, v: &str) {
-            self.0.insert(f.name().to_string(), v.to_string());
+    impl V<'_> {
+        fn put(&mut self, name: &str, value: String) {
+            if self.0.insert(name.to_string(), value).is_some() {
+                let seen = self.0.entry(RERECORDED.to_string()).or_default();
+                seen.push_str(name);
+                seen.push(' ');
+            }
         }
     }
+    impl Visit for V<'_> {
+        fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+            self.put(f.name(), format!("{v:?}"));
+        }
+        fn record_str(&mut self, f: &Field, v: &str) {
+            self.put(f.name(), v.to_string());
+        }
+    }
+
+    const RERECORDED: &str = "<recorded twice>";
 
     struct Capture(Spans);
     impl<S> Layer<S> for Capture
@@ -1904,6 +2094,9 @@ mod tests {
                 .unwrap_or_default();
             let mut fields = HashMap::new();
             attrs.record(&mut V(&mut fields));
+            if let Some(parent) = attrs.parent() {
+                fields.insert(PARENT.to_string(), parent.into_u64().to_string());
+            }
             self.0.0.lock().unwrap().push((id.into_u64(), name, fields));
         }
         fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
@@ -1913,6 +2106,39 @@ mod tests {
                 values.record(&mut V(fields));
             }
         }
+        fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
+            let mut all = self.0.0.lock().unwrap();
+            if let Some((_, _, fields)) = all.iter_mut().rev().find(|(i, _, _)| *i == id.into_u64())
+            {
+                fields.insert(CLOSED.to_string(), "true".to_string());
+            }
+        }
+    }
+
+    const CLOSED: &str = "<closed>";
+    const PARENT: &str = "<parent>";
+
+    fn span_id_of(spans: &Spans, name: &str, nth: usize) -> u64 {
+        spans
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, n, _)| n == name)
+            .nth(nth)
+            .map(|(id, _, _)| *id)
+            .unwrap()
+    }
+
+    fn vendor_calls(spans: &Spans) -> Vec<HashMap<String, String>> {
+        spans
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, name, _)| name == "voice.vendor_call")
+            .map(|(_, _, f)| f.clone())
+            .collect()
     }
 
     fn turns(spans: &Spans) -> Vec<HashMap<String, String>> {
@@ -1921,7 +2147,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, name, _)| name == "voice.turn")
+            .filter(|(_, name, _)| span_names::ALL.contains(&name.as_str()))
             .map(|(_, _, f)| f.clone())
             .collect()
     }
@@ -1977,6 +2203,53 @@ mod tests {
             stt_rec["bud.voice.turn_index"],
             tts_rec["bud.voice.turn_index"]
         );
+    }
+
+    /// Spec 029 R-6: in interaction mode each TTS record says whose words its line is, so the
+    /// front's characters can be shown apart from the agent's; outside the mode it says nothing.
+    #[tokio::test]
+    async fn an_interaction_tts_record_names_its_line_source_and_a_plain_one_does_not() {
+        use crate::core::interaction::types::{LineSource, LineSources};
+        use crate::observability::voice_attrs::interaction::TTS_LINE_SOURCE;
+
+        let (state, _) = default_plane().await;
+        let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+        let mut tts = tts_cfg(json!({"model": "tts-el"}));
+        let plain = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "sess-plain")
+            .await
+            .unwrap()
+            .meter;
+        let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+        let mut tts = tts_cfg(json!({"model": "tts-el"}));
+        let mode = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "sess-ix")
+            .await
+            .unwrap()
+            .meter;
+        let lines = Arc::new(LineSources::default());
+        mode.set_line_sources(Arc::clone(&lines));
+
+        let spans = Spans::default();
+        let subscriber = tracing_subscriber::registry().with(Capture(spans.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            plain.tts_spoken("Hello from Bud!");
+            lines.speaking("It shipped on Monday.", LineSource::Agent);
+            mode.tts_spoken("It shipped on Monday.");
+            lines.done();
+            lines.speaking("One moment.", LineSource::Front);
+            mode.tts_spoken("One moment.");
+            lines.done();
+        });
+
+        let records = turns(&spans);
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert!(
+            !records[0].contains_key(TTS_LINE_SOURCE),
+            "a plain session's TTS record has no line source: {:?}",
+            records[0]
+        );
+        assert_eq!(records[1][TTS_LINE_SOURCE], "agent");
+        assert_eq!(records[1]["bud.voice.characters"], "21");
+        assert_eq!(records[2][TTS_LINE_SOURCE], "front");
     }
 
     /// Release 5: the STT deployment's `fallback_models` reach the session's leg (one that is
@@ -2084,6 +2357,214 @@ mod tests {
         let records = turns(&spans);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["bud.voice.audio_seconds"], "1.0");
+    }
+
+    fn sessions(spans: &Spans) -> Vec<HashMap<String, String>> {
+        spans
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, name, _)| name == "voice.ws_session")
+            .map(|(_, _, f)| f.clone())
+            .collect()
+    }
+
+    /// A `/ws` session is ONE `voice.ws_session` root, closed with its totals, so Observability can
+    /// list it as one row and gather its billed records (each still its own trace, D-19) under it.
+    /// Without it a voice call was only scattered 0 ms records.
+    #[tokio::test]
+    async fn a_ws_session_is_one_session_span_closed_with_its_totals() {
+        let spans = Spans::default();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(spans.clone())),
+        );
+        let (state, _) = default_plane().await;
+        let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+        let mut tts = tts_cfg(json!({"model": "tts-el"}));
+        let legs = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "sess-20")
+            .await
+            .unwrap();
+        let meter = legs.meter.clone();
+        meter.add_stt_audio(16_000 * 2);
+        meter.stt_final("hello");
+        meter.tts_spoken("Hi there.");
+        meter.finish();
+        assert_eq!(
+            sessions(&spans)[0].get(CLOSED).map(String::as_str),
+            Some("true"),
+            "finish() closes the session span itself; the meter outlives the socket"
+        );
+        meter.finish();
+
+        let all = sessions(&spans);
+        assert_eq!(
+            all.len(),
+            1,
+            "one session span, however often it is finished: {all:?}"
+        );
+        let s = &all[0];
+        assert_eq!(s["bud.voice.capability"], "realtime_session");
+        assert_eq!(s["bud.voice.transport"], "websocket");
+        assert_eq!(s["bud.voice.rt.session_type"], "stream");
+        assert_eq!(s["bud.voice.session_id"], "sess-20");
+        assert_eq!(s["bud.endpoint_id"], "ep-stt");
+        assert_eq!(s["bud.project_id"], PROJECT);
+        assert_eq!(s["bud.api_key_id"], API_KEY_ID);
+        assert_eq!(s["bud.voice.session.turns"], "2", "its billed records");
+        assert_eq!(s["bud.voice.session.end_reason"], "client_close");
+        assert_eq!(s["bud.voice.endpoint_name"], "stt-dg");
+        assert!(
+            !s.contains_key("bud.prompt_id"),
+            "a stream session is no agent's"
+        );
+        assert!(s.contains_key("bud.voice.session.duration_ms"));
+        assert_eq!(s.get(RERECORDED), None, "every attribute is recorded once");
+        assert_eq!(
+            turns(&spans).len(),
+            2,
+            "the records themselves are unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_agent_session_is_named_for_the_agent_and_says_why_it_ended() {
+        let spans = Spans::default();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(spans.clone())),
+        );
+        let (state, _) = default_plane().await;
+        let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+        let mut tts = tts_cfg(json!({"model": "tts-el"}));
+        let legs = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "sess-21")
+            .await
+            .unwrap();
+        legs.meter.set_agent(AgentGrant {
+            alias: "prompt:support:v3".into(),
+            prompt_id: "c0de".into(),
+            version: 3,
+        });
+        legs.meter.set_end_reason("idle");
+        legs.meter.finish();
+
+        let s = &sessions(&spans)[0];
+        assert_eq!(s["bud.voice.rt.session_type"], "agent");
+        assert_eq!(s["bud.voice.endpoint_name"], "support");
+        assert_eq!(
+            s["bud.prompt_id"], "c0de",
+            "the agent's page lists its voice sessions by prompt id"
+        );
+        assert_eq!(s["bud.voice.session.end_reason"], "idle");
+        assert_eq!(s["bud.voice.session.turns"], "0");
+        assert_eq!(
+            s.get(RERECORDED),
+            None,
+            "the export keeps a field's FIRST value: a second one is never read"
+        );
+    }
+
+    /// Spec 029 in a Bud agent session: as EXPORTED, the session is one `voice.ws_session` root
+    /// carrying the agent's `bud.prompt_id` (what the agent's Observability tab lists sessions
+    /// by), and each interaction record (a line-sourced TTS record, a segmented STT upload) is the
+    /// root of its own trace linking to it, so budmetrics folds them under the session row.
+    #[tokio::test]
+    async fn an_interaction_agent_sessions_records_link_to_the_session_that_names_the_agent() {
+        use crate::core::interaction::types::{LineSource, LineSources};
+        use opentelemetry::trace::{SpanId, TracerProvider as _};
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+
+        #[derive(Debug, Clone, Default)]
+        struct Collect(Arc<Mutex<Vec<SpanData>>>);
+        impl SpanExporter for Collect {
+            fn export(
+                &self,
+                batch: Vec<SpanData>,
+            ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+                self.0.lock().unwrap().extend(batch);
+                std::future::ready(Ok(()))
+            }
+        }
+
+        let collect = Collect::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(collect.clone())
+            .build();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("ws-session"))),
+        );
+        let (state, _) = default_plane().await;
+        let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+        let mut tts = tts_cfg(json!({"model": "tts-el"}));
+        let meter = prepare(
+            &state,
+            Some(&cred(KEY)),
+            &mut stt,
+            &mut tts,
+            "sess-ix-agent",
+        )
+        .await
+        .unwrap()
+        .meter;
+        meter.set_agent(AgentGrant {
+            alias: "prompt:support".into(),
+            prompt_id: "c0de".into(),
+            version: 2,
+        });
+        let lines = Arc::new(LineSources::default());
+        meter.set_line_sources(Arc::clone(&lines));
+        meter.set_segmented();
+        lines.speaking("It shipped on Monday.", LineSource::Agent);
+        drop(meter.tts_spoken("It shipped on Monday."));
+        lines.done();
+        meter.stt_uploaded(1.5, true, "final");
+        meter.finish();
+
+        let spans = collect.0.lock().unwrap().clone();
+        let attr = |span: &SpanData, key: &str| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.as_str().into_owned())
+        };
+        let session = spans
+            .iter()
+            .find(|s| s.name == "voice.ws_session")
+            .expect("the session span is exported");
+        assert_eq!(session.parent_span_id, SpanId::INVALID);
+        // A request a client opened on WaaV, as an HTTP call's root is.
+        assert_eq!(session.span_kind, opentelemetry::trace::SpanKind::Server);
+        assert_eq!(attr(session, "bud.prompt_id").as_deref(), Some("c0de"));
+        assert_eq!(
+            attr(session, "bud.voice.rt.session_type").as_deref(),
+            Some("agent")
+        );
+        let records: Vec<&SpanData> = spans
+            .iter()
+            .filter(|s| span_names::ALL.contains(&&*s.name))
+            .collect();
+        assert_eq!(
+            records.len(),
+            2,
+            "a TTS record and an STT upload: {records:?}"
+        );
+        for record in records {
+            assert_eq!(record.parent_span_id, SpanId::INVALID, "a root of its own");
+            // Work WaaV does inside the session.
+            assert_eq!(record.span_kind, opentelemetry::trace::SpanKind::Internal);
+            assert_ne!(
+                record.span_context.trace_id(),
+                session.span_context.trace_id()
+            );
+            let first = record.links.iter().next().map(|l| l.span_context.clone());
+            assert_eq!(
+                first.as_ref(),
+                Some(&session.span_context),
+                "the record's first link is its session: {:?}",
+                record.links
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2330,6 +2811,154 @@ mod tests {
         };
         assert!(legs.meter.same_caller(&same));
         assert!(!legs.meter.same_caller(&other));
+    }
+
+    /// Each billed record carries its vendor exchange as a child: the synthesis's request, the
+    /// transcription's answer — attributed like the record. A TTS record stays open while its
+    /// request runs, so the record lasts as long as the synthesis.
+    #[tokio::test]
+    async fn a_record_is_the_parent_of_its_vendor_call() {
+        use crate::observability::vendor_span::VendorCall;
+        let spans = Spans::default();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(spans.clone())),
+        );
+        let (state, _) = default_plane().await;
+        let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+        let mut tts = tts_cfg(json!({"model": "tts-el"}));
+        let legs = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "sess-30")
+            .await
+            .unwrap();
+        let meter = legs.meter.clone();
+
+        let scope = meter
+            .tts_spoken("Hello there.")
+            .expect("a billed speak has a scope");
+        let call = VendorCall::open(
+            Some(&scope),
+            "elevenlabs",
+            "eleven_v3",
+            "POST",
+            "https://api.elevenlabs.io/v1/text-to-speech/x",
+            "",
+        );
+        let record = span_id_of(&spans, "voice.speech", 0);
+        let tts_call = &vendor_calls(&spans)[0];
+        assert_eq!(tts_call[PARENT], record.to_string());
+        assert_eq!(tts_call["gen_ai.operation.name"], "text_to_speech");
+        assert_eq!(tts_call["bud.endpoint_id"], "ep-tts");
+        assert_eq!(tts_call["bud.api_key_id"], API_KEY_ID);
+        drop(scope);
+        let open = |id: u64| {
+            !spans
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(i, _, f)| *i == id && f.contains_key(CLOSED))
+        };
+        assert!(open(record), "the record lasts while its request runs");
+        call.finish();
+        assert!(!open(record), "and ends with it");
+
+        meter.add_stt_audio(16_000 * 2);
+        let scope = meter
+            .stt_final("hi")
+            .expect("a billed transcript has a scope");
+        VendorCall::open(
+            Some(&scope),
+            "deepgram",
+            "nova-3",
+            "",
+            "wss://api.deepgram.com/v1/listen?model=nova-3",
+            "",
+        )
+        .finish();
+        let stt_call = &vendor_calls(&spans)[1];
+        assert_eq!(
+            stt_call[PARENT],
+            span_id_of(&spans, "voice.transcription", 0).to_string()
+        );
+        assert_eq!(stt_call["gen_ai.operation.name"], "transcription");
+        assert_eq!(stt_call["bud.endpoint_id"], "ep-stt");
+
+        assert!(
+            meter.tts_spoken("").is_none(),
+            "nothing billed, nothing traced"
+        );
+    }
+
+    /// The STT connection is traced beneath the session span, while the session is open.
+    #[tokio::test]
+    async fn the_stt_connection_is_traced_beneath_the_session() {
+        let spans = Spans::default();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(spans.clone())),
+        );
+        let (state, _) = default_plane().await;
+        let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+        let mut tts = tts_cfg(json!({"model": "tts-el"}));
+        let legs = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "sess-31")
+            .await
+            .unwrap();
+        let scope = legs.meter.stt_connection_scope().expect("an open session");
+        assert_eq!(
+            scope.parent().id().map(|i| i.into_u64()),
+            Some(span_id_of(&spans, "voice.ws_session", 0))
+        );
+        assert_eq!(scope.operation(), "transcription");
+        drop(scope);
+        legs.meter.finish();
+        assert!(legs.meter.stt_connection_scope().is_none());
+    }
+
+    /// The session says which API the client opened it on — once, at close.
+    #[tokio::test]
+    async fn the_session_names_its_route() {
+        let spans = Spans::default();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(spans.clone())),
+        );
+        let (state, _) = default_plane().await;
+        for (sid, route) in [
+            ("sess-32", None),
+            ("sess-33", Some(super::super::state::REALTIME_ROUTE)),
+        ] {
+            let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+            let mut tts = tts_cfg(json!({"model": "tts-el"}));
+            let legs = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, sid)
+                .await
+                .unwrap();
+            if let Some(route) = route {
+                legs.meter.set_route(route);
+            }
+            legs.meter.finish();
+        }
+        let all = sessions(&spans);
+        assert_eq!(all[0]["http.request.method"], "GET");
+        assert_eq!(all[0]["http.route"], "/ws");
+        assert_eq!(all[1]["http.route"], "/v1/realtime");
+        assert!(all.iter().all(|s| !s.contains_key(RERECORDED)));
+    }
+
+    /// A DAG node's meter bills into the session it runs in: it opens no session of its own.
+    #[tokio::test]
+    async fn a_node_meter_opens_no_session() {
+        let spans = Spans::default();
+        let _sub = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(spans.clone())),
+        );
+        let (state, _) = default_plane().await;
+        let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+        let mut tts = tts_cfg(json!({"model": "tts-el"}));
+        let legs = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "sess-34")
+            .await
+            .unwrap();
+        let before = sessions(&spans).len();
+        let node = LegMeter::for_node("sess-34".into(), legs.meter.caller.clone(), None);
+        node.finish();
+        assert_eq!(sessions(&spans).len(), before);
+        assert!(node.stt_connection_scope().is_none());
     }
 }
 

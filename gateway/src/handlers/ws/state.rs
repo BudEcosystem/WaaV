@@ -18,6 +18,11 @@ use crate::{
 #[cfg(feature = "dag-routing")]
 use crate::dag::{compiler::CompiledDAG, context::DAGContext, executor::DAGExecutor};
 
+/// The route a client opens a `/ws` session on.
+pub const WS_ROUTE: &str = "/ws";
+/// The route of the `/v1/realtime` agent cascade, which runs a `/ws` session for its client.
+pub const REALTIME_ROUTE: &str = "/v1/realtime";
+
 /// WebSocket connection state optimized for low latency
 ///
 /// Uses RwLock for state that changes rarely but is read frequently:
@@ -52,8 +57,14 @@ pub struct ConnectionState {
     /// FRD-023 RT6: who the session's credential identifies, fixed when the session authenticates
     /// so an `auth` refresh can renew the credential but never change the principal.
     pub caller_check: Option<crate::handlers::openai_realtime::session::CallerCheck>,
+    /// A `/v1/realtime` voice agent session's `?model` (`prompt:<name>`): a client secret that
+    /// refreshes its credential must have been minted for it.
+    pub agent_model: Option<String>,
     /// FRD-023 RT6: per-leg metering for a session whose legs address Bud deployments.
     pub leg_meter: Option<Arc<super::bud_legs::LegMeter>>,
+    /// The API the client opened this session on: [`WS_ROUTE`], or [`REALTIME_ROUTE`] for the
+    /// agent cascade. The session's trace is titled with it.
+    pub route: &'static str,
     /// FRD-023 RT6: each leg deployment's admission, held for the session (FRD-022 §6.2).
     pub leg_admissions: Vec<crate::core::deployment_policy::Admission>,
     /// Spec 025: the session's voice agent, when `config.agent` named one.
@@ -121,7 +132,9 @@ impl ConnectionState {
             auth: Auth::empty(),
             credential: None,
             caller_check: None,
+            agent_model: None,
             leg_meter: None,
+            route: WS_ROUTE,
             leg_admissions: Vec::new(),
             agent: None,
             interaction_request: None,
@@ -159,7 +172,9 @@ impl ConnectionState {
             auth,
             credential: None,
             caller_check: None,
+            agent_model: None,
             leg_meter: None,
+            route: WS_ROUTE,
             leg_admissions: Vec::new(),
             agent: None,
             interaction_request: None,

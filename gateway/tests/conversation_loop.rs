@@ -2817,7 +2817,10 @@ async fn tc_ws_12_the_stt_final_observer_sees_every_final() {
 
     let finals: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen = finals.clone();
-    vm.set_stt_final_observer(Arc::new(move |t: &str| seen.lock().push(t.to_string())));
+    vm.set_stt_final_observer(Arc::new(move |t: &str| {
+        seen.lock().push(t.to_string());
+        None
+    }));
     // The session's own forwarder, then the voice agent's replacement.
     vm.on_stt_result(|_r| Box::pin(async {})).await.unwrap();
     vm.on_stt_result(|_r| Box::pin(async {})).await.unwrap();

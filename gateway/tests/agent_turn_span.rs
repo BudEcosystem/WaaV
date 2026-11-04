@@ -1,4 +1,4 @@
-//! Spec 025: the exported `agent_turn` span covers the whole turn.
+//! Spec 025: the exported `agent_turn` span covers the whole turn, and links to its session.
 //!
 //! `tracing-opentelemetry` ends a span at its LAST EXIT, not when it closes; the turn span is
 //! entered only while the request opens, so without one more exit on the way out every exported
@@ -13,11 +13,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use serde_json::json;
 use tokio::sync::mpsc;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::layer::SubscriberExt;
 
 use waav_gateway::auth::SessionCredential;
@@ -75,7 +76,14 @@ impl TurnBackend for SlowBackend {
         let events = async_stream_events();
         Ok(Box::pin(events))
     }
-    async fn cancel(&self, _response_id: &str, _prompt_name: &str, _bearer: &str) {}
+    async fn cancel(
+        &self,
+        _response_id: &str,
+        _prompt_name: &str,
+        _bearer: &str,
+        _traceparent: Option<&str>,
+    ) {
+    }
 }
 
 fn async_stream_events() -> impl futures::Stream<Item = Result<AgentEvent, TurnFailure>> + Send {
@@ -116,6 +124,9 @@ fn the_agent_turn_span_lasts_as_long_as_the_turn() {
         .enable_time()
         .build()
         .unwrap();
+    let session = tracing::info_span!(parent: None, "voice.session");
+    let session_ctx = session.context().span().span_context().clone();
+    assert!(session_ctx.is_valid());
     rt.block_on(async {
         let entry = bud_auth::voice_agent::parse_voice_agent_blob(
             &json!({"prompt_id": "c0de", "version": 1, "stt": {"endpoint_id": "s"}, "tts": {"endpoint_id": "t"},
@@ -132,6 +143,7 @@ fn the_agent_turn_span_lasts_as_long_as_the_turn() {
                 conversation_id: "conv_voice_s1".into(),
                 variables: None,
                 text_only: false,
+                session_link: Some(session_ctx.clone()),
             },
             Arc::new(SlowBackend) as Arc<dyn TurnBackend>,
             Arc::new(Speech) as Arc<dyn SpeechOut>,
@@ -154,7 +166,7 @@ fn the_agent_turn_span_lasts_as_long_as_the_turn() {
     let turn = spans
         .iter()
         .find(|s| {
-            s.name == "voice.turn"
+            s.name == "voice.agent_turn"
                 && s.attributes.iter().any(|kv| {
                     kv.key.as_str() == "bud.voice.capability" && kv.value.as_str() == "agent_turn"
                 })
@@ -164,5 +176,16 @@ fn the_agent_turn_span_lasts_as_long_as_the_turn() {
     assert!(
         lasted >= Duration::from_millis(400),
         "the span must cover the turn, not just the request's opening: {lasted:?}"
+    );
+    // Still the root of its own trace (D-19), and linked to its session.
+    assert_eq!(turn.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+    assert_ne!(turn.span_context.trace_id(), session_ctx.trace_id());
+    assert!(
+        turn.links
+            .iter()
+            .any(|l| l.span_context.span_id() == session_ctx.span_id()
+                && l.span_context.trace_id() == session_ctx.trace_id()),
+        "the agent turn links to its session: {:?}",
+        turn.links
     );
 }

@@ -215,6 +215,14 @@ impl SessionMeter {
             rt::SESSION_TYPE,
             Some(&attribution.session_type),
         );
+        session_span.record(
+            crate::observability::voice_attrs::session::HTTP_METHOD,
+            "GET",
+        );
+        session_span.record(
+            crate::observability::voice_attrs::session::HTTP_ROUTE,
+            crate::handlers::ws::state::REALTIME_ROUTE,
+        );
         Self {
             session_span,
             session_id,

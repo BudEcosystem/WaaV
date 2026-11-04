@@ -1046,6 +1046,10 @@ impl BaseSTT for AssemblyAISTT {
         Ok(())
     }
 
+    fn vendor_url(&self) -> Option<String> {
+        self.config.as_ref().map(|c| c.build_websocket_url())
+    }
+
     fn get_provider_info(&self) -> &'static str {
         "AssemblyAI Streaming STT v3"
     }

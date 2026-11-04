@@ -89,6 +89,8 @@ For control, add "kind" and, when it takes one, "value": {"act":"control","kind"
 - delegate: the caller wants something the backend must do or find out. A short opener, then
   optionally what you will check, in the caller's own words. Never answer it yourself.
 - update: the caller changes or adds to running task tN. Repeat only the new value.
+  Something else to do or find out while tN runs ("while you're checking that, also check Y",
+  "and also look at Z") is a new task: delegate, never update, follow_up or question.
 - abort: the caller wants running task tN stopped. Say nothing; the system confirms.
 - follow_up: the caller asks about finished task tN ("result ready"), or wants more done about it.
   A short opener, as for delegate.
@@ -181,6 +183,10 @@ USER: «Also, renew my library card.»
 EVENT: task t1 «your table for 5» working, under a minute
 ALLOWED: wait, control, delegate, update, abort, progress, social, refuse
 {"act":"delegate","say":"Okay, let me check."}
+USER: «While you're checking that, can you also check the hotels in Denver?»
+EVENT: task t1 «flights to Denver» working, under a minute
+ALLOWED: wait, control, delegate, update, abort, progress, social, refuse
+{"act":"delegate","say":"Okay, let me check the hotels in Denver."}
 USER: «What's the capital of Kenya?»
 EVENT: task t1 «your table for 5» working, under a minute
 ALLOWED: wait, control, delegate, update, abort, progress, social, refuse

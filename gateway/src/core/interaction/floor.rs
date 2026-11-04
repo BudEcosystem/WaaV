@@ -114,6 +114,9 @@ pub struct FloorMachine {
     pending: Vec<Utterance>,
     /// A relay keeping the floor until its next sentence or this time.
     gap: Option<(ItemId, Lane, Ms)>,
+    /// The relayed answer the caller is in the middle of: a sentence of it was heard and not
+    /// its last. Another task's answer waits while more of it is queued.
+    amid: Option<ItemId>,
     parked: Option<ItemId>,
     user_speaking: bool,
     yield_until: Option<Ms>,
@@ -172,6 +175,7 @@ impl FloorMachine {
             active: VecDeque::new(),
             pending: Vec::new(),
             gap: None,
+            amid: None,
             parked: None,
             user_speaking: false,
             yield_until: None,
@@ -779,6 +783,19 @@ impl FloorMachine {
         }
         let turn_pending = self.turn_until.is_some_and(|(_, until)| now < until);
         let gap = self.gap.filter(|gap| now < gap.2);
+        // The answer being said: one with the provider that is not over, or the one whose next
+        // sentence is late. Another task's answer waits for it, so two answers ready at once
+        // are said one after the other, never sentence by sentence in turn.
+        let amid = self
+            .amid
+            .filter(|item| self.pending.iter().any(|queued| queued.item == *item));
+        let saying = (self.active.iter().rev())
+            .map(|active| &active.utterance)
+            .find(|utterance| utterance.kind == Kind::Relay && !utterance.discard)
+            .filter(|utterance| !utterance.last)
+            .map(|utterance| utterance.item)
+            .or(gap.map(|gap| gap.0))
+            .or(amid);
         self.pending.iter().position(|queued| {
             if queued.discard {
                 // A warm-up never competes with real speech.
@@ -791,7 +808,10 @@ impl FloorMachine {
                 queued.rank >= 3 && self.question_open && queued.question.is_none();
             let waits_for_relay =
                 gap.is_some_and(|gap| queued.item != gap.0 && queued.rank > RELAY_RANK);
-            !(waits_for_turn || waits_for_answer || waits_for_relay)
+            let waits_for_answer_said = queued.kind == Kind::Relay
+                && queued.rank >= RELAY_RANK
+                && saying.is_some_and(|item| item != queued.item);
+            !(waits_for_turn || waits_for_answer || waits_for_relay || waits_for_answer_said)
         })
     }
 
@@ -910,6 +930,9 @@ impl FloorMachine {
                     .pending
                     .iter()
                     .any(|queued| queued.item == utterance.item);
+            if utterance.kind == Kind::Relay && utterance.sentence.is_some() {
+                self.amid = (!utterance.last).then_some(utterance.item);
+            }
             if utterance.sentence.is_some() && !utterance.last && !more {
                 // Stream gap: the relay's next sentence is late.
                 self.gap = Some((utterance.item, utterance.lane, at + STREAM_GAP_MS));
@@ -1302,6 +1325,49 @@ mod tests {
         floor.on_pump(1_100, PumpEvent::Started { utt, at: 1_100 });
         floor.on_duplex(1_600, &DuplexAction::UserSpeaking(true));
         assert_eq!(floor.next_cmds(1_600), vec![]);
+    }
+
+    /// Two tasks' answers arrive sentence by sentence at once (a Bud agent's tasks run side by
+    /// side): each is said whole, the first one first.
+    #[test]
+    fn two_answers_ready_at_once_are_said_one_after_the_other() {
+        let mut floor = machine();
+        floor.offer(0, sentence(1, 1, "Your order shipped.", false));
+        floor.offer(0, sentence(2, 1, "We open at nine.", false));
+        floor.offer(0, sentence(1, 2, "It arrives Friday.", true));
+        floor.offer(0, sentence(2, 2, "We close at six.", true));
+        let mut said = Vec::new();
+        let mut now = 0;
+        while let Some((utt, item, text)) = submitted(&mut floor, now) {
+            said.push((item.0, text));
+            floor.on_pump(now, PumpEvent::Started { utt, at: now });
+            floor.on_pump(now, PumpEvent::SynthDone { utt });
+            now += 1_000;
+            floor.on_pump(
+                now,
+                PumpEvent::Idle {
+                    utt,
+                    delivered_ms: 1_000,
+                    at: now,
+                },
+            );
+        }
+        let items: Vec<u64> = said.iter().map(|(item, _)| *item).collect();
+        assert_eq!(items, [1, 1, 2, 2], "{said:?}");
+
+        // An answer whose next sentence is late holds the other for the stream gap only.
+        let mut floor = machine();
+        play(
+            &mut floor,
+            sentence(1, 1, "Your order shipped.", false),
+            0,
+            1_000,
+        );
+        floor.offer(1_000, sentence(2, 1, "We open at nine.", true));
+        assert_eq!(submitted(&mut floor, 1_000), None, "the gap holds it");
+        floor.tick(1_000 + STREAM_GAP_MS);
+        let (_, item, _) = submitted(&mut floor, 1_000 + STREAM_GAP_MS).expect("after the gap");
+        assert_eq!(item, ItemId(2));
     }
 
     #[test]

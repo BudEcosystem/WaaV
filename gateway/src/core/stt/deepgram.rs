@@ -1595,6 +1595,12 @@ impl BaseSTT for DeepgramSTT {
         Ok(())
     }
 
+    fn vendor_url(&self) -> Option<String> {
+        self.config
+            .as_ref()
+            .and_then(|c| self.build_websocket_url(c).ok())
+    }
+
     fn get_provider_info(&self) -> &'static str {
         "Deepgram STT WebSocket"
     }

@@ -282,6 +282,24 @@ task goes on with revision 2.
 {"type": "bud.task.cancelled", "event_id": "evt_9006", "task_id": "task_77aa01fe", "task_ref": "t2", "revision": 1, "state": "cancelled", "cancelling": false, "by": "client", "reason": "client_cancelled", "effects": "none_committed", "t_ms": 15200}
 ```
 
+### `tool_started` / `tool_done` (`bud.tool.started` / `bud.tool.done` on `/realtime`)
+
+A tool that the task's backend runs itself (a Bud agent's budprompt tool: MCP, web search, a
+delegated agent). These events are sent only for adopted tasks. A speculative run's tools are not
+reported before its task is adopted.
+
+```json
+{"type": "tool_started", "task_id": "task_5b1e9c0d", "item_id": "mcp_1", "name": "lookup_order", "t_ms": 7020}
+{"type": "tool_done", "task_id": "task_5b1e9c0d", "item_id": "mcp_1", "name": "lookup_order", "duration_ms": 1250, "ok": false, "error": "upstream 503", "t_ms": 8270}
+```
+
+- `duration_ms` runs from the tool's start item to its done item. It is `null` when no start item
+  came.
+- `error` is the item's own error text. It is `null` when the item gave none.
+
+On `/realtime` these events become `bud.tool.*` with a `response_id`. See
+`gateway/docs/agent-realtime-events.md`.
+
 ### `floor_state` / `bud.floor.state`
 
 | Field | Type | Meaning |

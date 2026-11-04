@@ -203,6 +203,7 @@ async fn engine(
             conversation_id: "conv_voice_s".into(),
             variables: None,
             text_only: false,
+            session_link: None,
         },
         Arc::new(AgentBrain::new(base)) as Arc<dyn TurnBackend>,
         Arc::clone(vm) as Arc<dyn SpeechOut>,
@@ -359,4 +360,23 @@ async fn a_voice_agent_turn_end_to_end() {
 
     engine.shutdown().await;
     vm.stop().await.ok();
+}
+
+/// A barge-in's cancel carries the turn's `traceparent`, so it is a span of the turn's trace (under
+/// its session in Observability) rather than a trace of its own.
+#[tokio::test]
+async fn the_cancel_belongs_to_the_turns_trace() {
+    let (base, gw) = gateway().await;
+    let brain = AgentBrain::new(base);
+    let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    brain
+        .cancel("resp_9", "support", "bud-caller-key", Some(tp))
+        .await;
+    brain
+        .cancel("resp_10", "support", "bud-caller-key", None)
+        .await;
+    assert_eq!(
+        *gw.cancel_traceparents.lock(),
+        vec![Some(tp.to_string()), None]
+    );
 }

@@ -42,11 +42,12 @@ pub enum AgentEvent {
         name: String,
         kind: String,
     },
-    /// That tool finished.
+    /// That tool finished. `error`: what the item said went wrong, when it failed and said so.
     ToolFinished {
         item_id: String,
         name: String,
         ok: bool,
+        error: Option<String>,
     },
     /// A function call finished being written. It is a tool of the agent's own unless the
     /// session declared a function of that name ([`ClientExtras::tools`]): then the client
@@ -57,6 +58,17 @@ pub enum AgentEvent {
         ok: bool,
         call_id: String,
         arguments: String,
+    },
+    /// budprompt holds a tool call until the caller approves it (spec 029 §7.3, an
+    /// `mcp_approval_request` item): the stream stays open while it waits for the vote.
+    /// `id` is the escalation's, `arguments` the call's JSON as a string, `expires_at` the
+    /// unix time (seconds) after which budprompt declines it.
+    ApprovalRequest {
+        id: String,
+        name: String,
+        arguments: String,
+        server_label: Option<String>,
+        expires_at: Option<f64>,
     },
     /// The run completed.
     Completed {
@@ -128,6 +140,16 @@ impl TurnFailure {
             | Self::Transport(m)
             | Self::Internal(m) => m,
         }
+    }
+
+    /// The failure a run reported mid-stream (`response.failed`, `error`): a run held for an
+    /// approval only a designated person can give (`approval_required`, spec 029 §7.3) is the
+    /// approval failure; any other is upstream.
+    pub fn of_run(code: &str, message: &str) -> Self {
+        if code == "approval_required" {
+            return Self::ApprovalRequired(message.to_owned());
+        }
+        Self::Upstream(format!("{code}: {message}"))
     }
 
     /// Whether the turn may be tried again: only when the request never reached the agent, so no
@@ -207,6 +229,38 @@ pub struct Truncate {
     pub output_text: String,
 }
 
+/// The caller's vote on a held tool call (spec 029 §7.3): a request of its own, with the
+/// session's bearer, continuing the turn that holds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalVote {
+    /// The turn's response id (`response.created`).
+    pub previous_response_id: String,
+    /// The hold's id (the escalation's).
+    pub approval_request_id: String,
+    pub approve: bool,
+    pub reason: Option<String>,
+}
+
+impl ApprovalVote {
+    /// The JSON body, without the `prompt` that [`AgentBrain::vote`] adds. No `conversation`:
+    /// budprompt refuses it with `previous_response_id`.
+    pub fn body(&self) -> Value {
+        let mut response = json!({
+            "type": "mcp_approval_response",
+            "approval_request_id": self.approval_request_id,
+            "approve": self.approve,
+        });
+        if let Some(reason) = self.reason.as_deref().filter(|r| !r.is_empty()) {
+            response["reason"] = Value::from(reason);
+        }
+        json!({
+            "previous_response_id": self.previous_response_id,
+            "stream": false,
+            "input": [response],
+        })
+    }
+}
+
 /// What a session adds to its agent's runs, where the agent lets a session do so (the GA
 /// cascade's `session.tools` and `session.instructions`). All of it travels as the Responses
 /// API's own request fields.
@@ -235,6 +289,10 @@ pub struct AgentTurnRequest {
     pub session_id: String,
     pub turn_index: u64,
     pub extras: ClientExtras,
+    /// The line the agent is to write before its final answer (`background.answer_marker`):
+    /// sent as `bud_answer_marker` so budprompt tells the agent to write it. Only an
+    /// interaction-mode background run sets it; a plain voice agent's body never carries it.
+    pub answer_marker: Option<String>,
 }
 
 impl AgentTurnRequest {
@@ -274,6 +332,9 @@ impl AgentTurnRequest {
         }
         if let Some(instructions) = &extras.instructions {
             body["instructions"] = Value::from(instructions.as_str());
+        }
+        if let Some(marker) = self.answer_marker.as_deref().filter(|m| !m.is_empty()) {
+            body["bud_answer_marker"] = Value::from(marker);
         }
         body
     }
@@ -366,6 +427,20 @@ fn tool_name(item: &Value) -> String {
         .to_string()
 }
 
+/// What a finished tool item says went wrong: its `error` text, an error object's `message`, or
+/// the object itself. `None` when it says nothing.
+fn tool_error(item: &Value) -> Option<String> {
+    let error = item.get("error").filter(|e| !e.is_null())?;
+    let text = match error {
+        Value::String(text) => text.clone(),
+        other => other
+            .get("message")
+            .and_then(Value::as_str)
+            .map_or_else(|| other.to_string(), str::to_string),
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
 fn output_of(response: Option<&Value>) -> Vec<Value> {
     response
         .and_then(|r| r.get("output"))
@@ -411,6 +486,20 @@ pub fn map_event(event: Option<&str>, data: &str) -> Option<AgentEvent> {
         "response.output_item.added" | "response.output_item.done" => {
             let item = v.get("item")?;
             let item_type = item.get("type").and_then(Value::as_str)?;
+            if item_type == "mcp_approval_request" {
+                // Held until the caller votes (spec 029 §7.3); its `done` frame says nothing new.
+                if kind != "response.output_item.added" {
+                    return None;
+                }
+                let text = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_string);
+                return Some(AgentEvent::ApprovalRequest {
+                    id: text("id")?,
+                    name: tool_name(item),
+                    arguments: text("arguments").unwrap_or_default(),
+                    server_label: text("server_label"),
+                    expires_at: item.get("bud_expires_at").and_then(Value::as_f64),
+                });
+            }
             if !TOOL_ITEM_TYPES.contains(&item_type) {
                 return None;
             }
@@ -442,6 +531,7 @@ pub fn map_event(event: Option<&str>, data: &str) -> Option<AgentEvent> {
                         item_id,
                         name,
                         ok: !failed,
+                        error: tool_error(item),
                     }),
                 }
             }
@@ -555,20 +645,65 @@ impl AgentBrain {
     }
 
     /// Best-effort `POST /responses/{id}/cancel`. A run that already ended answers 409; that and
-    /// every other failure is ignored — closing the stream already stopped the model.
-    pub async fn cancel(&self, response_id: &str, prompt_name: &str, bearer: &str) {
+    /// every other failure is ignored — closing the stream already stopped the model. With the
+    /// turn's `traceparent` it is a span of the turn's trace, not a trace of its own.
+    pub async fn cancel(
+        &self,
+        response_id: &str,
+        prompt_name: &str,
+        bearer: &str,
+        traceparent: Option<&str>,
+    ) {
         let url = format!("{}/responses/{}/cancel", self.base_url, response_id);
-        let res = self
+        let mut req = self
             .http
             .post(url)
             .bearer_auth(bearer)
             .header("x-model-name", prompt_name)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await;
+            .timeout(Duration::from_secs(5));
+        if let Some(tp) = traceparent {
+            req = req.header("traceparent", tp);
+        }
+        let res = req.send().await;
         if let Err(e) = res {
             tracing::debug!(response_id, error = %e, "agent run cancel failed (best-effort)");
         }
+    }
+
+    /// The caller's vote on a held tool call: `POST /responses` (spec 029 §7.3).
+    /// Same base URL and bearer as the turn; only the status is checked. `x-model-name` names
+    /// the agent, as for a cancel, for a gateway that routes a request by it.
+    pub async fn vote(
+        &self,
+        vote: &ApprovalVote,
+        prompt_name: &str,
+        bearer: &str,
+        traceparent: Option<&str>,
+    ) -> Result<(), TurnFailure> {
+        // The turn's own `prompt.id`: budgateway's auth refuses a `/v1/responses` body with neither
+        // `model` nor `prompt.id` (400), and with it the vote is authorised as the turn was.
+        // budprompt takes the vote before any other branching, so it starts no run.
+        let mut body = vote.body();
+        body["prompt"] = json!({ "id": prompt_name });
+        let mut req = self
+            .http
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(bearer)
+            .header("x-model-name", prompt_name)
+            .timeout(Duration::from_secs(10))
+            .json(&body);
+        if let Some(tp) = traceparent {
+            req = req.header("traceparent", tp);
+        }
+        let resp = req.send().await.map_err(|e| {
+            TurnFailure::Transport(format!("the Bud gateway could not be reached: {e}"))
+        })?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = read_bounded(resp, MAX_ERROR_BODY_BYTES).await;
+            return Err(classify_http(status, &body));
+        }
+        Ok(())
     }
 }
 
@@ -711,6 +846,7 @@ mod tests {
             session_id: "s1".into(),
             turn_index: 4,
             extras: ClientExtras::default(),
+            answer_marker: None,
         };
         let b = req.body();
         assert_eq!(
@@ -744,6 +880,7 @@ mod tests {
             session_id: "s".into(),
             turn_index: 0,
             extras: ClientExtras::default(),
+            answer_marker: None,
         };
         let b = req.body();
         assert!(b["prompt"].get("variables").is_none());
@@ -780,6 +917,32 @@ mod tests {
             ..req
         };
         assert_eq!(injected.body()["input"], json!([]));
+    }
+
+    #[test]
+    fn the_answer_marker_is_sent_only_when_one_is_declared() {
+        let req = AgentTurnRequest {
+            prompt_name: "a".into(),
+            version: 1,
+            variables: None,
+            input: "hi".into(),
+            conversation_id: "c".into(),
+            truncate: None,
+            session_id: "s".into(),
+            turn_index: 0,
+            extras: ClientExtras::default(),
+            answer_marker: Some("ANSWER:".into()),
+        };
+        assert_eq!(req.body()["bud_answer_marker"], "ANSWER:");
+        // A plain voice agent's body (no marker) and an empty one carry no such field.
+        for answer_marker in [None, Some(String::new())] {
+            let body = AgentTurnRequest {
+                answer_marker,
+                ..req.clone()
+            }
+            .body();
+            assert!(body.get("bud_answer_marker").is_none(), "{body}");
+        }
     }
 
     #[test]
@@ -908,9 +1071,44 @@ mod tests {
                 AgentEvent::ToolFinished {
                     item_id: "mcp_1".into(),
                     name: "lookup_order".into(),
-                    ok: false
+                    ok: false,
+                    error: Some("boom".into()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_failed_tool_keeps_what_it_said_went_wrong() {
+        let finished = |item: Value| match map_event(
+            None,
+            &json!({"type": "response.output_item.done", "item": item}).to_string(),
+        ) {
+            Some(AgentEvent::ToolFinished { ok, error, .. }) => (ok, error),
+            other => panic!("not a finished tool: {other:?}"),
+        };
+        // An error object's message.
+        assert_eq!(
+            finished(json!({"id": "m1", "type": "mcp_call", "name": "t",
+                            "error": {"type": "tool_error", "message": "upstream 503"}})),
+            (false, Some("upstream 503".into()))
+        );
+        // An error object without a message is kept as its JSON.
+        assert_eq!(
+            finished(json!({"id": "m1", "type": "mcp_call", "name": "t", "error": {"code": "x"}})),
+            (false, Some(r#"{"code":"x"}"#.into()))
+        );
+        // Failed without saying why: no text is made up.
+        assert_eq!(
+            finished(json!({"id": "m1", "type": "web_search_call", "status": "failed"})),
+            (false, None)
+        );
+        // A tool that succeeded has no error, even with an empty `error` field.
+        assert_eq!(
+            finished(
+                json!({"id": "m1", "type": "mcp_call", "name": "t", "status": "completed", "error": null})
+            ),
+            (true, None)
         );
     }
 
@@ -945,6 +1143,99 @@ mod tests {
                 message: "upstream died".into()
             })
         );
+    }
+
+    /// Spec 029 §7.3: the hold is an `mcp_approval_request` item; its `done` frame is not a
+    /// second hold, and it is never a tool that started.
+    #[test]
+    fn an_approval_hold_is_parsed_with_its_deadline() {
+        let item = json!({"type": "mcp_approval_request", "id": "esc_1", "name": "refund_order",
+                          "arguments": "{\"order_id\":\"4417\"}", "server_label": "orders",
+                          "bud_expires_at": 1_762_000_030});
+        let added = sse(
+            "response.output_item.added",
+            json!({"output_index": 1, "sequence_number": 7, "item": item}),
+        );
+        let done = sse("response.output_item.done", json!({"item": item}));
+        let mut d = SseDecoder::default();
+        let got: Vec<_> = d
+            .push(format!("{added}: keep-alive\n\n{done}").as_bytes())
+            .unwrap()
+            .iter()
+            .filter_map(|(e, data)| map_event(e.as_deref(), data))
+            .collect();
+        assert_eq!(
+            got,
+            vec![AgentEvent::ApprovalRequest {
+                id: "esc_1".into(),
+                name: "refund_order".into(),
+                arguments: "{\"order_id\":\"4417\"}".into(),
+                server_label: Some("orders".into()),
+                expires_at: Some(1_762_000_030.0),
+            }]
+        );
+        // Without a deadline or arguments it is still a hold.
+        let bare = json!({"type": "response.output_item.added",
+                          "item": {"type": "mcp_approval_request", "id": "esc_2", "name": "t"}});
+        assert_eq!(
+            map_event(None, &bare.to_string()),
+            Some(AgentEvent::ApprovalRequest {
+                id: "esc_2".into(),
+                name: "t".into(),
+                arguments: String::new(),
+                server_label: None,
+                expires_at: None,
+            })
+        );
+    }
+
+    /// Spec 029 §7.3: a run held for an approval only a designated person can give ends with
+    /// `response.failed` / `approval_required`: the approval failure, not an upstream error.
+    #[test]
+    fn a_run_that_failed_for_approval_is_the_approval_failure() {
+        let failed = map_event(
+            None,
+            &json!({"type": "response.failed", "response": {"error": {"code": "approval_required", "message": "a manager must approve refunds"}}}).to_string(),
+        );
+        let Some(AgentEvent::Failed { code, message }) = failed else {
+            panic!("{failed:?}");
+        };
+        let failure = TurnFailure::of_run(&code, &message);
+        assert_eq!(
+            failure,
+            TurnFailure::ApprovalRequired("a manager must approve refunds".into())
+        );
+        assert_eq!(failure.code(), "approval_required");
+        assert_eq!(
+            TurnFailure::of_run("server_error", "upstream died"),
+            TurnFailure::Upstream("server_error: upstream died".into())
+        );
+    }
+
+    /// Spec 029 §7.3: the vote's body, exactly.
+    #[test]
+    fn the_vote_is_an_approval_response_continuing_the_turn() {
+        let vote = ApprovalVote {
+            previous_response_id: "resp_1".into(),
+            approval_request_id: "esc_1".into(),
+            approve: true,
+            reason: None,
+        };
+        assert_eq!(
+            vote.body(),
+            json!({"previous_response_id": "resp_1", "stream": false,
+                   "input": [{"type": "mcp_approval_response", "approval_request_id": "esc_1",
+                              "approve": true}]})
+        );
+        let declined = ApprovalVote {
+            approve: false,
+            reason: Some("timeout".into()),
+            ..vote
+        };
+        let body = declined.body();
+        assert_eq!(body["input"][0]["approve"], false);
+        assert_eq!(body["input"][0]["reason"], "timeout");
+        assert!(body.get("conversation").is_none() && body.get("prompt").is_none());
     }
 
     #[test]

@@ -149,6 +149,34 @@
       ]
     },
     {
+      "column": "ack_latency_ms",
+      "attribute": "bud.voice.interaction.ack_latency_ms",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "interaction_act",
+      "attribute": "bud.voice.interaction.act",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "answer_latency_ms",
+      "attribute": "bud.voice.interaction.answer_latency_ms",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "interaction_task_ref",
+      "attribute": "bud.voice.interaction.task_ref",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
       "column": "language",
       "attribute": "bud.voice.language",
       "roles": [
@@ -433,6 +461,13 @@
       ]
     },
     {
+      "column": "tts_line_source",
+      "attribute": "bud.voice.tts.line_source",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
       "column": "tts_model",
       "attribute": "bud.voice.tts.model",
       "roles": [
@@ -508,34 +543,6 @@
       "attribute": "gen_ai.request.model",
       "roles": [
         "leg"
-      ]
-    },
-    {
-      "column": "interaction_act",
-      "attribute": "bud.voice.interaction.act",
-      "roles": [
-        "turn"
-      ]
-    },
-    {
-      "column": "interaction_task_ref",
-      "attribute": "bud.voice.interaction.task_ref",
-      "roles": [
-        "turn"
-      ]
-    },
-    {
-      "column": "ack_latency_ms",
-      "attribute": "bud.voice.interaction.ack_latency_ms",
-      "roles": [
-        "turn"
-      ]
-    },
-    {
-      "column": "answer_latency_ms",
-      "attribute": "bud.voice.interaction.answer_latency_ms",
-      "roles": [
-        "turn"
       ]
     }
   ]

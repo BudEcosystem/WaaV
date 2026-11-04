@@ -67,6 +67,32 @@ pub struct Claims {
     pub uid: Option<String>,
     #[serde(default)]
     pub akid: Option<String>,
+    /// A voice agent's secret only (`alias` is `prompt:<name>`): the minting credential
+    /// itself, which the agent's turns are run with. Inside the box, so its holder never reads
+    /// it; every other secret leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cred: Option<SealedCredential>,
+}
+
+/// The parent credential sealed in a voice agent's client secret. Never printed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SealedCredential(String);
+
+impl SealedCredential {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SealedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SealedCredential([redacted])")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,7 +290,33 @@ mod tests {
             pid: Some("proj-7c1e".into()),
             uid: Some("user-9a2b".into()),
             akid: Some("akid-44f0".into()),
+            cred: None,
         }
+    }
+
+    /// A voice agent's secret carries its parent credential inside the box: it opens to it,
+    /// the token never shows it, and neither does a debug print of the claims.
+    #[test]
+    fn an_agent_secret_seals_its_parent_credential() {
+        let k = keys(&format!("k1:{}", b64(&[7u8; 32])));
+        let agent = Claims {
+            alias: "prompt:support".into(),
+            cred: Some(SealedCredential::new("bud_parent_key")),
+            ..claims(5000)
+        };
+        let token = k.seal(&agent).unwrap();
+        assert!(!token.contains("bud_parent_key"));
+        let opened = k.open(&token, 2000).unwrap();
+        assert_eq!(
+            opened.cred.as_ref().map(SealedCredential::expose),
+            Some("bud_parent_key")
+        );
+        assert!(!format!("{opened:?}").contains("bud_parent_key"));
+        // A secret of before (no `cred`) still opens, without one.
+        assert_eq!(
+            k.open(&k.seal(&claims(5000)).unwrap(), 2000).unwrap().cred,
+            None
+        );
     }
 
     #[test]

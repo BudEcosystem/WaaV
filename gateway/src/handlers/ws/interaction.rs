@@ -20,12 +20,12 @@ use crate::core::audio::PumpControl;
 use crate::core::conversation::TurnAttribution;
 use crate::core::interaction::actor::{self, ActorDeps, Background, InteractionHandle, Msg};
 use crate::core::interaction::background::TextBackend;
-use crate::core::interaction::bud_agent::AgentBackground;
+use crate::core::interaction::bud_agent::{AgentBackground, answer_marker};
 use crate::core::interaction::config::{
     self, BackendKind, InteractionConfig, ParseCtx, ServerInteraction, Tri,
 };
 use crate::core::interaction::persona::Persona;
-use crate::core::interaction::types::PumpEvent;
+use crate::core::interaction::types::{LineSources, PumpEvent};
 use crate::core::interaction::{analyser, front_model, front_pool, speech, tasks, tenant};
 use crate::core::stt::STTResult;
 use crate::core::voice_manager::VoiceManager;
@@ -442,10 +442,17 @@ pub(super) async fn prepare(
         return None;
     }
 
-    let credential = state.read().await.credential.clone();
+    let (credential, session_link) = {
+        let guard = state.read().await;
+        let link = guard
+            .leg_meter
+            .as_ref()
+            .and_then(|meter| meter.session_link());
+        (guard.credential.clone(), link)
+    };
     let mut llm_config = background.map(|background| background.to_conversation_config());
     let built = match (agent, graph, llm_config.as_mut()) {
-        (Some(agent), ..) => agent_background(agent, stream_id, &cfg, credential),
+        (Some(agent), ..) => agent_background(agent, stream_id, &cfg, credential, session_link),
         (None, Some(graph), _) => Ok(Background::Text(graph)),
         (None, None, llm_config) if remote.is_some() => {
             let spec = remote
@@ -702,6 +709,7 @@ fn agent_background(
     stream_id: &str,
     cfg: &InteractionConfig,
     credential: Option<SessionCredential>,
+    session_link: Option<opentelemetry::trace::SpanContext>,
 ) -> Result<Background, String> {
     let base_url = super::bud_legs::llm_base_url().ok_or(
         "voice agents are not available on this gateway: WAAV_LLM_BASE_URL (the Bud gateway) \
@@ -716,10 +724,13 @@ fn agent_background(
         conversation_id: super::agent::conversation_id_for(stream_id),
         variables: agent.config.variables.clone(),
         text_only: false,
+        session_link,
     };
-    let marker = cfg.tasks.answer_marker.clone();
+    // Bud's agent runtime is told the marker, so one is always sent (ANSWER: unless declared).
+    let marker = answer_marker(cfg.tasks.answer_marker.clone());
     let brain = Arc::new(AgentBrain::new(base_url));
-    let background = AgentBackground::new(brain, session, credential, marker);
+    let parallel = cfg.tasks.max_parallel as usize;
+    let background = AgentBackground::with_parallel(brain, session, credential, marker, parallel);
     Ok(Background::Agent(background))
 }
 
@@ -754,11 +765,16 @@ pub(super) async fn start(
         sip,
         placement,
     } = prepared;
-    let (owner, tracker) = {
+    let (owner, tracker, meter) = {
         let guard = state.read().await;
         let owner = crate::handlers::tasks::owner(&guard.auth).to_owned();
-        (owner, guard.task_tracker.clone())
+        (owner, guard.task_tracker.clone(), guard.leg_meter.clone())
     };
+    // Each TTS record says whose words its line is: the agent's answer or the front's (R-6).
+    let lines = Arc::new(LineSources::default());
+    if let Some(meter) = &meter {
+        meter.set_line_sources(Arc::clone(&lines));
+    }
     let sample_rate = vm.get_config().stt_config.sample_rate;
     let duplex = cfg.duplex.clone();
 
@@ -770,7 +786,7 @@ pub(super) async fn start(
         vm: vm.clone(),
         ctl: ctl.clone(),
         pump_rx,
-        speech: speech::spawn(vm.clone(), ctl.clone(), pump_tx),
+        speech: speech::spawn(vm.clone(), ctl.clone(), pump_tx, lines),
         out: message_tx.clone(),
         background,
         system_prompt,

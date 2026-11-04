@@ -14,6 +14,23 @@ use super::types::{
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WireEvent {
+    /// A tool the task's backend runs itself (a Bud agent's budprompt tool) started.
+    ToolStarted {
+        task_id: String,
+        item_id: String,
+        name: String,
+        t_ms: u64,
+    },
+    /// ... and finished: how long it ran, whether it worked, and what it said went wrong.
+    ToolDone {
+        task_id: String,
+        item_id: String,
+        name: String,
+        duration_ms: Option<u64>,
+        ok: bool,
+        error: Option<String>,
+        t_ms: u64,
+    },
     /// Sent at adoption; a provisional run emits nothing.
     TaskCreated {
         task_id: String,
@@ -517,7 +534,10 @@ pub fn task_event_to_wire(event: &TaskEvent, spoken: bool) -> Option<WireEvent> 
             state: TaskState::Cancelled,
             cancelling: false,
             by: (*by).to_owned(),
-            reason: format!("{by}_cancelled"),
+            reason: match *by {
+                super::tasks::NOT_STARTED_BY => "not_started".to_owned(),
+                by => format!("{by}_cancelled"),
+            },
             effects: effects.clone(),
             t_ms: event.at,
             lineage: Lineage::clone(&event.lineage),
@@ -551,6 +571,36 @@ mod tests {
 
     use super::super::types::{HitlId, HitlRequest, TaskId, TaskRef};
     use super::*;
+
+    #[test]
+    fn tool_events_carry_the_task_the_tool_ran_for() {
+        let started = WireEvent::ToolStarted {
+            task_id: "task_1".into(),
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            t_ms: 7_000,
+        };
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            json!({"type": "tool_started", "task_id": "task_1", "item_id": "mcp_1",
+                   "name": "lookup_order", "t_ms": 7_000})
+        );
+        let done = WireEvent::ToolDone {
+            task_id: "task_1".into(),
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            duration_ms: Some(1_250),
+            ok: false,
+            error: Some("upstream 503".into()),
+            t_ms: 8_250,
+        };
+        assert_eq!(
+            serde_json::to_value(&done).unwrap(),
+            json!({"type": "tool_done", "task_id": "task_1", "item_id": "mcp_1",
+                   "name": "lookup_order", "duration_ms": 1_250, "ok": false,
+                   "error": "upstream 503", "t_ms": 8_250})
+        );
+    }
 
     /// The event serialises to exactly the document's example.
     fn assert_wire(event: &WireEvent, example: &str) {

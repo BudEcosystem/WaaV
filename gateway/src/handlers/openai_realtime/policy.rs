@@ -176,6 +176,8 @@ fn apply_session_update(
     // would open a trace in the vendor org every project on the credential shares (D-11).
     session.remove("model");
     session.remove("tracing");
+    // A Bud voice agent's (the cascade's) seeding of its conversation: a vendor has no such field.
+    session.remove("bud_context");
 
     if let Some(kind) = session.get("type").and_then(Value::as_str)
         && kind != rules.session_type
@@ -598,6 +600,18 @@ mod tests {
             &rules(),
         ));
         assert!(out["session"].get("tracing").is_none());
+    }
+
+    /// `session.bud_context` is a Bud voice agent's (the cascade reads it): a vendor model never
+    /// sees it, and the rest of the update still goes through.
+    #[test]
+    fn bud_context_never_reaches_a_vendor() {
+        let out = forwarded(client_event(
+            r#"{"type":"session.update","session":{"voice":"marin","bud_context":[{"role":"user","text":"hi"}]}}"#,
+            &rules(),
+        ));
+        assert!(out["session"].get("bud_context").is_none(), "{out}");
+        assert_eq!(out["session"]["voice"], "marin");
     }
 
     /// TC-EVT-06 🔒
