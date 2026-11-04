@@ -2,6 +2,33 @@
 
 All notable changes to WaaV Gateway will be documented in this file.
 
+## [1.3.0] - 2026-11-04
+
+Everything merged to `main` after 1.2.0 (#56-#60). Upgrade notes: Gnani now calls `api.vachana.ai` for both speech-to-text and text-to-speech, so its key must be a Vachana `X-API-Key-ID` (#57, #58); a Huawei SIS config for Bangkok (`ap-southeast-2`) is refused, since Huawei lists no SIS host there (#56); and a social, question or refuse decision of interaction mode may now take up to `front_model.line_budget_ms` longer when its line is late (set it to `0` for the 1.2.0 single budget) (#60).
+
+### Features
+
+- **Several gateways share one front server, or a pool of them** (#60). Each interaction session takes a pair of the server's slots under a Redis lease (the task Redis, else `WAAV_REDIS_URL`; 30 s TTL, renewed every 10 s), so a gateway that dies frees its slots. Servers come from `front_model.url` and the new `front_model.urls` (`WAAV_INTERACTION_FRONT_URL` takes a comma-separated list), and a hostname with several addresses, such as a headless Service, is one server per address, re-resolved every 5 s. Each server's slots are warmed with the persona's prompt before a session is placed on it; a lost server's sessions move to another and re-prime. A full pool refuses the mode with `front_busy`, an empty one with `front_unavailable`, logged once. `WAAV_INTERACTION_FRONT_API_KEY` sets the front's key. New metrics `waav_interaction_front_pairs{server,state}` and `waav_interaction_front_refused_total{reason}`. `front_model.command` is unchanged.
+- **One `voice.turn` trace per caller turn** (#60), carrying `bud.voice.interaction.act`, `.task_ref`, `.ack_latency_ms`, `.answer_latency_ms` and `response_latency_ms`; each background run is a child span in its turn's trace.
+- **A decision's line has its own deadline** (#60): once the act is known and the act's reply is the front's own line (`social`, `question`, `refuse`), the line gets `front_model.line_budget_ms` (default 1,500 ms, at most 10,000 ms, `WAAV_INTERACTION_FRONT_LINE_BUDGET_MS`). A line that still misses it is logged.
+
+### Bug Fixes
+
+- **Interaction mode** (#60):
+  - A Smart Turn inference that times out gives no verdict, instead of the previous turn's, which could end a new turn early.
+  - The narrator checks numbers said in words against the result, no longer takes the caller's own numbers as a source (except identifiers of 7 or more digits), and never cuts a part that holds a contrast, an exception or a negation (`narration.cut_never_drops`).
+  - Dangling end words that also finish sentences ("Where are you from?") hold the turn only when an answer is not expected (`copy_spans.can_end_sentence`); the text end-of-turn model, where present, can end such a hold at once.
+  - The lexical self-echo filter applies only when the sound may have been the agent's, so a caller repeating the agent's words ("Aisle seat, please.") is heard.
+  - An outage that recurs within `max_wait_s` counts as one outage, so stall and back lines stop repeating.
+  - Bud mode: a voice agent's `response.created` counts as a sign of life, so slow agents no longer draw stall lines or ended calls.
+- **Gnani on its documented API.** Text-to-speech uses `POST api.vachana.ai/api/v1/tts/inference` with the `timbre-v3.0` and `timbre-v2.5` voice catalogs (#57). Speech-to-text uses the Prisma realtime WebSocket (`wss://api.vachana.ai/stt/v3/stream`) instead of gRPC on `asr.gnani.ai`, with `end_turn` sending Gnani's `commit`; it gives final results only (#58). The former config spellings still parse, and `GNANI_ACCESS_KEY` and the client certificate are no longer needed.
+- **Dead hosts and stale voices** (#56): Viettel AI moves to `viettelai.vn` with its 16 current voices; Murf's EU, Middle East and South America hosts are the documented ones; Huawei SIS uses `sis-ext.<region>`; Tinkoff defaults to `anna` (old voices mapped by gender, with a warning); Acapela completes a bare speaker name to its `22k_HQ` voice; Zalo AI asks for WAV (`encode_type=0`).
+- **iFlytek and Bhashini** (#59): iFlytek's built-in voices are sent as the ids the Singapore host lists (`x_xiaoyan` and so on), and Bhashini's fallback Hindi and Assamese TTS service follows AI4Bharat's routing (`indic-tts-coqui-indo_aryan-gpu--t4`).
+
+### Documentation
+
+- `docs/interaction_mode.md` gains "A Shared Front" and "Turn Records", with the updated narrator, hold and echo rules (#60). Gnani's rows in the README, `docs/plugins.md` and `docs/SUPPORTED_PROVIDERS.md` follow its new API (#58).
+
 ## [1.2.0] - 2026-10-29
 
 Everything merged to `main` after 1.1.0 (#45, #47-#54). Upgrade note: an alias whose `stt`, `tts`, `llm` or `realtime` leg names a `credential_ref` that is undeclared, bound to another host, or (on `stt`/`tts`/`realtime`) set without a `base_url` used to start and fail every session on that leg; it is now refused at startup, naming the alias and leg (#51).
