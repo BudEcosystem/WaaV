@@ -1,0 +1,150 @@
+name: Front image
+
+# The interaction-mode front server image (front/Dockerfile): llama.cpp with the front model baked in.
+#
+#   * a PR that touches it   -> build both devices, start the CPU image as a deployment does and check it
+#   * a push to main          -> publish `:nightly-<device>` and the immutable `:nightly-<sha>-<device>`
+#   * run by hand             -> publish the pinned tag `<llama.cpp build>-<device>`, which deployments
+#                                pin. A tag that exists is never overwritten: bump LLAMA_CPP_BUILD (or
+#                                the model pin together with it) instead. `release_tag`, when given,
+#                                also publishes `<release_tag>-<device>`.
+#
+# Publishes to registry.bud.studio/runtime/waav-front with the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+# pair release.yml uses.
+
+on:
+  pull_request:
+    paths:
+      - "front/**"
+      - ".github/workflows/front-image.yml"
+  push:
+    branches: [main]
+    paths:
+      - "front/**"
+      - ".github/workflows/front-image.yml"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Also publish <release_tag>-<device> (e.g. 1.4.0); empty for the pinned tag only"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: registry.bud.studio/runtime/waav-front
+
+concurrency:
+  group: front-image-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    if: github.event_name == 'pull_request'
+    name: build (${{ matrix.device }}) and smoke-test the CPU image
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [cpu, cuda]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: useblacksmith/setup-docker-builder@v1
+
+      # The CUDA image is only built: the runner has no GPU to start it on.
+      - name: Build
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: ./front
+          file: ./front/Dockerfile
+          build-args: |
+            DEVICE=${{ matrix.device }}
+          push: false
+          load: ${{ matrix.device == 'cpu' }}
+          tags: waav-front:${{ github.sha }}-${{ matrix.device }}
+
+      # A deployment starts the server with only its serving flags (the model comes from the image's
+      # LLAMA_ARG_MODEL) and the key from LLAMA_API_KEY: both must hold, and the baked model must be
+      # the pinned one.
+      - name: Smoke-test the image as a deployment starts it
+        if: matrix.device == 'cpu'
+        env:
+          LOCAL_IMAGE: waav-front:${{ github.sha }}-cpu
+        run: |
+          set -euo pipefail
+          PIN="$(sed -n 's/^ARG MODEL_SHA256=//p' front/Dockerfile | head -1)"
+          test "$(docker inspect --format '{{ index .Config.Labels "studio.bud.waav-front.model-sha256" }}' "$LOCAL_IMAGE")" = "$PIN"
+          docker run --rm --entrypoint sh "$LOCAL_IMAGE" -c "echo '$PIN  '\"\$LLAMA_ARG_MODEL\" | sha256sum -c -"
+          KEY="$(openssl rand -hex 16)"
+          docker run -d --name front -e LLAMA_API_KEY="$KEY" -p 127.0.0.1:18741:18741 "$LOCAL_IMAGE" \
+            --host 0.0.0.0 --port 18741 -np 2 -c 8192 --cache-ram 0 -fa on -t 2 --metrics --no-webui
+          for _ in $(seq 1 120); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18741/health)" = 200 ] && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18741/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18741/props)" = 401
+          SLOTS="$(curl -fsS -H "Authorization: Bearer $KEY" http://127.0.0.1:18741/props | jq '.total_slots')"
+          test "$SLOTS" = 2
+          echo "waav-front OK: healthy, the key is required, $SLOTS slots, model $PIN"
+          docker rm -f front
+
+  publish:
+    if: github.event_name != 'pull_request'
+    name: publish (${{ matrix.device }})
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [cpu, cuda]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: useblacksmith/setup-docker-builder@v1
+
+      - name: Log in to registry.bud.studio
+        uses: docker/login-action@v3
+        with:
+          registry: registry.bud.studio
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        env:
+          EVENT: ${{ github.event_name }}
+          IS_DEFAULT: ${{ github.ref_name == github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          DEVICE: ${{ matrix.device }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            TAGS="$IMAGE:nightly-$DEVICE"$'\n'"$IMAGE:nightly-${{ github.sha }}-$DEVICE"
+          else
+            BUILD="$(sed -n 's/^ARG LLAMA_CPP_BUILD=//p' front/Dockerfile)"
+            test -n "$BUILD" || { echo "::error::no LLAMA_CPP_BUILD in front/Dockerfile"; exit 1; }
+            PINNED="$IMAGE:$BUILD-$DEVICE"
+            if docker buildx imagetools inspect "$PINNED" >/dev/null 2>&1; then
+              echo "::error::$PINNED already exists. Bump LLAMA_CPP_BUILD instead of overwriting a tag deployments pin."
+              exit 1
+            fi
+            [ "$IS_DEFAULT" = "true" ] || echo "::warning::publishing $PINNED from $GITHUB_REF_NAME, not the default branch"
+            TAGS="$PINNED"
+            [ -z "$RELEASE_TAG" ] || TAGS="$TAGS"$'\n'"$IMAGE:$RELEASE_TAG-$DEVICE"
+          fi
+          { echo 'tags<<TAGS_EOF'; printf '%s\n' "$TAGS"; echo 'TAGS_EOF'; } >> "$GITHUB_OUTPUT"
+          echo "publishing:"; printf '%s\n' "$TAGS" | sed 's/^/  /'
+
+      - name: Build and push
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: ./front
+          file: ./front/Dockerfile
+          build-args: |
+            DEVICE=${{ matrix.device }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}

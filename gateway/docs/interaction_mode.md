@@ -1114,6 +1114,8 @@ A front model the gateway does not run itself (no `front_model.command`) is shar
 - **No server** - a URL that names no server refuses the mode with `front_unavailable`, logged once until a server appears. Servers that appear are used without a restart.
 - **Counts** - `waav_interaction_front_pairs{server, state="held"|"free"}` counts the pairs every gateway holds on each server, and `waav_interaction_front_refused_total{reason}` counts the sessions refused. A change in the pairs held is logged.
 
+**The front image.** `registry.bud.studio/runtime/waav-front:<llama.cpp build>-cpu` (or `-cuda`) is a llama.cpp server with the front model baked in (Qwen3.5-2B Q4_K_M, pinned by revision and sha256), built from `front/Dockerfile` by `.github/workflows/front-image.yml`. The model path comes from the image (`LLAMA_ARG_MODEL`) and the key from `LLAMA_API_KEY`, so a deployment passes only the serving flags, for example `--host 0.0.0.0 --port 18741 -np 8 -c 32768 --cache-ram 0 -fa on`. `-np` sets the slots, so half of it is the pairs. Pin the build tag; `nightly-<device>` follows `main`.
+
 ## Listing Tasks
 
 `GET /v1/tasks` lists the tasks of the caller's sessions: the live ones, and finished ones for ten minutes. The optional query parameter `stream_id` limits the list to one session. A request without an authenticated id gets only the session it names, and an empty list without `stream_id`.
